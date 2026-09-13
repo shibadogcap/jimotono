@@ -3,6 +3,10 @@
 //   top-k=2, shared=1, seq=128, batch=4, fp32, 決定論的合成回帰。
 // ループ: MoE層 fwd→bwd→optim8更新。10ステップ毎にckpt recompute照合、
 //   100ステップ毎にesmoe往復。loss/steps-sec/tokens-sec/RSSをstderrへ1行ログ。
+// held-out検証: 合成データをtrain用 (salt 7, t in [0,TOKS)) とval用
+//   (同生成式・salt 7・t+VAL_OFFSETで重なりなし) に分離。学習更新はtrainの
+//   みで行い、valはforwardのみ (更新なし) で50ステップ毎＋開始前＋最終に
+//   計測し val_loss 列に記録する。
 // 時間上限 (既定6000秒) とステップ上限のどちらかで正常終了 (exit 0)。
 // loss非有限で即時exit 1。不正引数・2GB超・内部失敗もexit 1。
 // 規約: C11, restrict積極使用, errnoベース + goto cleanup (AGENTS.MD 7.1)。
@@ -48,6 +52,11 @@
 #define LR_CKPT_EVERY 10
 #define LR_ESMOE_EVERY 100
 #define LR_CKPT_TOL 1e-4f
+// held-out val: trainと同一生成式・同一w_star。トークン索引をVAL_OFFSETだけ
+// ずらすことで重なりなし (train t∈[0,TOKS), val t+OFFSET)。決定論的。
+#define LR_VAL_TOKS LR_TOKS
+#define LR_VAL_EVERY 50
+#define LR_VAL_OFFSET 100000
 
 // 1層あたり: Wgate[E*N] + Wg/Wu/Wd[E*H*N]x3 + Wgs/Wus/Wds[S*H*N]x3
 #define LR_P_WGATE ((size_t)LR_E * (size_t)LR_N)
@@ -399,6 +408,80 @@ static void lr_bwd_range(const lr_ctx_t *restrict ctx, size_t n_total,
     }
 }
 
+// held-out val forwardのみ (更新なし)。Vactsは呼び出し側確保の作業域
+// [(LAYERS+1)][VAL_TOKS][N]。検証ありjt_moe_fwdを使い、残差合算点で
+// isfiniteを確認する。成功時はMSEを返し、失敗時はNANを返す。
+// val由来の勾配計算・重み更新は一切行わない。
+static float lr_val_loss(const float *restrict P,
+                         const size_t *restrict layer_off, size_t head_off,
+                         const float *restrict Xv, const float *restrict Tv,
+                         float *restrict Vacts) {
+    if (P == NULL || layer_off == NULL || Xv == NULL || Tv == NULL ||
+        Vacts == NULL) {
+        return (float)NAN;
+    }
+    memcpy(Vacts, Xv,
+           (size_t)LR_VAL_TOKS * (size_t)LR_N * sizeof(float));
+    for (int l = 0; l < LR_LAYERS; l++) {
+        const float *base = P + layer_off[(size_t)l];
+        const float *Wgate = base;
+        const float *Wg = Wgate + LR_P_WGATE;
+        const float *Wu = Wg + LR_P_ROUTED;
+        const float *Wd = Wu + LR_P_ROUTED;
+        const float *Wgs = Wd + LR_P_ROUTED;
+        const float *Wus = Wgs + LR_P_SHARED;
+        const float *Wds = Wus + LR_P_SHARED;
+        for (int t = 0; t < LR_VAL_TOKS; t++) {
+            const float *xin =
+                Vacts +
+                ((size_t)l * (size_t)LR_VAL_TOKS + (size_t)t) * (size_t)LR_N;
+            float *xout =
+                Vacts +
+                ((size_t)(l + 1) * (size_t)LR_VAL_TOKS + (size_t)t) *
+                    (size_t)LR_N;
+            float M[LR_N];
+            size_t ids[LR_K];
+            float weights[LR_K];
+            float Gsel[(size_t)LR_K * (size_t)LR_H];
+            float Usel[(size_t)LR_K * (size_t)LR_H];
+            float Ysel[(size_t)LR_K * (size_t)LR_N];
+            float Gs[(size_t)LR_S * (size_t)LR_H];
+            float Us[(size_t)LR_S * (size_t)LR_H];
+            int frc = jt_moe_fwd(xin, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, M,
+                                 LR_N, LR_H, LR_E, LR_K, LR_S, ids,
+                                 weights, NULL, Gsel, Usel, Ysel, Gs, Us);
+            if (frc != JT_OK) {
+                return (float)NAN;
+            }
+            for (int j = 0; j < LR_N; j++) {
+                double v =
+                    (double)xin[j] + (double)LR_RESID * (double)M[j];
+                if (!isfinite(v)) {
+                    return (float)NAN;
+                }
+                xout[j] = (float)v;
+            }
+        }
+    }
+    {
+        const float *Wo = P + head_off;
+        float bo = P[head_off + (size_t)LR_N];
+        const float *alast =
+            Vacts + (size_t)LR_LAYERS * (size_t)LR_VAL_TOKS * (size_t)LR_N;
+        double sum = 0.0;
+        for (int t = 0; t < LR_VAL_TOKS; t++) {
+            const float *a = alast + (size_t)t * (size_t)LR_N;
+            double pred = (double)bo;
+            for (int j = 0; j < LR_N; j++) {
+                pred += (double)a[j] * (double)Wo[j];
+            }
+            double diff = pred - (double)Tv[t];
+            sum += diff * diff;
+        }
+        return (float)(sum / (double)LR_VAL_TOKS);
+    }
+}
+
 #if LR_HAVE_PTHREAD
 typedef struct lr_thr_arg {
     const lr_ctx_t *ctx;
@@ -440,6 +523,9 @@ int main(int argc, char **argv) {
     float *T = NULL;
     float *acts = NULL;
     float *dtmp = NULL;
+    float *Xv = NULL;    // held-out val入力 [(VAL_TOKS)][N] (更新に不使用)
+    float *Tv = NULL;    // held-out val目標 [VAL_TOKS] (更新に不使用)
+    float *Vacts = NULL; // val forward作業域 [(LAYERS+1)][VAL_TOKS][N]
     float *Gpart = NULL;   // [nthr][n_total] スレッド別勾配部分和
     float *dtmps = NULL;   // [nthr][P_LAYER] スレッド別bwd私用域
     // fwd中間値キャッシュ (bwd再計算除去用。[L][TOKS] 単位)。
@@ -464,6 +550,8 @@ int main(int argc, char **argv) {
     double t0 = 0.0;
     long step = 0;
     float w_star[LR_N];
+    float val_loss = (float)NAN;  // 直近のval計測値 (毎ステップログ列へ)
+    float val_init = (float)NAN;  // 開始前val (単調減少確認用)
 
     memset(&opt, 0, sizeof(opt));
     memset(&es, 0, sizeof(es));
@@ -548,18 +636,24 @@ int main(int argc, char **argv) {
                       (size_t)LR_K * (size_t)LR_N +
                       (size_t)2 * (size_t)LR_S * (size_t)LR_H) *
                  4.0);
-        double est =
-            w_bytes + g_bytes + o_bytes + a_bytes + t_bytes + c_bytes;
+        // held-out val: Xv/Tv + forward作業域Vacts。
+        double v_bytes = (double)LR_VAL_TOKS * (double)LR_N * 4.0 +
+                         (double)LR_VAL_TOKS * 4.0 +
+                         (double)(LR_LAYERS + 1) * (double)LR_VAL_TOKS *
+                             (double)LR_N * 4.0;
+        double est = w_bytes + g_bytes + o_bytes + a_bytes + t_bytes +
+                     c_bytes + v_bytes;
         printf("train_longrun: layers=%d d=%d E=%d h=%d k=%d S=%d "
                "seq=%d batch=%d toks/step=%d fp32 threads=%ld\n",
                LR_LAYERS, LR_N, LR_E, LR_H, LR_K, LR_S, LR_SEQ, LR_BATCH,
                LR_TOKS, nthr);
         printf("train_longrun: params=%zu weight=%.2fMiB grad=%.2fMiB "
                "optim=%.2fMiB acts=%.2fMiB thr=%.2fMiB cache=%.2fMiB "
-               "est_resident=%.2fMiB\n",
+               "val=%.2fMiB est_resident=%.2fMiB\n",
                n_total, w_bytes / 1048576.0, g_bytes / 1048576.0,
                o_bytes / 1048576.0, a_bytes / 1048576.0,
-               t_bytes / 1048576.0, c_bytes / 1048576.0, est / 1048576.0);
+               t_bytes / 1048576.0, c_bytes / 1048576.0,
+               v_bytes / 1048576.0, est / 1048576.0);
         fflush(stdout);
         if (est > LR_MAX_GB * 1024.0 * 1024.0 * 1024.0) {
             fprintf(stderr, "train_longrun: est %.2fMiB exceeds %.0fGB\n",
@@ -576,6 +670,10 @@ int main(int argc, char **argv) {
     acts = (float *)malloc((size_t)(LR_LAYERS + 1) * (size_t)LR_TOKS *
                            (size_t)LR_N * sizeof(float));
     dtmp = (float *)malloc(LR_P_LAYER * sizeof(float));
+    Xv = (float *)malloc((size_t)LR_VAL_TOKS * (size_t)LR_N * sizeof(float));
+    Tv = (float *)malloc((size_t)LR_VAL_TOKS * sizeof(float));
+    Vacts = (float *)malloc((size_t)(LR_LAYERS + 1) * (size_t)LR_VAL_TOKS *
+                            (size_t)LR_N * sizeof(float));
     {
         size_t nct = (size_t)LR_LAYERS * (size_t)LR_TOKS;
         Cids = (size_t *)malloc(nct * (size_t)LR_K * sizeof(size_t));
@@ -600,9 +698,9 @@ int main(int argc, char **argv) {
             (float *)malloc((size_t)nthr * LR_P_LAYER * sizeof(float));
     }
     if (P == NULL || G == NULL || X == NULL || T == NULL || acts == NULL ||
-        dtmp == NULL || Cids == NULL || Cw == NULL || CGsel == NULL ||
-        CUsel == NULL || CYsel == NULL ||
-        (LR_S > 0 && (CGs == NULL || CUs == NULL)) ||
+        dtmp == NULL || Xv == NULL || Tv == NULL || Vacts == NULL ||
+        Cids == NULL || Cw == NULL || CGsel == NULL || CUsel == NULL ||
+        CYsel == NULL || (LR_S > 0 && (CGs == NULL || CUs == NULL)) ||
         (nthr > 1 && (Gpart == NULL || dtmps == NULL))) {
         fprintf(stderr, "train_longrun: OOM\n");
         errno = ENOMEM;
@@ -646,6 +744,8 @@ int main(int argc, char **argv) {
         P[head_off + (size_t)LR_N] = 0.0f;
     }
     // 合成回帰データ: T = dot(X, w_star)/4。
+    // trainは t∈[0,TOKS) のみで更新に使用。valは同一生成式で索引を
+    // VAL_OFFSETずらし (重なりなし) たheld-outであり更新には一切使わない。
     for (int t = 0; t < LR_TOKS; t++) {
         double acc = 0.0;
         for (int j = 0; j < LR_N; j++) {
@@ -654,6 +754,15 @@ int main(int argc, char **argv) {
             acc += (double)v * (double)w_star[j];
         }
         T[t] = (float)(acc / 4.0);
+    }
+    for (int t = 0; t < LR_VAL_TOKS; t++) {
+        double acc = 0.0;
+        for (int j = 0; j < LR_N; j++) {
+            float v = lr_pat(t + LR_VAL_OFFSET, j, 7);
+            Xv[(size_t)t * (size_t)LR_N + (size_t)j] = v;
+            acc += (double)v * (double)w_star[j];
+        }
+        Tv[t] = (float)(acc / 4.0);
     }
 
     // ---- optim8 ----
@@ -696,6 +805,15 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "train_longrun: start max_steps=%ld time_limit=%.0fs lr=%g\n",
             max_steps, time_limit, (double)lr);
+    // 開始前val (初期値記録。forwardのみ・更新なし)。
+    val_init = lr_val_loss(P, layer_off, head_off, Xv, Tv, Vacts);
+    if (!isfinite((double)val_init)) {
+        fprintf(stderr, "train_longrun: initial val loss non-finite\n");
+        goto cleanup;
+    }
+    val_loss = val_init;
+    fprintf(stderr, "train_longrun: val_init=%.6f (held-out %d toks)\n",
+            (double)val_init, LR_VAL_TOKS);
     t0 = lr_now_sec();
 
     for (step = 0; step < max_steps; step++) {
@@ -1010,6 +1128,20 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
 
+        // ---- held-out val計測 (forwardのみ。valで更新は絶対にしない)。
+        // 50ステップ毎＋最終ステップで再計測し、それ以外は直近値を維持。
+        if ((step + 1) % LR_VAL_EVERY == 0 || step + 1 == max_steps) {
+            float vv =
+                lr_val_loss(P, layer_off, head_off, Xv, Tv, Vacts);
+            if (!isfinite((double)vv)) {
+                fprintf(stderr,
+                        "train_longrun: non-finite val loss step=%ld\n",
+                        step + 1);
+                goto cleanup;
+            }
+            val_loss = vv;
+        }
+
         // ---- ログ ----
         el = lr_now_sec() - t0;
         {
@@ -1017,10 +1149,10 @@ int main(int argc, char **argv) {
             double sps = (el > 0.0) ? done / el : 0.0;
             double tps = sps * (double)LR_TOKS;
             fprintf(stderr,
-                    "step=%ld loss=%.6f steps_sec=%.3f toks_sec=%.1f "
-                    "rss_mib=%.1f gnorm=%.4f elapsed=%.1fs\n",
-                    step + 1, (double)loss, sps, tps, lr_rss_mib(), gnorm,
-                    el);
+                    "step=%ld loss=%.6f val_loss=%.6f steps_sec=%.3f "
+                    "toks_sec=%.1f rss_mib=%.1f gnorm=%.4f elapsed=%.1fs\n",
+                    step + 1, (double)loss, (double)val_loss, sps, tps,
+                    lr_rss_mib(), gnorm, el);
         }
         if (el >= time_limit) {
             fprintf(stderr, "train_longrun: time limit %.0fs reached\n",
@@ -1035,11 +1167,22 @@ int main(int argc, char **argv) {
         if (done < 0.0) {
             done = 0.0;
         }
+        // 最終valを再計測 (forwardのみ) して単調減少の目安を報告する。
+        // 緩いスモーク目安: final < init*0.5。失敗でもexitは変えない
+        // (過剰な厳しさ禁止。判定はログの前半/後半平均と併せて行う)。
+        {
+            float vf =
+                lr_val_loss(P, layer_off, head_off, Xv, Tv, Vacts);
+            if (isfinite((double)vf)) {
+                val_loss = vf;
+            }
+        }
         fprintf(stderr,
                 "train_longrun: done steps=%ld elapsed=%.1fs steps_sec=%.3f "
-                "rss_mib=%.1f\n",
+                "rss_mib=%.1f val_init=%.6f val_last=%.6f\n",
                 step + 1 <= max_steps ? step + 1 : max_steps, el,
-                (el > 0.0 && done > 0.0) ? done / el : 0.0, lr_rss_mib());
+                (el > 0.0 && done > 0.0) ? done / el : 0.0, lr_rss_mib(),
+                (double)val_init, (double)val_loss);
     }
     rc_all = 0;
 
@@ -1056,6 +1199,9 @@ cleanup:
     free(T);
     free(acts);
     free(dtmp);
+    free(Xv);
+    free(Tv);
+    free(Vacts);
     free(Gpart);
     free(dtmps);
     free(Cids);
