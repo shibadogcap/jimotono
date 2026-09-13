@@ -68,6 +68,7 @@ int jt_routing_topk(const float *restrict logits, size_t n, size_t k,
 // t_rel: t-s(t)。窓先頭で0。0 <= t_rel < w。
 // w (W): 窓幅。2〜4開始 (0不可)。
 // out_loss: 結果格納。内部はdouble累積しfloatで返す。
+// 仕様(MINOR-3): λ=α=0でも g_prev/g_anchor の非有限値は INVAL (0*INF=NaN防止のfail-closed)。重み0でも検査する。
 // 戻り値: JT_OK / JT_ERR_INVAL (errno=EINVAL)。
 int jt_routing_sticky_loss(const float *restrict g_t,
                            const float *restrict g_prev,

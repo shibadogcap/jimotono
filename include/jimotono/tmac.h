@@ -49,6 +49,7 @@
 
 // 必要バイト数 (オーバーフロー時はJT_ERR_NOMEM/EINVAL + errno)。
 // qlut: N*(K/4)*8 byte。param: N*(K/32)*sizeof(float) (scales/biases各1配列分)。
+// 注意(MINOR-2): qlut_bytes単体はK%4、ctorはK%32を要求。K=4等では qlut_bytes=OK でも ctor=INVAL になる。param_bytesもK%32要求のため実害なし。
 int jt_tmac_qlut_bytes(size_t n, size_t k, size_t *restrict out);
 int jt_tmac_param_bytes(size_t n, size_t k, size_t *restrict out);
 
