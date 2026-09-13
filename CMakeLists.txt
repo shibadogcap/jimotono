@@ -46,6 +46,7 @@ add_library(jimotono_core
   src/esmoe.c
   src/mixed_prec.c
   src/lut_aware.c
+  src/model1b.c
 )
 # POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
@@ -135,6 +136,9 @@ if(JIMOTONO_BUILD_BENCH)
     target_compile_definitions(test_cycle_bench PRIVATE JIMOTONO_BUILD_COMMIT="${JIMOTONO_BUILD_COMMIT}")
   endif()
 
+  add_executable(test_model1b bench/kernel/test_model1b.c)
+  target_link_libraries(test_model1b PRIVATE jimotono_core)
+
 endif()
 
 enable_testing()
@@ -152,6 +156,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME mixed_lut COMMAND test_mixed_lut)
   add_test(NAME e2e_pipe COMMAND test_e2e_pipe)
   add_test(NAME cycle COMMAND test_cycle_bench)
+  add_test(NAME model1b COMMAND test_model1b)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
