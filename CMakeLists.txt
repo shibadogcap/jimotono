@@ -116,6 +116,15 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_e2e_pipe bench/kernel/test_e2e_pipe.c)
   target_link_libraries(test_e2e_pipe PRIVATE jimotono_core)
 
+  add_executable(test_cycle_bench bench/kernel/test_cycle_bench.c)
+  target_link_libraries(test_cycle_bench PRIVATE jimotono_core jimotono_bench_common)
+  # bench_schema.md の commit 記録用にビルド時ハッシュを埋め込む (取得不可時は空)。
+  execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE JIMOTONO_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(JIMOTONO_BUILD_COMMIT)
+    target_compile_definitions(test_cycle_bench PRIVATE JIMOTONO_BUILD_COMMIT="${JIMOTONO_BUILD_COMMIT}")
+  endif()
+
 endif()
 
 enable_testing()
@@ -131,6 +140,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME optim_offload COMMAND test_optim_offload)
   add_test(NAME mixed_lut COMMAND test_mixed_lut)
   add_test(NAME e2e_pipe COMMAND test_e2e_pipe)
+  add_test(NAME cycle COMMAND test_cycle_bench)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
