@@ -315,13 +315,14 @@ static void cb_rms_bwd_case(void *ctx) {
 
 // ---- 環境取得 (クロスプラットフォーム・同一ソースでビルド可能) ----
 static void cb_machine_name(char *buf, size_t cap) {
-    const char *env = getenv("JIMOTONO_MACHINE");
-    const char *dflt = "macmini-i7-8700B";  // configs/bench/machine.yaml 既定
-    const char *src = (env != NULL && env[0] != '\0') ? env : dflt;
     if (cap == 0) {
         return;
     }
-    snprintf(buf, cap, "%s", src);
+    // machineラベルは bench_common の共有ヘルパーで解決する
+    // (JIMOTONO_MACHINE 上書き、未設定時は machine.yaml 既定)。
+    if (jt_bench_machine_label(buf, cap) != JT_OK) {
+        snprintf(buf, cap, "%s", "macmini-i7-8700B");
+    }
 }
 
 static void cb_cpu_brand(char *buf, size_t cap) {

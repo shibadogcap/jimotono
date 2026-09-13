@@ -332,3 +332,16 @@ io_fail:
     errno = EIO;
     return JT_ERR_IO;
 }
+
+int jt_bench_machine_label(char *restrict buf, size_t cap) {
+    const char *env = NULL;
+    const char *src = NULL;
+    if (buf == NULL || cap == 0) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    env = getenv("JIMOTONO_MACHINE");
+    src = (env != NULL && env[0] != '\0') ? env : "macmini-i7-8700B";
+    snprintf(buf, cap, "%s", src);
+    return JT_OK;
+}

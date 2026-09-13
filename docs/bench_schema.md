@@ -44,3 +44,10 @@ gdn2/d64-dv128	11	987.000000	12.000000
 3. `sh scripts/bench_env.sh | tee results/bench/<date>-env.txt` で外乱記録。
 4. ベンチ実行 → `results/bench/<date>-<machine>.json` に追記。
 5. 中央値+MADで記録し、外れ値は破棄 (MADが大きい場合は再計測)。
+
+## 環境変数 (machineラベル上書き)
+
+- `JIMOTONO_MACHINE`: `machine` ラベルの上書き。未設定/空時は既定 `macmini-i7-8700B`
+  (`configs/bench/machine.yaml` の既定)。例: `JIMOTONO_MACHINE=n150 test_cycle_bench`。
+- 解決は `jt_bench_machine_label()` (bench_common) に集約し、cycle bench は起動時に
+  `machine: <label>` を表出力する。N150 定義は `machine.yaml` の `n150:` を参照。
