@@ -9,3 +9,14 @@ build_commit: "<git hash>"
 build_type: "RelWithDebInfo"
 notes: "ブラウザ・エディタ有無、温度、外乱を記録"
 trials: 11   # 中央値+MAD用 (N回計測)
+
+# --- known machines (reference; active default above, do not change) ---
+n150:
+  name: "n150"
+  cpu: "Intel N150"
+  freq: "up to 3.6GHz (burst)"
+  freq_locked: false
+  ram: "11GiB"
+  os: "Ubuntu 24.04"
+  storage: "ext4 on /dev/sda2 (O_DIRECT scaffold verified)"
+  notes: "4C/4T Twin Lake; lab host per results/bench/20260913-n150.md"

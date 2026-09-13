@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "bench_common.h"
@@ -177,6 +178,78 @@ static void test_print_roundtrip(void) {
     fclose(fp);
 }
 
+static void test_machine_label(void) {
+    // JIMOTONO_MACHINE による machine ラベル上書き (既存 CHECK 流儀)。
+    // cycle bench (test_cycle_bench.c) と共有の jt_bench_machine_label を検証し、
+    // N150 相当の値が JSON 出力に載ることも往復確認する。
+    char saved[256];
+    const char *old = getenv("JIMOTONO_MACHINE");
+    int had_old = (old != NULL);
+    char buf[128];
+    if (had_old) {
+        snprintf(saved, sizeof saved, "%s", old);
+    }
+#if defined(_WIN32)
+    CHECK(_putenv("JIMOTONO_MACHINE=n150") == 0, "setenv n150");
+    CHECK(jt_bench_machine_label(buf, sizeof buf) == JT_OK, "machine n150 rc");
+    CHECK(strcmp(buf, "n150") == 0, "machine n150 got=%s", buf);
+    CHECK(_putenv("JIMOTONO_MACHINE=") == 0, "setenv empty");
+    CHECK(jt_bench_machine_label(buf, sizeof buf) == JT_OK, "machine empty rc");
+    CHECK(strcmp(buf, "macmini-i7-8700B") == 0, "machine empty fallback got=%s", buf);
+#else
+    CHECK(setenv("JIMOTONO_MACHINE", "n150", 1) == 0, "setenv n150");
+    CHECK(jt_bench_machine_label(buf, sizeof buf) == JT_OK, "machine n150 rc");
+    CHECK(strcmp(buf, "n150") == 0, "machine n150 got=%s", buf);
+    CHECK(setenv("JIMOTONO_MACHINE", "", 1) == 0, "setenv empty");
+    CHECK(jt_bench_machine_label(buf, sizeof buf) == JT_OK, "machine empty rc");
+    CHECK(strcmp(buf, "macmini-i7-8700B") == 0, "machine empty fallback got=%s", buf);
+    CHECK(unsetenv("JIMOTONO_MACHINE") == 0, "unsetenv");
+    CHECK(jt_bench_machine_label(buf, sizeof buf) == JT_OK, "machine unset rc");
+    CHECK(strcmp(buf, "macmini-i7-8700B") == 0, "machine unset fallback got=%s", buf);
+#endif
+    CHECK(jt_bench_machine_label(NULL, sizeof buf) == JT_ERR_INVAL, "machine NULL buf");
+    CHECK(jt_bench_machine_label(buf, 0) == JT_ERR_INVAL, "machine cap 0");
+    // N150 ラベル付き JSON 行の往復確認 (cycle bench の JSON 出力と同形式)。
+    {
+        FILE *fp = tmpfile();
+        char out[1024];
+        size_t len = 0;
+        CHECK(fp != NULL, "tmpfile machine");
+        if (fp != NULL) {
+#if defined(_WIN32)
+            CHECK(_putenv("JIMOTONO_MACHINE=n150") == 0, "setenv n150 json");
+#else
+            CHECK(setenv("JIMOTONO_MACHINE", "n150", 1) == 0, "setenv n150 json");
+#endif
+            CHECK(jt_bench_machine_label(buf, sizeof buf) == JT_OK, "machine relabel rc");
+            CHECK(jt_bench_print_json(fp, "cycle/fwd_sum", buf, "abc123", 11, 100.0, 1.0,
+                                      "n150 check") == JT_OK,
+                  "json n150 rc");
+            rewind(fp);
+            len = fread(out, 1, sizeof(out) - 1u, fp);
+            out[len] = '\0';
+            CHECK(strstr(out, "\"machine\":\"n150\"") != NULL, "json machine n150");
+            fclose(fp);
+        }
+    }
+    // 環境復元 (他テストへの漏れ防止)。
+    if (had_old) {
+#if defined(_WIN32)
+        char restore[320];
+        snprintf(restore, sizeof restore, "JIMOTONO_MACHINE=%s", saved);
+        _putenv(restore);
+#else
+        setenv("JIMOTONO_MACHINE", saved, 1);
+#endif
+    } else {
+#if defined(_WIN32)
+        _putenv("JIMOTONO_MACHINE=");
+#else
+        unsetenv("JIMOTONO_MACHINE");
+#endif
+    }
+}
+
 int main(void) {
     test_clock_monotonic();
     test_median_odd();
@@ -186,6 +259,7 @@ int main(void) {
     test_measure_trials();
     test_dummy_range();
     test_print_roundtrip();
+    test_machine_label();
     if (g_fail != 0) {
         printf("bench_smoke: FAIL\n");
         return 1;

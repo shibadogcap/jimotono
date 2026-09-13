@@ -59,4 +59,10 @@ int jt_bench_print_json(FILE *restrict fp, const char *restrict name,
                         size_t trials, double median_ns, double mad_ns,
                         const char *restrict notes);
 
+// machineラベル解決 (configs/bench/machine.yaml の `machine` 既定を上書き可能)。
+// 環境変数 JIMOTONO_MACHINE が非空ならその値を、未設定/空なら既定
+// "macmini-i7-8700B" を buf に格納する (NUL終端保証)。
+// 戻り値: JT_OK / JT_ERR_INVAL (buf==NULL || cap==0)。
+int jt_bench_machine_label(char *restrict buf, size_t cap);
+
 #endif  // JIMOTONO_BENCH_COMMON_H
