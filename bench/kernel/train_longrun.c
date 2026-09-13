@@ -95,6 +95,31 @@ static double lr_now_sec(void) {
 }
 
 // RSSをMiBで返す (取得不可時は0)。
+// D2: 自発的/非自発的コンテキストスイッチ差分 (ステップあたり) 用。
+// getrusage(RUSAGE_SELF)のru_nvcsw/ru_nivcswを返す。取得不可時は0。
+static void lr_get_csw(long *v, long *iv) {
+#if defined(__unix__) || defined(__APPLE__)
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        if (v != NULL) {
+            *v = (long)ru.ru_nvcsw;
+        }
+        if (iv != NULL) {
+            *iv = (long)ru.ru_nivcsw;
+        }
+        return;
+    }
+#endif
+    if (v != NULL) {
+        *v = 0L;
+    }
+    if (iv != NULL) {
+        *iv = 0L;
+    }
+}
+
+// RSSをMiBで返す (取得不可時は0)。
 static double lr_rss_mib(void) {
 #if defined(__unix__) || defined(__APPLE__)
     struct rusage ru;
@@ -275,6 +300,22 @@ static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
             }
             xout[j] = (float)v;
         }
+    }
+    if (rc_out != NULL) {
+        *rc_out = rc;
+    }
+}
+
+// D2粗粒化: 全層分 [a,b) トークンを1ワーカーで連続処理。
+// 従来は層ごとにfork/join (6回/step) だったが、トークン並列は層間で
+// 依存がない (acts[l+1][t]は同ワーカーのacts[l][t]からのみ決まる) ため
+// 単一fork/joinに融合できる。各トークンの計算内容・順序は不変で
+// ビット一致。ワーカーあたり作業量は約6倍 (12Tで約200KB→約1.2MB)。
+static void lr_fwd_all_range(const lr_ctx_t *restrict ctx, int a, int b,
+                             int *restrict rc_out) {
+    int rc = JT_OK;
+    for (int l = 0; l < LR_LAYERS && rc == JT_OK; l++) {
+        lr_fwd_layer_range(ctx, l, a, b, &rc);
     }
     if (rc_out != NULL) {
         *rc_out = rc;
@@ -494,19 +535,20 @@ typedef struct lr_thr_arg {
     int rc;
 } lr_thr_arg_t;
 
-static void *lr_thr_fwd(void *v) {
+// D2粗粒化用: 1ステップ分の fused forward全層 + backward を同一ワーカーで
+// 処理 (単一fork/join/step)。Gpartゼロ埋めもワーカー側で並列化し、
+// 主スレッドの直列memsetを除去する。トークン分割は従来と同一のため等価。
+static void *lr_thr_step(void *v) {
     lr_thr_arg_t *arg = (lr_thr_arg_t *)v;
     int rc = JT_OK;
-    lr_fwd_layer_range(arg->ctx, arg->layer, arg->a, arg->b, &rc);
-    arg->rc = rc;
-    return NULL;
-}
-
-static void *lr_thr_bwd(void *v) {
-    lr_thr_arg_t *arg = (lr_thr_arg_t *)v;
-    int rc = JT_OK;
-    lr_bwd_range(arg->ctx, arg->n_total, arg->a, arg->b, arg->Gout,
-                 arg->dtmp, &rc);
+    if (arg->Gout != NULL && arg->n_total > 0) {
+        memset(arg->Gout, 0, arg->n_total * sizeof(float));
+    }
+    lr_fwd_all_range(arg->ctx, arg->a, arg->b, &rc);
+    if (rc == JT_OK) {
+        lr_bwd_range(arg->ctx, arg->n_total, arg->a, arg->b, arg->Gout,
+                     arg->dtmp, &rc);
+    }
     arg->rc = rc;
     return NULL;
 }
@@ -552,6 +594,8 @@ int main(int argc, char **argv) {
     float w_star[LR_N];
     float val_loss = (float)NAN;  // 直近のval計測値 (毎ステップログ列へ)
     float val_init = (float)NAN;  // 開始前val (単調減少確認用)
+    long csw_prev_v = 0L;  // D2: 前ステップのru_nvcsw (自発的)
+    long csw_prev_iv = 0L; // D2: 前ステップのru_nivcsw (非自発的)
 
     memset(&opt, 0, sizeof(opt));
     memset(&es, 0, sizeof(es));
@@ -815,6 +859,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "train_longrun: val_init=%.6f (held-out %d toks)\n",
             (double)val_init, LR_VAL_TOKS);
     t0 = lr_now_sec();
+    lr_get_csw(&csw_prev_v, &csw_prev_iv);
 
     for (step = 0; step < max_steps; step++) {
         double loss_sum = 0.0;
@@ -847,64 +892,9 @@ int main(int argc, char **argv) {
             wctx.CYsel = CYsel;
             wctx.CGs = CGs;
             wctx.CUs = CUs;
-            for (int l = 0; l < LR_LAYERS; l++) {
-#if LR_HAVE_PTHREAD
-                if (nthr > 1) {
-                    pthread_t thrs[16];
-                    lr_thr_arg_t args[16];
-                    size_t chunk = ((size_t)LR_TOKS + (size_t)nthr - 1) /
-                                   (size_t)nthr;
-                    int bad = 0;
-                    for (long w = 0; w < nthr; w++) {
-                        size_t a = (size_t)w * chunk;
-                        size_t b = a + chunk;
-                        if (b > (size_t)LR_TOKS) {
-                            b = (size_t)LR_TOKS;
-                        }
-                        args[w].ctx = &wctx;
-                        args[w].n_total = n_total;
-                        args[w].layer = l;
-                        args[w].a = (int)a;
-                        args[w].b = (int)b;
-                        args[w].Gout = NULL;
-                        args[w].dtmp = NULL;
-                        args[w].rc = JT_OK;
-                        if (pthread_create(&thrs[w], NULL, lr_thr_fwd,
-                                           &args[w]) != 0) {
-                            fprintf(stderr,
-                                    "train_longrun: pthread_create failed\n");
-                            errno = ENOMEM;
-                            goto cleanup;
-                        }
-                    }
-                    for (long w = 0; w < nthr; w++) {
-                        pthread_join(thrs[w], NULL);
-                        if (args[w].rc != JT_OK) {
-                            bad = args[w].rc;
-                        }
-                    }
-                    if (bad != JT_OK) {
-                        fprintf(stderr,
-                                "train_longrun: fwd failed step=%ld l=%d "
-                                "rc=%d\n",
-                                step, l, bad);
-                        goto cleanup;
-                    }
-                } else
-#endif
-                {
-                    int frc = JT_OK;
-                    lr_fwd_layer_range(&wctx, l, 0, LR_TOKS, &frc);
-                    if (frc != JT_OK) {
-                        fprintf(stderr,
-                                "train_longrun: fwd failed step=%ld l=%d "
-                                "rc=%d\n",
-                                step, l, frc);
-                        goto cleanup;
-                    }
-                }
-            }
-            // ---- backward: fwd再計算→bwd→勾配加算 (トークン並列) ----
+            // D2粗粒化: forward全層+bwdを単一fork/join/stepに融合 (従来7回→1回)。
+            // 各ワーカーがトークン範囲[a,b)をfwd全層→bwd連続処理し、
+            // acts/キャッシュがL2に残る間の再利用を狙う。分割は従来と同一で等価。
 #if LR_HAVE_PTHREAD
             if (nthr > 1) {
                 pthread_t thrs[16];
@@ -918,17 +908,15 @@ int main(int argc, char **argv) {
                     if (b > (size_t)LR_TOKS) {
                         b = (size_t)LR_TOKS;
                     }
-                    memset(Gpart + (size_t)w * n_total, 0,
-                           n_total * sizeof(float));
                     args[w].ctx = &wctx;
                     args[w].n_total = n_total;
-                    args[w].layer = -1;
+                    args[w].layer = -2;
                     args[w].a = (int)a;
                     args[w].b = (int)b;
                     args[w].Gout = Gpart + (size_t)w * n_total;
                     args[w].dtmp = dtmps + (size_t)w * LR_P_LAYER;
                     args[w].rc = JT_OK;
-                    if (pthread_create(&thrs[w], NULL, lr_thr_bwd,
+                    if (pthread_create(&thrs[w], NULL, lr_thr_step,
                                        &args[w]) != 0) {
                         fprintf(stderr,
                                 "train_longrun: pthread_create failed\n");
@@ -944,7 +932,7 @@ int main(int argc, char **argv) {
                 }
                 if (bad != JT_OK) {
                     fprintf(stderr,
-                            "train_longrun: bwd failed step=%ld rc=%d\n",
+                            "train_longrun: fwd/bwd failed step=%ld rc=%d\n",
                             step, bad);
                     goto cleanup;
                 }
@@ -959,14 +947,24 @@ int main(int argc, char **argv) {
             } else
 #endif
             {
-                int brc = JT_OK;
-                memset(G, 0, n_total * sizeof(float));
-                lr_bwd_range(&wctx, n_total, 0, LR_TOKS, G, dtmp, &brc);
-                if (brc != JT_OK) {
+                int frc = JT_OK;
+                lr_fwd_all_range(&wctx, 0, LR_TOKS, &frc);
+                if (frc != JT_OK) {
                     fprintf(stderr,
-                            "train_longrun: bwd failed step=%ld rc=%d\n",
-                            step, brc);
+                            "train_longrun: fwd failed step=%ld rc=%d\n",
+                            step, frc);
                     goto cleanup;
+                }
+                {
+                    int brc = JT_OK;
+                    memset(G, 0, n_total * sizeof(float));
+                    lr_bwd_range(&wctx, n_total, 0, LR_TOKS, G, dtmp, &brc);
+                    if (brc != JT_OK) {
+                        fprintf(stderr,
+                                "train_longrun: bwd failed step=%ld rc=%d\n",
+                                step, brc);
+                        goto cleanup;
+                    }
                 }
             }
         }
@@ -1148,11 +1146,27 @@ int main(int argc, char **argv) {
             double done = (double)(step + 1);
             double sps = (el > 0.0) ? done / el : 0.0;
             double tps = sps * (double)LR_TOKS;
+            long csw_cur_v = 0L;
+            long csw_cur_iv = 0L;
+            long csw_dv = 0L;
+            long csw_div = 0L;
+            lr_get_csw(&csw_cur_v, &csw_cur_iv);
+            csw_dv = csw_cur_v - csw_prev_v;
+            csw_div = csw_cur_iv - csw_prev_iv;
+            if (csw_dv < 0L) {
+                csw_dv = 0L;
+            }
+            if (csw_div < 0L) {
+                csw_div = 0L;
+            }
+            csw_prev_v = csw_cur_v;
+            csw_prev_iv = csw_cur_iv;
             fprintf(stderr,
                     "step=%ld loss=%.6f val_loss=%.6f steps_sec=%.3f "
-                    "toks_sec=%.1f rss_mib=%.1f gnorm=%.4f elapsed=%.1fs\n",
+                    "toks_sec=%.1f rss_mib=%.1f gnorm=%.4f elapsed=%.1fs "
+                    "csw_v=%ld csw_iv=%ld\n",
                     step + 1, (double)loss, (double)val_loss, sps, tps,
-                    lr_rss_mib(), gnorm, el);
+                    lr_rss_mib(), gnorm, el, csw_dv, csw_div);
         }
         if (el >= time_limit) {
             fprintf(stderr, "train_longrun: time limit %.0fs reached\n",
