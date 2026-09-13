@@ -301,6 +301,13 @@ int jt_mp_propose_bits(jt_mp_layer_t base_layer,
         return rc;
     }
     // 暫定しきい値 (FRI本実装までの予約位置。分布仮定スタブ)。
+    // P2完了までの差し替え計画 (MINOR-2対応。振る舞い不変・閾値は維持):
+    // 現状 score>2.0で1段上げ/score<0.5で1段下げ。将来の実推定量候補は
+    // (a)量子化誤差MSE (W vs dequant(quant(W))。jt_lut_err_t.mse流用。MSE大→高ビット)、
+    // (b)勾配ノルム比 (||g_q-g_fp||/||g_fp||。比大→高ビット)、
+    // (c)活性化レンジ (max|x|統計。レンジ大→高ビット)。
+    // 選択基準: (c)を既定 (安価・FRIのプロファイリング不要方針と整合)、(a)を
+    // オフライン較正用、(b)を1B級スモークでのみ検証。しきい値は分布較正後に再決定。
     if (score > 2.0f) {
         if (base == 2) {
             base = 4;
