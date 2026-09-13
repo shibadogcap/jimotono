@@ -47,11 +47,13 @@ add_library(jimotono_core
   src/mixed_prec.c
   src/lut_aware.c
 )
-target_include_directories(jimotono_core PUBLIC include)
-# O_DIRECT (io_direct.c) はglibcで_GNU_SOURCEを要する。LinuxのみPRIVATE付与。
+# POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
+# Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_compile_definitions(jimotono_core PRIVATE _GNU_SOURCE)
+  add_compile_definitions(_GNU_SOURCE)
 endif()
+target_include_directories(jimotono_core PUBLIC include)
+# O_DIRECT (io_direct.c) はglibcで_GNU_SOURCEを要する。上記で充足。
 # io_uring (Linuxのみ, Phase 2足場)。既定OFFでfallback (ENOSYS) ビルド。
 # 有効時のみ <liburing.h> をincludeしliburingにリンクする。
 # O_DIRECTは本タスク範囲外 (buffered fd前提)。
