@@ -39,6 +39,7 @@ add_library(jimotono_core
   src/routing.c
   src/io_batch.c
   src/io_batch_uring.c
+  src/io_direct.c
   src/train_bwd.c
   src/checkpoint.c
   src/optim8.c
@@ -104,6 +105,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_uring bench/kernel/test_uring.c)
   target_link_libraries(test_uring PRIVATE jimotono_core)
 
+  add_executable(test_io_direct bench/kernel/test_io_direct.c)
+  target_link_libraries(test_io_direct PRIVATE jimotono_core)
+
   add_executable(test_train_bwd bench/kernel/test_train_bwd.c)
   target_link_libraries(test_train_bwd PRIVATE jimotono_core)
 
@@ -127,6 +131,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME io_batch COMMAND test_io)
   add_test(NAME bench_smoke COMMAND bench_smoke)
   add_test(NAME uring COMMAND test_uring)
+  add_test(NAME io_direct COMMAND test_io_direct)
   add_test(NAME train_bwd COMMAND test_train_bwd)
   add_test(NAME optim_offload COMMAND test_optim_offload)
   add_test(NAME mixed_lut COMMAND test_mixed_lut)
