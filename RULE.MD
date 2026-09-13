@@ -60,6 +60,16 @@
 | CSAの日本語タスク性能 | DeepSeek V4での日本語評価は未報告 |
 | 1誤差伝播あたり20Mサイクルの達成可能性 | 理論値のみ。プロトタイプで検証が必要 |
 
+## 6. 並列開発の運用規則（worktree分離・2026-09-13制定）
+
+背景：単一ディレクトリで4ブランチをcheckoutし合った結果、17:41〜17:55に約20回のcheckout往復が発生し、サブエージェント2つが同一シェルを取り合う競合を起こした。この再発を防ぐため以下を厳守する。
+
+- 1ブランチ1worktree原則：並列作業は必ず別worktree。同一ディレクトリでの`git checkout`/`git switch`によるブランチ往復は禁止
+- 対応表（固定）：`develop`→`/Users/shibadogcap/jimotono`、`feat/p1/lut-kernel`→`~/jimotono-wt-lut`、`feat/p1/gdn2-kernel`→`~/jimotono-wt-gdn2`、`feat/p1/moe-routing`→`~/jimotono-wt-routing`、`feat/p1/ssd-stream`→`~/jimotono-wt-ssd`
+- サブエージェントへの指示はworktreeパス・ブランチ・ビルドdirを明示し、`checkout/switch`禁止・他wtへの接触禁止・ビルドdir分離（各wt内の`build-*`を使用し共有`build-dbg`を使わない）を毎回含める
+- main wt（`/Users/shibadogcap/jimotono`）は`develop`専用の統合場所とし、P1個別実装は各wtでのみ行う
+- worktree作成・破棄はROADMAP 2.3手順に従う（`git worktree add ~/jimotono-wt-<name> -b <branch> develop`、`git worktree list`で確認）
+
 ## 5. 参照すべき研究・実装一覧
 
 | 領域 | 参照元 | URL |
