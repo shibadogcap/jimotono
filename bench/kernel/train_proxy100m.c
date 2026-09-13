@@ -132,6 +132,111 @@ static double px_now_sec(void) {
     return (double)clock() / (double)CLOCKS_PER_SEC;
 }
 
+// ---- F2 breakdown probes (Phase F2 measurement only) ----
+// 計測専用。計算内容・順序・並列化に一切触れない。wallはclock_gettime単調時計
+// (px_now_sec)、cyclesはx86 rdtsc (非x86では0)。10フェーズの合計がstep実測に
+// 一致するよう other = step_wall - sum(9相) で残差吸収する。
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#pragma intrinsic(__rdtsc)
+static inline uint64_t px_rdtsc(void) {
+    return (uint64_t)__rdtsc();
+}
+#elif defined(__GNUC__) || defined(__clang__)
+static inline uint64_t px_rdtsc(void) {
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+#else
+static inline uint64_t px_rdtsc(void) {
+    return 0ULL;
+}
+#endif
+#define PX_HAVE_RDTSC 1
+#else
+static inline uint64_t px_rdtsc(void) {
+    return 0ULL;
+}
+#define PX_HAVE_RDTSC 0
+#endif
+
+enum {
+    PX_PH_DATA = 0,   // acts<=X memcpy
+    PX_PH_FWD,        // forward計算 (worker内fwdのmax)
+    PX_PH_BWD,        // backward計算 (worker内bwdのmax。G zero含む)
+    PX_PH_OPTIM,      // grad norm/clip + optim8_step
+    PX_PH_CKPT,       // ckpt recompute照合 (5step毎)
+    PX_PH_ESMOE,      // esmoe往復 (register/prefetch/load/memcmp。5step毎)
+    PX_PH_SYNC,       // fork/join + 順序付きreduction (単一Tでは0)
+    PX_PH_ALLOC,      // esmoe往復内 malloc/free のみ
+    PX_PH_LOGGING,    // loss MSE + sticky + val + stderrログ
+    PX_PH_OTHER,      // weights_finite + 残差 (step_wall - sum)
+    PX_PH_N
+};
+static const char *px_ph_name[PX_PH_N] = {
+    "data", "fwd",        "bwd",      "optim",   "ckpt_recompute",
+    "esmoe_io", "sync",   "alloc",    "logging", "other"};
+static double px_ph_acc[PX_PH_N];
+static long px_ph_cswv[PX_PH_N];
+static long px_ph_csiv[PX_PH_N];
+static long px_ph_inb[PX_PH_N];
+static long px_ph_oub[PX_PH_N];
+static uint64_t px_tsc_acc = 0ULL;
+static double px_step_wall_acc = 0.0; // F2 probe: Σstep_wall (一致確認用)
+// F2 probe: logging相の内訳 (合計はLOGGINGと一致。計測のみ)。
+static double px_log_loss = 0.0;   // MSE loss
+static double px_log_sticky = 0.0; // sticky loss実経路
+static double px_log_val = 0.0;    // held-out val forward
+static double px_log_misc = 0.0;   // stderrログ・getrusage等
+static uint64_t px_esmoe_write_bytes = 0ULL; // register(pwrite)側の計測値
+
+typedef struct px_snap {
+    double t;
+    long v;
+    long iv;
+    long inb;
+    long oub;
+} px_snap_t;
+
+// getrusage拡張スナップ (ru_nvcsw/nivcsw + ru_inblock/oublock)。
+// macOSではinblock/oublockは常に0の見込み (測定で確認する)。
+static px_snap_t px_snap_now(void) {
+    px_snap_t s;
+    s.t = px_now_sec();
+    s.v = 0L;
+    s.iv = 0L;
+    s.inb = 0L;
+    s.oub = 0L;
+#if defined(__unix__) || defined(__APPLE__)
+    {
+        struct rusage ru;
+        memset(&ru, 0, sizeof(ru));
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            s.v = (long)ru.ru_nvcsw;
+            s.iv = (long)ru.ru_nivcsw;
+            s.inb = (long)ru.ru_inblock;
+            s.oub = (long)ru.ru_oublock;
+        }
+    }
+#endif
+    return s;
+}
+
+static void px_prof_acc(int ph, px_snap_t a, px_snap_t b) {
+    if (ph < 0 || ph >= PX_PH_N) {
+        return;
+    }
+    px_ph_acc[ph] += b.t - a.t;
+    px_ph_cswv[ph] += (b.v - a.v);
+    px_ph_csiv[ph] += (b.iv - a.iv);
+    px_ph_inb[ph] += (b.inb - a.inb);
+    px_ph_oub[ph] += (b.oub - a.oub);
+}
+
 // RSSをMiBで返す (取得不可時は0)。
 // D2: 自発的/非自発的コンテキストスイッチ差分 (ステップあたり) 用。
 // getrusage(RUSAGE_SELF)のru_nvcsw/ru_nivcswを返す。取得不可時は0。
@@ -335,8 +440,11 @@ static int px_ckpt_layer_fn(int seg_idx, int layer, void *vctx) {
 
 static void px_usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--steps N] [--time SECS] [--lr LR] [--threads T]\n"
-            "  defaults: steps=1073741824 time=6000 lr=1e-3 threads=online\n",
+            "usage: %s [--steps N] [--time SECS] [--lr LR] [--threads T] "
+            "[--profile]\n"
+            "  defaults: steps=1073741824 time=6000 lr=1e-3 threads=online\n"
+            "  --profile: F2 breakdown (10-phase wall/csw/io, measurement "
+            "only)\n",
             prog);
 }
 
@@ -650,6 +758,8 @@ typedef struct px_thr_arg {
     float *Gout;  // bwd用 (fwd時はNULL)。
     float *dtmp;  // bwd用 (fwd時はNULL)。
     int rc;
+    double fwd_sec; // F2 probe: 当該ワーカーのfwd wall (計測のみ)
+    double bwd_sec; // F2 probe: 当該ワーカーのbwd wall (計測のみ)
 } px_thr_arg_t;
 
 // D2粗粒化用: 1ステップ分の fused forward全層 + backward を同一ワーカーで
@@ -658,18 +768,109 @@ typedef struct px_thr_arg {
 static void *px_thr_step(void *v) {
     px_thr_arg_t *arg = (px_thr_arg_t *)v;
     int rc = JT_OK;
+    double t_f0 = 0.0;
+    double t_f1 = 0.0;
+    double t_b0 = 0.0;
+    double t_b1 = 0.0;
     if (arg->Gout != NULL && arg->n_total > 0) {
         memset(arg->Gout, 0, arg->n_total * sizeof(float));
     }
+    t_f0 = px_now_sec();
     px_fwd_all_range(arg->ctx, arg->a, arg->b, &rc);
+    t_f1 = px_now_sec();
+    arg->fwd_sec = t_f1 - t_f0;
     if (rc == JT_OK) {
+        t_b0 = px_now_sec();
         px_bwd_range(arg->ctx, arg->n_total, arg->a, arg->b, arg->Gout,
                      arg->dtmp, &rc);
+        t_b1 = px_now_sec();
+        arg->bwd_sec = t_b1 - t_b0;
+    } else {
+        arg->bwd_sec = 0.0;
     }
     arg->rc = rc;
     return NULL;
 }
 #endif
+
+// F2 probe: 10フェーズ内訳の表示 (計測のみ。計算内容・順序に触れない)。
+// other残差により Σphase = Σstep_wall が成立する。cswのfwd/bwd/sync按分は
+// wall比の近似 (getrusageはプロセス粒度のため)。macOSのinblock/oublockは
+// 常に0の見込みで、esmoe tmpfile量はstats+register計数で代替する。
+static void px_print_profile(long nthr, long steps_done, double run_wall,
+                             const jt_esmoe_stats_t *es0,
+                             const jt_esmoe_stats_t *es1, px_snap_t run0) {
+    px_snap_t run1 = px_snap_now();
+    double sum = 0.0;
+    double step_avg = 0.0;
+    double sum_ms = 0.0;
+    double step_ms = 0.0;
+    if (steps_done <= 0) {
+        steps_done = 1;
+    }
+    for (int q = 0; q < PX_PH_N; q++) {
+        sum += px_ph_acc[q];
+    }
+    step_avg =
+        (steps_done > 0) ? px_step_wall_acc / (double)steps_done : 0.0;
+    sum_ms = (steps_done > 0) ? sum / (double)steps_done * 1000.0 : 0.0;
+    step_ms = step_avg * 1000.0;
+    fprintf(stderr,
+            "train_proxy100m [F2-profile]: threads=%ld steps=%ld "
+            "run_wall=%.3fs\n",
+            nthr, steps_done, run_wall);
+    fprintf(stderr,
+            "train_proxy100m [F2-profile]: %-14s %10s %7s %10s %10s\n",
+            "phase", "ms/step", "pct", "csw_v/step", "csw_iv/step");
+    for (int q = 0; q < PX_PH_N; q++) {
+        double ms = px_ph_acc[q] / (double)steps_done * 1000.0;
+        double pct = (sum > 0.0) ? px_ph_acc[q] / sum * 100.0 : 0.0;
+        double cv = (double)px_ph_cswv[q] / (double)steps_done;
+        double ci = (double)px_ph_csiv[q] / (double)steps_done;
+        fprintf(stderr,
+                "train_proxy100m [F2-profile]: %-14s %10.3f %6.2f%% "
+                "%10.1f %10.1f\n",
+                px_ph_name[q], ms, pct, cv, ci);
+    }
+    fprintf(stderr,
+            "train_proxy100m [F2-profile]: check sum_phases_ms/step=%.3f "
+            "step_wall_avg_ms/step=%.3f diff_us=%.2f\n",
+            sum_ms, step_ms, (sum_ms - step_ms) * 1000.0);
+    fprintf(stderr,
+            "train_proxy100m [F2-profile]: logging_detail loss_ms=%.3f "
+            "sticky_ms=%.3f val_ms=%.3f misc_ms=%.3f (per step avg)\n",
+            px_log_loss / (double)steps_done * 1000.0,
+            px_log_sticky / (double)steps_done * 1000.0,
+            px_log_val / (double)steps_done * 1000.0,
+            px_log_misc / (double)steps_done * 1000.0);
+    {
+        uint64_t rd1 = (es1 != NULL) ? es1->bytes_read : 0ULL;
+        uint64_t rd0 = (es0 != NULL) ? es0->bytes_read : 0ULL;
+        uint64_t ld1 = (es1 != NULL) ? es1->loads : 0ULL;
+        uint64_t ld0 = (es0 != NULL) ? es0->loads : 0ULL;
+        long ckpt_ev = steps_done / (long)PX_CKPT_EVERY;
+        long esmoe_ev = steps_done / (long)PX_ESMOE_EVERY;
+        double cps =
+            (steps_done > 0)
+                ? (double)px_tsc_acc / (double)steps_done
+                : 0.0;
+        double ghz =
+            (step_avg > 0.0 && PX_HAVE_RDTSC) ? cps / step_avg / 1e9 : 0.0;
+        fprintf(stderr,
+                "train_proxy100m [F2-profile]: io run_inblock=%ld "
+                "run_oublock=%ld esmoe_read_bytes=%llu esmoe_loads=%llu "
+                "esmoe_write_bytes=%llu ckpt_events=%ld esmoe_events=%ld\n",
+                run1.inb - run0.inb, run1.oub - run0.oub,
+                (unsigned long long)(rd1 - rd0),
+                (unsigned long long)(ld1 - ld0),
+                (unsigned long long)px_esmoe_write_bytes, ckpt_ev,
+                esmoe_ev);
+        fprintf(stderr,
+                "train_proxy100m [F2-profile]: tsc cycles/step=%.0f "
+                "tsc_GHz_est=%.3f rdtsc=%d (参考値。fenceなし)\n",
+                cps, ghz, PX_HAVE_RDTSC);
+    }
+}
 
 int main(int argc, char **argv) {
     int rc_all = 1;
@@ -715,6 +916,9 @@ int main(int argc, char **argv) {
     float sticky_loss = 0.0f;     // 直近のsticky loss層平均 (毎ステップ計測)
     long csw_prev_v = 0L;  // D2: 前ステップのru_nvcsw (自発的)
     long csw_prev_iv = 0L; // D2: 前ステップのru_nivcsw (非自発的)
+    int profile = 0;       // F2 probe: --profileで10フェーズ内訳を出す
+    px_snap_t prof_run0;   // F2 probe: run全体のio差分開始点
+    jt_esmoe_stats_t prof_es0; // F2 probe: esmoe stats開始点
 
     memset(&opt, 0, sizeof(opt));
     memset(&es, 0, sizeof(es));
@@ -733,6 +937,8 @@ int main(int argc, char **argv) {
             lr = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             nthr_req = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--profile") == 0) {
+            profile = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             px_usage(argv[0]);
@@ -986,23 +1192,58 @@ int main(int argc, char **argv) {
             (double)val_init, PX_VAL_TOKS);
     t0 = px_now_sec();
     px_get_csw(&csw_prev_v, &csw_prev_iv);
+    // F2 probe: run全体のio差分開始点 (計測のみ)。
+    prof_run0 = px_snap_now();
+    memset(&prof_es0, 0, sizeof(prof_es0));
+    if (es_inited) {
+        if (jt_esmoe_stats(&es, &prof_es0) != JT_OK) {
+            memset(&prof_es0, 0, sizeof(prof_es0));
+        }
+    }
 
     for (step = 0; step < max_steps; step++) {
         double loss_sum = 0.0;
+        // F2 probe: ステップ境界 (計測のみ)。
+        px_snap_t s_step0 = px_snap_now();
+        uint64_t tsc0 = px_rdtsc();
+        double ph0[PX_PH_N];
+        long cv0[PX_PH_N];
+        long ci0[PX_PH_N];
+        long ib0[PX_PH_N];
+        long ob0[PX_PH_N];
+        for (int pq = 0; pq < PX_PH_N; pq++) {
+            ph0[pq] = px_ph_acc[pq];
+            cv0[pq] = px_ph_cswv[pq];
+            ci0[pq] = px_ph_csiv[pq];
+            ib0[pq] = px_ph_inb[pq];
+            ob0[pq] = px_ph_oub[pq];
+        }
         float loss = 0.0f;
         double gnorm = 0.0;
         double el = 0.0;
         // ---- ステップ冒頭: 重み全体を1回だけ検証 (unchecked区間の前提)。
         // 以降のトークン×層 (3072コール/ステップ) のper-call重みスキャンを
         // 省略する。ステップ内P不変のため等価。非有限時はfail-closed abort。
-        if (!px_weights_finite(P, n_total)) {
-            fprintf(stderr,
-                    "train_proxy100m: non-finite weights step=%ld\n", step);
-            goto cleanup;
+        // F2 probe: 当該検証はother相へ計上 (計測のみ)。
+        {
+            px_snap_t s_w = px_snap_now();
+            int wf_ok = px_weights_finite(P, n_total);
+            px_prof_acc(PX_PH_OTHER, s_w, px_snap_now());
+            if (!wf_ok) {
+                fprintf(stderr,
+                        "train_proxy100m: non-finite weights step=%ld\n",
+                        step);
+                goto cleanup;
+            }
         }
         // ---- forward: acts[0]=X, acts[l+1]=acts[l]+MoE(acts[l]) ----
-        memcpy(acts, X,
-               (size_t)PX_TOKS * (size_t)PX_N * sizeof(float));
+        // F2 probe: data相 (計測のみ)。
+        {
+            px_snap_t s_d = px_snap_now();
+            memcpy(acts, X,
+                   (size_t)PX_TOKS * (size_t)PX_N * sizeof(float));
+            px_prof_acc(PX_PH_DATA, s_d, px_snap_now());
+        }
         {
             px_ctx_t wctx;
             wctx.P = P;
@@ -1025,6 +1266,10 @@ int main(int argc, char **argv) {
             if (nthr > 1) {
                 pthread_t thrs[16];
                 px_thr_arg_t args[16];
+                // F2 probe: 融合区間のwall/csw (計測のみ)。
+                px_snap_t s_fb0 = px_snap_now();
+                double fwd_max = 0.0;
+                double bwd_max = 0.0;
                 size_t chunk = ((size_t)PX_TOKS + (size_t)nthr - 1) /
                                (size_t)nthr;
                 int bad = 0;
@@ -1042,6 +1287,8 @@ int main(int argc, char **argv) {
                     args[w].Gout = Gpart + (size_t)w * n_total;
                     args[w].dtmp = dtmps + (size_t)w * PX_P_LAYER;
                     args[w].rc = JT_OK;
+                    args[w].fwd_sec = 0.0;
+                    args[w].bwd_sec = 0.0;
                     if (pthread_create(&thrs[w], NULL, px_thr_step,
                                        &args[w]) != 0) {
                         fprintf(stderr,
@@ -1070,11 +1317,80 @@ int main(int argc, char **argv) {
                         G[i] += gp[i];
                     }
                 }
+                // F2 probe: 融合区間を fwd=max(worker fwd)/bwd=max(worker bwd)/
+                // sync=残差(fork/join+reduction+create overhead)に分解。
+                // cswはwall按分 (近似。脚注参照)。計算内容・順序は不変。
+                {
+                    px_snap_t s_fb1 = px_snap_now();
+                    double fused_w = s_fb1.t - s_fb0.t;
+                    long dv = s_fb1.v - s_fb0.v;
+                    long div = s_fb1.iv - s_fb0.iv;
+                    long din = s_fb1.inb - s_fb0.inb;
+                    long dout = s_fb1.oub - s_fb0.oub;
+                    double fw = 0.0;
+                    double bw = 0.0;
+                    double sy = 0.0;
+                    for (long w = 0; w < nthr; w++) {
+                        if (args[w].fwd_sec > fwd_max) {
+                            fwd_max = args[w].fwd_sec;
+                        }
+                        if (args[w].bwd_sec > bwd_max) {
+                            bwd_max = args[w].bwd_sec;
+                        }
+                    }
+                    fw = fwd_max;
+                    bw = bwd_max;
+                    if (fw < 0.0) {
+                        fw = 0.0;
+                    }
+                    if (bw < 0.0) {
+                        bw = 0.0;
+                    }
+                    if (fused_w <= 0.0) {
+                        fw = 0.0;
+                        bw = 0.0;
+                        sy = 0.0;
+                    } else if (fw + bw > fused_w) {
+                        double sc = fused_w / (fw + bw);
+                        fw *= sc;
+                        bw *= sc;
+                        sy = 0.0;
+                    } else {
+                        sy = fused_w - fw - bw;
+                    }
+                    px_ph_acc[PX_PH_FWD] += fw;
+                    px_ph_acc[PX_PH_BWD] += bw;
+                    px_ph_acc[PX_PH_SYNC] += sy;
+                    if (fused_w > 0.0) {
+                        px_ph_cswv[PX_PH_FWD] += (long)(dv * (fw / fused_w));
+                        px_ph_cswv[PX_PH_BWD] += (long)(dv * (bw / fused_w));
+                        px_ph_cswv[PX_PH_SYNC] +=
+                            dv - (long)(dv * (fw / fused_w)) -
+                            (long)(dv * (bw / fused_w));
+                        px_ph_csiv[PX_PH_FWD] += (long)(div * (fw / fused_w));
+                        px_ph_csiv[PX_PH_BWD] += (long)(div * (bw / fused_w));
+                        px_ph_csiv[PX_PH_SYNC] +=
+                            div - (long)(div * (fw / fused_w)) -
+                            (long)(div * (bw / fused_w));
+                        px_ph_inb[PX_PH_SYNC] += din;
+                        px_ph_oub[PX_PH_SYNC] += dout;
+                    } else {
+                        px_ph_cswv[PX_PH_SYNC] += dv;
+                        px_ph_csiv[PX_PH_SYNC] += div;
+                        px_ph_inb[PX_PH_SYNC] += din;
+                        px_ph_oub[PX_PH_SYNC] += dout;
+                    }
+                }
             } else
 #endif
             {
                 int frc = JT_OK;
-                px_fwd_all_range(&wctx, 0, PX_TOKS, &frc);
+                // F2 probe: fwd相 (計測のみ)。
+                {
+                    px_snap_t s_f = px_snap_now();
+                    px_fwd_all_range(&wctx, 0, PX_TOKS, &frc);
+                    px_prof_acc(PX_PH_FWD, s_f, px_snap_now());
+                }
                 if (frc != JT_OK) {
                     fprintf(stderr,
                             "train_proxy100m: fwd failed step=%ld rc=%d\n",
@@ -1083,8 +1399,11 @@ int main(int argc, char **argv) {
                 }
                 {
                     int brc = JT_OK;
+                    // F2 probe: bwd相 (G zero含む。計測のみ)。
+                    px_snap_t s_b = px_snap_now();
                     memset(G, 0, n_total * sizeof(float));
                     px_bwd_range(&wctx, n_total, 0, PX_TOKS, G, dtmp, &brc);
+                    px_prof_acc(PX_PH_BWD, s_b, px_snap_now());
                     if (brc != JT_OK) {
                         fprintf(stderr,
                                 "train_proxy100m: bwd failed step=%ld rc=%d\n",
@@ -1095,7 +1414,9 @@ int main(int argc, char **argv) {
             }
         }
         // ---- loss (MSE) ----
+        // F2 probe: logging相へ計上 (計測のみ)。
         {
+            px_snap_t s_l0 = px_snap_now();
             const float *Wo = P + head_off;
             float bo = P[head_off + (size_t)PX_N];
             const float *alast =
@@ -1110,6 +1431,11 @@ int main(int argc, char **argv) {
                 loss_sum += diff * diff;
             }
             loss = (float)(loss_sum / (double)PX_TOKS);
+            {
+                px_snap_t s_l1 = px_snap_now();
+                px_prof_acc(PX_PH_LOGGING, s_l0, s_l1);
+                px_log_loss += s_l1.t - s_l0.t;
+            }
         }
         if (!isfinite(loss)) {
             fprintf(stderr, "train_proxy100m: non-finite loss step=%ld\n",
@@ -1121,7 +1447,9 @@ int main(int argc, char **argv) {
         // ダミーgate禁止: Cids/Cw (実top-k結果) 由来のみを使う。共有expertは
         // routing.h方針で対象外 (routedのみ)。損失合算・逆伝播はTODOのため
         // 測定・記録のみ (scaffold段階の実経路確認)。
+        // F2 probe: logging相へ計上 (計測のみ)。
         {
+            px_snap_t s_s0 = px_snap_now();
             double ssum = 0.0;
             for (int l = 0; l < PX_LAYERS; l++) {
                 for (int t = 0; t < PX_TOKS; t++) {
@@ -1158,10 +1486,17 @@ int main(int argc, char **argv) {
                 ssum += (double)sl;
             }
             sticky_loss = (float)(ssum / (double)PX_LAYERS);
+            {
+                px_snap_t s_s1 = px_snap_now();
+                px_prof_acc(PX_PH_LOGGING, s_s0, s_s1);
+                px_log_sticky += s_s1.t - s_s0.t;
+            }
         }
 
         // ---- ckpt recompute照合 (5ステップ毎、token0) ----
         if ((step + 1) % PX_CKPT_EVERY == 0) {
+            // F2 probe: ckpt_recompute相 (計測のみ)。
+            px_snap_t s_c0 = px_snap_now();
             jt_ckpt_plan_t plan;
             px_ckpt_ctx_t ctx;
             float bnd[16 * PX_N];
@@ -1215,10 +1550,14 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            px_prof_acc(PX_PH_CKPT, s_c0, px_snap_now());
         }
 
         // ---- esmoe往復 (5ステップ毎、layer0 Wd実重み) ----
         if ((step + 1) % PX_ESMOE_EVERY == 0) {
+            // F2 probe: esmoe_io相 (allocは分離。計測のみ)。
+            px_snap_t s_e0 = px_snap_now();
+            double alloc0 = px_ph_acc[PX_PH_ALLOC];
             const float *base0 = P + layer_off[0];
             const float *Wd0 = base0 + PX_P_WGATE + (size_t)2 * PX_P_ROUTED;
             const unsigned char *wdb = (const unsigned char *)Wd0;
@@ -1231,6 +1570,8 @@ int main(int argc, char **argv) {
                             step);
                     goto cleanup;
                 }
+                // F2 probe: backingへのpwrite量 (statsに無いため計測)。
+                px_esmoe_write_bytes += (uint64_t)eb;
             }
             if (jt_esmoe_evict(&es, 1) != JT_OK) {
                 fprintf(stderr, "train_proxy100m: esmoe evict failed\n");
@@ -1246,8 +1587,13 @@ int main(int argc, char **argv) {
                 }
             }
             for (uint32_t e = 0; e < (uint32_t)PX_E; e++) {
-                unsigned char *out =
-                    (unsigned char *)malloc(eb ? eb : 1);
+                unsigned char *out = NULL;
+                // F2 probe: alloc相 (mallocのみ。計測のみ)。
+                {
+                    double t_a0 = px_now_sec();
+                    out = (unsigned char *)malloc(eb ? eb : 1);
+                    px_ph_acc[PX_PH_ALLOC] += px_now_sec() - t_a0;
+                }
                 if (out == NULL) {
                     fprintf(stderr, "train_proxy100m: esmoe OOM\n");
                     errno = ENOMEM;
@@ -1257,7 +1603,12 @@ int main(int argc, char **argv) {
                 int cmp = (lrc == JT_OK)
                               ? memcmp(out, wdb + (size_t)e * eb, eb)
                               : 1;
-                free(out);
+                // F2 probe: alloc相 (freeのみ。計測のみ)。
+                {
+                    double t_f0 = px_now_sec();
+                    free(out);
+                    px_ph_acc[PX_PH_ALLOC] += px_now_sec() - t_f0;
+                }
                 if (lrc != JT_OK || cmp != 0) {
                     fprintf(stderr,
                             "train_proxy100m: esmoe roundtrip mismatch step=%ld "
@@ -1266,9 +1617,22 @@ int main(int argc, char **argv) {
                     goto cleanup;
                 }
             }
+            // F2 probe: esmoe_io = ブロックwall - alloc分。csw/io差分は
+            // esmoe_ioへ全計上 (allocのcswは無視できる。計測のみ)。
+            {
+                px_snap_t s_e1 = px_snap_now();
+                double alloc_d = px_ph_acc[PX_PH_ALLOC] - alloc0;
+                px_ph_acc[PX_PH_ESMOE] += (s_e1.t - s_e0.t) - alloc_d;
+                px_ph_cswv[PX_PH_ESMOE] += (s_e1.v - s_e0.v);
+                px_ph_csiv[PX_PH_ESMOE] += (s_e1.iv - s_e0.iv);
+                px_ph_inb[PX_PH_ESMOE] += (s_e1.inb - s_e0.inb);
+                px_ph_oub[PX_PH_ESMOE] += (s_e1.oub - s_e0.oub);
+            }
         }
 
         // ---- optim更新 (非有限ガード + global norm clip 1.0付き) ----
+        // F2 probe: optim相 (計測のみ)。
+        px_snap_t s_o0 = px_snap_now();
         {
             double acc = 0.0;
             for (size_t i = 0; i < n_total; i++) {
@@ -1294,10 +1658,13 @@ int main(int argc, char **argv) {
                     step);
             goto cleanup;
         }
+        px_prof_acc(PX_PH_OPTIM, s_o0, px_snap_now());
 
         // ---- held-out val計測 (forwardのみ。valで更新は絶対にしない)。
         // 5ステップ毎＋最終ステップで再計測し、それ以外は直近値を維持。
+        // F2 probe: logging相へ計上 (計測のみ)。
         if ((step + 1) % PX_VAL_EVERY == 0 || step + 1 == max_steps) {
+            px_snap_t s_v0 = px_snap_now();
             float vv =
                 px_val_loss(P, layer_off, head_off, Xv, Tv, Vacts);
             if (!isfinite((double)vv)) {
@@ -1307,9 +1674,16 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
             val_loss = vv;
+            {
+                px_snap_t s_v1 = px_snap_now();
+                px_prof_acc(PX_PH_LOGGING, s_v0, s_v1);
+                px_log_val += s_v1.t - s_v0.t;
+            }
         }
 
         // ---- ログ ----
+        // F2 probe: logging相 (計測のみ)。
+        px_snap_t s_g0 = px_snap_now();
         el = px_now_sec() - t0;
         {
             double done = (double)(step + 1);
@@ -1338,6 +1712,35 @@ int main(int argc, char **argv) {
                     step + 1, (double)loss, (double)val_loss,
                     (double)sticky_loss, sps, tps,
                     px_rss_mib(), gnorm, el, csw_dv, csw_div);
+        }
+        px_snap_t s_g1 = px_snap_now();
+        px_prof_acc(PX_PH_LOGGING, s_g0, s_g1);
+        px_log_misc += s_g1.t - s_g0.t;
+        // F2 probe: other残差 = step_wall - sum(他9相)。合計一致用 (計測のみ)。
+        {
+            px_snap_t s_step1 = px_snap_now();
+            uint64_t tsc1 = px_rdtsc();
+            double accounted = 0.0;
+            long cv_acc = 0L;
+            long ci_acc = 0L;
+            long ib_acc = 0L;
+            long ob_acc = 0L;
+            px_tsc_acc += (tsc1 - tsc0);
+            // 全相 (OTHER直計上分=weights_finite含む) を差し引くことで
+            // Σphase = Σstep_wall を厳密に成立させる。
+            for (int pq = 0; pq < PX_PH_N; pq++) {
+                accounted += px_ph_acc[pq] - ph0[pq];
+                cv_acc += px_ph_cswv[pq] - cv0[pq];
+                ci_acc += px_ph_csiv[pq] - ci0[pq];
+                ib_acc += px_ph_inb[pq] - ib0[pq];
+                ob_acc += px_ph_oub[pq] - ob0[pq];
+            }
+            px_ph_acc[PX_PH_OTHER] += (s_step1.t - s_step0.t) - accounted;
+            px_ph_cswv[PX_PH_OTHER] += (s_step1.v - s_step0.v) - cv_acc;
+            px_ph_csiv[PX_PH_OTHER] += (s_step1.iv - s_step0.iv) - ci_acc;
+            px_ph_inb[PX_PH_OTHER] += (s_step1.inb - s_step0.inb) - ib_acc;
+            px_ph_oub[PX_PH_OTHER] += (s_step1.oub - s_step0.oub) - ob_acc;
+            px_step_wall_acc += (s_step1.t - s_step0.t);
         }
         if (el >= time_limit) {
             fprintf(stderr, "train_proxy100m: time limit %.0fs reached\n",
@@ -1368,6 +1771,19 @@ int main(int argc, char **argv) {
                 step + 1 <= max_steps ? step + 1 : max_steps, el,
                 (el > 0.0 && done > 0.0) ? done / el : 0.0, px_rss_mib(),
                 (double)val_init, (double)val_loss, (double)sticky_loss);
+    }
+    // F2 probe: --profile時のみ内訳表示 (計測のみ)。
+    if (profile) {
+        jt_esmoe_stats_t prof_es1;
+        memset(&prof_es1, 0, sizeof(prof_es1));
+        if (es_inited) {
+            if (jt_esmoe_stats(&es, &prof_es1) != JT_OK) {
+                memset(&prof_es1, 0, sizeof(prof_es1));
+            }
+        }
+        px_print_profile(nthr, (step < max_steps ? step + 1 : max_steps),
+                         px_now_sec() - t0, &prof_es0, &prof_es1,
+                         prof_run0);
     }
     rc_all = 0;
 
