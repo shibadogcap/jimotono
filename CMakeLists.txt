@@ -142,6 +142,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_model1b bench/kernel/test_model1b.c)
   target_link_libraries(test_model1b PRIVATE jimotono_core)
 
+  # train_longrun: 長時間学習ベンチ (実行バイナリのみ。ctestには追加しない)。
+  add_executable(train_longrun bench/kernel/train_longrun.c)
+  target_link_libraries(train_longrun PRIVATE jimotono_core)
 endif()
 
 enable_testing()
