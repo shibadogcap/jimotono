@@ -47,6 +47,7 @@ add_library(jimotono_core
   src/mixed_prec.c
   src/lut_aware.c
   src/model1b.c
+  src/moe_layer.c
 )
 # POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
@@ -129,6 +130,8 @@ if(JIMOTONO_BUILD_BENCH)
 
   add_executable(test_cycle_bench bench/kernel/test_cycle_bench.c)
   target_link_libraries(test_cycle_bench PRIVATE jimotono_core jimotono_bench_common)
+  add_executable(test_moe_layer bench/kernel/test_moe_layer.c)
+  target_link_libraries(test_moe_layer PRIVATE jimotono_core)
   # bench_schema.md の commit 記録用にビルド時ハッシュを埋め込む (取得不可時は空)。
   execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE JIMOTONO_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
@@ -157,6 +160,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME e2e_pipe COMMAND test_e2e_pipe)
   add_test(NAME cycle COMMAND test_cycle_bench)
   add_test(NAME model1b COMMAND test_model1b)
+  add_test(NAME moe_layer COMMAND test_moe_layer)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
