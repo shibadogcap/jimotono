@@ -5,6 +5,14 @@
 // 準拠: AGENTS.MD §3.3 (学習時はLUT-Dense層を通常のテンソル演算で学習し、
 //   推論時にLUTへコンパイル)、§2.2混合精度 (ビット幅はmixed_prec.hのpolicy)。
 //
+// 用語注記 (MINOR-1対応。knowledge/papers.md §1警告との整合):
+// 本プロジェクトの「LUT-aware / HGQ-LUT方式」は、学習時にLUT-Dense層を通常の
+// fp32テンソル演算で学習し推論時にLUTへコンパイルする学習足場を指す
+// (AGENTS.MD §3.3)。T-MAC論文 (2407.00088) のCPU動的LUTとも、FPGA用HGQ
+// (BN+Dense+Actを真理値表に静的展開) とも別物であり、T-MAC文脈ではHGQと
+// 呼ばない (papers.md §1「学習→推論の流れ (注意: HGQ-LUTとは別物)」参照)。
+// コード側 jt_lut_* のリネームはAPI影響が大きいため行わない。
+//
 // 設計:
 // - forward (jt_lut_dense_fwd): fp32テンソル演算でLUT-Dense等価値を計算する
 //   (Y = XW [+b])。同時に重みをper-block量子化→逆量子化して量子化誤差統計
