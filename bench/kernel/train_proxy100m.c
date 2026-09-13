@@ -438,13 +438,57 @@ static int px_ckpt_layer_fn(int seg_idx, int layer, void *vctx) {
     return JT_OK;
 }
 
+// F3-5: lrスケジュール (warmup 100 + cosine decay)。数値等価ではなく
+// 学習動態の改善用。既定base lrは2e-4。
+#define PX_LR_WARMUP 100L
+#define PX_LR_DEFAULT 2e-4f
+#ifndef PX_LR_PI
+#define PX_LR_PI 3.14159265358979323846
+#endif
+// スケジュールlrを返す (stepは0-indexed、T=max_steps、W=warmup、B=base)。
+// step<W: 線形warmup B*(step+1)/W。以降: cosine B*0.5*(1+cos(pi*(step+1-W)/(T-W)))。
+// T<=W時はwarmupのみ。常に有限・非負を返す。
+static float px_sched_lr(long step, long total, float base) {
+    double B = (double)base;
+    double W = 100.0;
+    double T = (total > 0) ? (double)total : 1.0;
+    double s = (double)(step + 1);
+    double lr = B;
+    if (!(B > 0.0) || !isfinite(B)) {
+        return base;
+    }
+    if (s <= W) {
+        lr = B * (s / W);
+    } else if (T <= W) {
+        lr = B;
+    } else {
+        double p = (s - W) / (T - W);
+        if (p < 0.0) {
+            p = 0.0;
+        }
+        if (p > 1.0) {
+            p = 1.0;
+        }
+        lr = B * 0.5 * (1.0 + cos(p * PX_LR_PI));
+    }
+    if (!isfinite(lr) || lr < 0.0) {
+        lr = 0.0;
+    }
+    return (float)lr;
+}
 static void px_usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [--steps N] [--time SECS] [--lr LR] [--threads T] "
-            "[--profile]\n"
-            "  defaults: steps=1073741824 time=6000 lr=1e-3 threads=online\n"
+            "[--profile] [--no-offload] [--no-ckpt] [--no-sched]\n"
+            "  defaults: steps=1073741824 time=6000 lr=2e-4 threads=6\n"
             "  --profile: F2 breakdown (10-phase wall/csw/io, measurement "
-            "only)\n",
+            "only)\n"
+            "  --no-offload: disable ESMoE roundtrip (28M resident, skip "
+            "register/prefetch/load check)\n"
+            "  --no-ckpt: disable ckpt recompute check (skip recompute "
+            "verification)\n"
+            "  --no-sched: disable lr schedule (fixed lr; default is warmup "
+            "100 + cosine decay)\n",
             prog);
 }
 
@@ -876,7 +920,7 @@ int main(int argc, char **argv) {
     int rc_all = 1;
     long max_steps = 1073741824L;
     double time_limit = 6000.0;
-    float lr = 1e-3f;
+    float lr = PX_LR_DEFAULT;
     float *P = NULL;
     float *G = NULL;
     float *X = NULL;
@@ -917,6 +961,9 @@ int main(int argc, char **argv) {
     long csw_prev_v = 0L;  // D2: 前ステップのru_nvcsw (自発的)
     long csw_prev_iv = 0L; // D2: 前ステップのru_nivcsw (非自発的)
     int profile = 0;       // F2 probe: --profileで10フェーズ内訳を出す
+    int no_offload = 0; // F3-1: --no-offloadでESMoE往復を無効化
+    int no_ckpt = 0;    // F3-2: --no-ckptでckpt recompute照合を無効化
+    int no_sched = 0;   // F3-5: --no-schedでlrスケジュール無効化 (固定lr)
     px_snap_t prof_run0;   // F2 probe: run全体のio差分開始点
     jt_esmoe_stats_t prof_es0; // F2 probe: esmoe stats開始点
 
@@ -939,6 +986,12 @@ int main(int argc, char **argv) {
             nthr_req = atol(argv[++i]);
         } else if (strcmp(argv[i], "--profile") == 0) {
             profile = 1;
+        } else if (strcmp(argv[i], "--no-offload") == 0) {
+            no_offload = 1;
+        } else if (strcmp(argv[i], "--no-ckpt") == 0) {
+            no_ckpt = 1;
+        } else if (strcmp(argv[i], "--no-sched") == 0) {
+            no_sched = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             px_usage(argv[0]);
@@ -957,19 +1010,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // ---- スレッド数 (既定=オンラインCPU数、上限16)。同一nthrでは静的分割+
-    // 順序付きreductionのため決定的。
+    // ---- スレッド数 (F3-3: 既定=6。F2で4〜6Tが最速、online(12T)はsync増で
+    // 後退のため過剰)。同一nthrでは静的分割+順序付きreductionのため決定的。
+    // 明示--threads指定は1〜16で上書き可能。
     nthr = nthr_req;
-#if PX_HAVE_PTHREAD && defined(_SC_NPROCESSORS_ONLN)
     if (nthr == 0) {
-        long on = sysconf(_SC_NPROCESSORS_ONLN);
-        nthr = (on > 0) ? on : 4L;
+        nthr = 6L;
     }
-#else
-    if (nthr == 0) {
-        nthr = 1L;
-    }
-#endif
 #if !PX_HAVE_PTHREAD
     nthr = 1L;
 #endif
@@ -1166,7 +1213,14 @@ int main(int argc, char **argv) {
     }
 
     // ---- esmoe (layer0 Wd形状: 16 experts × H*N floats) ----
-    {
+    // F3-1: --no-offload時は全常駐 (物理28M) のためoffload自体が不要。
+    // 初期化・往復照合を共にスキップし、その旨をログに明示する。
+    if (no_offload) {
+        fprintf(stderr,
+                "train_proxy100m: esmoe offload disabled (--no-offload): "
+                "28M resident, skipping register/prefetch/load roundtrip "
+                "check\n");
+    } else {
         jt_esmoe_cfg_t ecfg;
         ecfg.n_experts = (uint32_t)PX_E;
         ecfg.expert_bytes = (size_t)PX_H * (size_t)PX_N * sizeof(float);
@@ -1179,8 +1233,26 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "train_proxy100m: start max_steps=%ld time_limit=%.0fs lr=%g\n",
-            max_steps, time_limit, (double)lr);
+            "train_proxy100m: start max_steps=%ld time_limit=%.0fs lr=%g%s%s%s\n",
+            max_steps, time_limit, (double)lr,
+            no_offload ? " --no-offload" : "",
+            no_ckpt ? " --no-ckpt" : "", no_sched ? " --no-sched" : "");
+    if (no_ckpt) {
+        fprintf(stderr,
+                "train_proxy100m: ckpt recompute check disabled (--no-ckpt): "
+                "skipping recompute verification\n");
+    }
+    if (no_sched) {
+        fprintf(stderr,
+                "train_proxy100m: lr schedule disabled (--no-sched): fixed "
+                "lr=%g\n",
+                (double)lr);
+    } else {
+        fprintf(stderr,
+                "train_proxy100m: lr schedule warmup=%ld + cosine decay "
+                "(base lr=%g, T=%ld)\n",
+                PX_LR_WARMUP, (double)lr, max_steps);
+    }
     // 開始前val (初期値記録。forwardのみ・更新なし)。
     val_init = px_val_loss(P, layer_off, head_off, Xv, Tv, Vacts);
     if (!isfinite((double)val_init)) {
@@ -1494,7 +1566,11 @@ int main(int argc, char **argv) {
         }
 
         // ---- ckpt recompute照合 (5ステップ毎、token0) ----
-        if ((step + 1) % PX_CKPT_EVERY == 0) {
+        // F3-2: --no-ckpt時はスキップ (数値には触れないためloss軌道不変)。
+        // 照合スキップをログ明示 (起動時に1行)。
+        if (no_ckpt) {
+            /* skip: ckpt recompute verification disabled */
+        } else if ((step + 1) % PX_CKPT_EVERY == 0) {
             // F2 probe: ckpt_recompute相 (計測のみ)。
             px_snap_t s_c0 = px_snap_now();
             jt_ckpt_plan_t plan;
@@ -1554,7 +1630,10 @@ int main(int argc, char **argv) {
         }
 
         // ---- esmoe往復 (5ステップ毎、layer0 Wd実重み) ----
-        if ((step + 1) % PX_ESMOE_EVERY == 0) {
+        // F3-1: --no-offload時はスキップ (数値には触れないためloss軌道不変)。
+        if (no_offload) {
+            /* skip: 28M residentのため往復照合なし */
+        } else if ((step + 1) % PX_ESMOE_EVERY == 0) {
             // F2 probe: esmoe_io相 (allocは分離。計測のみ)。
             px_snap_t s_e0 = px_snap_now();
             double alloc0 = px_ph_acc[PX_PH_ALLOC];
@@ -1631,8 +1710,15 @@ int main(int argc, char **argv) {
         }
 
         // ---- optim更新 (非有限ガード + global norm clip 1.0付き) ----
+        // F3-5: lrスケジュール適用 (warmup 100 + cosine)。--no-sched時は固定。
+        // opt.lrをステップ毎に更新するのみで、更新式自体は不変。
         // F2 probe: optim相 (計測のみ)。
         px_snap_t s_o0 = px_snap_now();
+        float cur_lr = lr;
+        if (!no_sched) {
+            cur_lr = px_sched_lr(step, max_steps, lr);
+        }
+        opt.lr = cur_lr;
         {
             double acc = 0.0;
             for (size_t i = 0; i < n_total; i++) {
@@ -1705,12 +1791,12 @@ int main(int argc, char **argv) {
             csw_prev_v = csw_cur_v;
             csw_prev_iv = csw_cur_iv;
             fprintf(stderr,
-                    "step=%ld loss=%.6f val_loss=%.6f sticky=%.6f "
+                    "step=%ld loss=%.6f val_loss=%.6f sticky=%.6f lr=%.6g "
                     "steps_sec=%.3f "
                     "toks_sec=%.1f rss_mib=%.1f gnorm=%.4f elapsed=%.1fs "
                     "csw_v=%ld csw_iv=%ld\n",
                     step + 1, (double)loss, (double)val_loss,
-                    (double)sticky_loss, sps, tps,
+                    (double)sticky_loss, (double)cur_lr, sps, tps,
                     px_rss_mib(), gnorm, el, csw_dv, csw_div);
         }
         px_snap_t s_g1 = px_snap_now();
