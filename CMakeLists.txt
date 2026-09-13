@@ -43,6 +43,8 @@ add_library(jimotono_core
   src/checkpoint.c
   src/optim8.c
   src/esmoe.c
+  src/mixed_prec.c
+  src/lut_aware.c
 )
 target_include_directories(jimotono_core PUBLIC include)
 # io_uring (Linuxのみ, Phase 2足場)。既定OFFでfallback (ENOSYS) ビルド。
@@ -108,6 +110,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_optim_offload bench/kernel/test_optim_offload.c)
   target_link_libraries(test_optim_offload PRIVATE jimotono_core)
 
+  add_executable(test_mixed_lut bench/kernel/test_mixed_lut.c)
+  target_link_libraries(test_mixed_lut PRIVATE jimotono_core)
+
 endif()
 
 enable_testing()
@@ -121,6 +126,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME uring COMMAND test_uring)
   add_test(NAME train_bwd COMMAND test_train_bwd)
   add_test(NAME optim_offload COMMAND test_optim_offload)
+  add_test(NAME mixed_lut COMMAND test_mixed_lut)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
