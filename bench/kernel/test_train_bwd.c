@@ -628,6 +628,175 @@ static void test_rmsnorm_grad(void) {
           "rms eps=0");
 }
 
+// ---- SwiGLU/RMSNorm forward単体 (手計算値, tol=1e-5) ----
+
+static int fwd_close(float got, double want, double tol) {
+    double d = fabs((double)got - want);
+    double allowed = tol + tol * fabs(want);
+    return d <= allowed;
+}
+
+static void test_swiglu_fwd(void) {
+    const int n = 2;
+    const int h = 2;
+    const double tol = 1e-5;
+    // 手計算 (double):
+    //   G0=1*1+(-0.5)*0.5=0.75, U0=1*0.5+(-0.5)*(-1)=1.0
+    //   G1=1*(-1)+(-0.5)*2=-2.0, U1=1*2+(-0.5)*0=2.0
+    //   s0=silu(0.75)*1.0=0.5093840244, s1=silu(-2)*2=-0.4768116881
+    //   Y0=s0*1+s1*(-0.5)=0.7477898684, Y1=s0*2+s1*1.5=0.3035505166
+    float X[2] = {1.0f, -0.5f};
+    float Wg[4] = {1.0f, 0.5f, -1.0f, 2.0f};
+    float Wu[4] = {0.5f, -1.0f, 2.0f, 0.0f};
+    float Wd[4] = {1.0f, 2.0f, -0.5f, 1.5f};
+    float G[2] = {0.0f, 0.0f};
+    float U[2] = {0.0f, 0.0f};
+    float Y[2] = {0.0f, 0.0f};
+    int rc = jt_swiglu_fwd(X, Wg, Wu, Wd, G, U, Y, n, h);
+    CHECK(rc == JT_OK, "swiglu_fwd rc=%d", rc);
+    if (rc == JT_OK) {
+        CHECK(fwd_close(G[0], 0.75, tol), "swiglu_fwd G0=%f", G[0]);
+        CHECK(fwd_close(G[1], -2.0, tol), "swiglu_fwd G1=%f", G[1]);
+        CHECK(fwd_close(U[0], 1.0, tol), "swiglu_fwd U0=%f", U[0]);
+        CHECK(fwd_close(U[1], 2.0, tol), "swiglu_fwd U1=%f", U[1]);
+        CHECK(fwd_close(Y[0], 0.7477898684257798, tol), "swiglu_fwd Y0=%f",
+              Y[0]);
+        CHECK(fwd_close(Y[1], 0.30355051663038424, tol), "swiglu_fwd Y1=%f",
+              Y[1]);
+    }
+    // double参照との一致 (既存finite-diffと同一式)。
+    {
+        double rX[2], rWg[4], rWu[4], rWd[4], rY[2];
+        for (int j = 0; j < n; j++) {
+            rX[j] = (double)X[j];
+        }
+        for (int i = 0; i < 4; i++) {
+            rWg[i] = (double)Wg[i];
+            rWu[i] = (double)Wu[i];
+            rWd[i] = (double)Wd[i];
+        }
+        ref_swiglu_fwd(rX, rWg, rWu, rWd, rY, n, h);
+        CHECK(fwd_close(Y[0], rY[0], tol), "swiglu_fwd ref Y0=%f vs %f",
+              Y[0], rY[0]);
+        CHECK(fwd_close(Y[1], rY[1], tol), "swiglu_fwd ref Y1=%f vs %f",
+              Y[1], rY[1]);
+    }
+    // bwdとの勾配整合: fwd核のG/Uをbwdへ渡して正常終了すること。
+    {
+        float dY[2] = {0.3f, -0.2f};
+        float dX[2] = {0.0f, 0.0f};
+        float dWg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float dWu[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float dWd[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int brc = jt_swiglu_bwd(dY, X, G, U, Wd, Wg, Wu, dX, dWg, dWu,
+                                dWd, n, h);
+        CHECK(brc == JT_OK, "swiglu fwd->bwd rc=%d", brc);
+        if (brc == JT_OK) {
+            for (int i = 0; i < n; i++) {
+                CHECK(isfinite(dX[i]), "swiglu fwd->bwd dX[%d]=%f", i,
+                      dX[i]);
+            }
+        }
+    }
+    // 不正系 (fail-closed: 出力不変)。
+    {
+        float g0 = G[0], u0 = U[0], y0 = Y[0];
+        CHECK(jt_swiglu_fwd(NULL, Wg, Wu, Wd, G, U, Y, n, h) ==
+                  JT_ERR_INVAL,
+              "swiglu_fwd NULL X");
+        CHECK(jt_swiglu_fwd(X, Wg, Wu, Wd, G, U, Y, 0, h) ==
+                  JT_ERR_INVAL,
+              "swiglu_fwd n=0");
+        CHECK(jt_swiglu_fwd(X, Wg, Wu, Wd, G, U, Y, n, 0) ==
+                  JT_ERR_INVAL,
+              "swiglu_fwd h=0");
+        CHECK(jt_swiglu_fwd(X, Wg, Wu, Wd, G, U, Y, JT_BWD_MAX_WIDE + 1,
+                            h) == JT_ERR_INVAL,
+              "swiglu_fwd n over max");
+        CHECK(G[0] == g0 && U[0] == u0 && Y[0] == y0,
+              "swiglu_fwd mutated on inval");
+        errno = 0;
+        {
+            float badX[2] = {1.0f, (float)NAN};
+            float g1 = G[0];
+            int nrc = jt_swiglu_fwd(badX, Wg, Wu, Wd, G, U, Y, n, h);
+            CHECK(nrc == JT_ERR_INVAL && errno == EINVAL,
+                  "swiglu_fwd nan");
+            CHECK(G[0] == g1, "swiglu_fwd nan mutated");
+        }
+    }
+}
+
+static void test_rmsnorm_fwd(void) {
+    const int n = 4;
+    const double tol = 1e-5;
+    const float eps = 1e-6f;
+    // 手計算: mean=(1+4+1+0.25)/4=1.5625, r=1/sqrt(1.5625+1e-6)。
+    float X[4] = {1.0f, 2.0f, -1.0f, 0.5f};
+    float W[4] = {1.0f, 0.5f, 2.0f, 1.0f};
+    float Y[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = jt_rmsnorm_fwd(X, W, Y, n, eps);
+    CHECK(rc == JT_OK, "rmsnorm_fwd rc=%d", rc);
+    if (rc == JT_OK) {
+        CHECK(fwd_close(Y[0], 0.7999997440001229, tol),
+              "rmsnorm_fwd Y0=%f", Y[0]);
+        CHECK(fwd_close(Y[1], 0.7999997440001229, tol),
+              "rmsnorm_fwd Y1=%f", Y[1]);
+        CHECK(fwd_close(Y[2], -1.5999994880002457, tol),
+              "rmsnorm_fwd Y2=%f", Y[2]);
+        CHECK(fwd_close(Y[3], 0.39999987200006143, tol),
+              "rmsnorm_fwd Y3=%f", Y[3]);
+    }
+    // double参照との一致。
+    {
+        double rX[4], rW[4], rY[4];
+        for (int i = 0; i < n; i++) {
+            rX[i] = (double)X[i];
+            rW[i] = (double)W[i];
+        }
+        ref_rms_fwd(rX, rW, rY, n, (double)eps);
+        for (int i = 0; i < n; i++) {
+            CHECK(fwd_close(Y[i], rY[i], tol),
+                  "rmsnorm_fwd ref Y[%d]=%f vs %f", i, Y[i], rY[i]);
+        }
+    }
+    // bwdとの勾配整合: fwd核出力をbwd経路に渡して正常終了すること。
+    {
+        float dY[4] = {0.2f, -0.1f, 0.4f, 0.1f};
+        float dX[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float dW[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int brc = jt_rmsnorm_bwd(dY, X, W, dX, dW, n, eps);
+        CHECK(brc == JT_OK, "rmsnorm fwd->bwd rc=%d", brc);
+        if (brc == JT_OK) {
+            for (int i = 0; i < n; i++) {
+                CHECK(isfinite(dX[i]) && isfinite(dW[i]),
+                      "rmsnorm fwd->bwd [%d]=%f/%f", i, dX[i], dW[i]);
+            }
+        }
+    }
+    // 不正系 (fail-closed: 出力不変)。
+    {
+        float y0 = Y[0];
+        CHECK(jt_rmsnorm_fwd(NULL, W, Y, n, eps) == JT_ERR_INVAL,
+              "rmsnorm_fwd NULL X");
+        CHECK(jt_rmsnorm_fwd(X, W, Y, 0, eps) == JT_ERR_INVAL,
+              "rmsnorm_fwd n=0");
+        CHECK(jt_rmsnorm_fwd(X, W, Y, n, 0.0f) == JT_ERR_INVAL,
+              "rmsnorm_fwd eps=0");
+        CHECK(jt_rmsnorm_fwd(X, W, Y, n, -1.0f) == JT_ERR_INVAL,
+              "rmsnorm_fwd eps<0");
+        CHECK(Y[0] == y0, "rmsnorm_fwd mutated on inval");
+        errno = 0;
+        {
+            float badX[4] = {1.0f, 2.0f, (float)INFINITY, 0.5f};
+            int nrc = jt_rmsnorm_fwd(badX, W, Y, n, eps);
+            CHECK(nrc == JT_ERR_INVAL && errno == EINVAL,
+                  "rmsnorm_fwd inf");
+            CHECK(Y[0] == y0, "rmsnorm_fwd inf mutated");
+        }
+    }
+}
+
 // ---- checkpoint足場 ----
 
 static int ckpt_fwd_stub(int layer, void *ctx) {
@@ -715,6 +884,8 @@ int main(void) {
     test_gdn2_bwd_invalid();
     test_swiglu_grad();
     test_rmsnorm_grad();
+    test_swiglu_fwd();
+    test_rmsnorm_fwd();
     test_checkpoint();
     if (g_fail != 0) {
         fprintf(stderr, "train_bwd: FAIL\n");

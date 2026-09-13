@@ -91,6 +91,29 @@ int jt_rmsnorm_bwd(const float *restrict dY, const float *restrict X,
                    const float *restrict W, float *restrict dX,
                    float *restrict dW, int n, float eps);
 
+// SwiGLU融合の順伝播 (jt_swiglu_bwdと整合するforward核)。
+// 定義 (bwdコメントと同一):
+//   G[i] = sum_j X[j] Wg[i][j], U[i] = sum_j X[j] Wu[i][j]  (i<h, j<n)
+//   s[i] = silu(G[i]) * U[i], silu(z) = z * sigmoid(z)
+//   Y[j] = sum_i s[i] Wd[i][j]
+//   Wg/Wu/Wdはrow-major ([h][n])。
+// G/Uはcheckpoint/逆伝播用の保存中間値 (bwdのG/U入力にそのまま渡せる)。
+// 内部はdouble累積、sigmoidはdouble評価。fail-closed: 非有限入力・
+// NULL・次元不正時はJT_ERR_INVAL (errno=EINVAL) を返し、G/U/Yを更新しない。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用)。
+int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
+                  const float *restrict Wu, const float *restrict Wd,
+                  float *restrict G, float *restrict U,
+                  float *restrict Y, int n, int h);
+
+// RMSNormの順伝播 (jt_rmsnorm_bwdと整合するforward核)。
+// 定義: r = 1/sqrt(mean(X^2)+eps), Y[i] = W[i]*X[i]*r (内部double累積)。
+// fail-closed: 非有限入力・NULL・次元不正・eps<=0/非有限時は
+// JT_ERR_INVAL (errno=EINVAL) を返し、Yを更新しない。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用)。
+int jt_rmsnorm_fwd(const float *restrict X, const float *restrict W,
+                   float *restrict Y, int n, float eps);
+
 #ifdef __cplusplus
 }
 #endif

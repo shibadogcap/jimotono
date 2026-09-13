@@ -11,14 +11,12 @@
 // 測定対象 (小規模: dk=32/dv=64、n=64/h=64):
 //   - gdn2 decode順伝播 (jt_gdn2_decode_step, ライブラリ核)
 //   - gdn2 backward (jt_gdn2_decode_bwd, ライブラリ核)
-//   - swiglu fwd (bench内参照実装。下記 NOTE 参照)
+//   - swiglu fwd (jt_swiglu_fwd, ライブラリ核)
 //   - swiglu bwd (jt_swiglu_bwd, ライブラリ核)
-//   - rmsnorm fwd (bench内参照実装。下記 NOTE 参照)
+//   - rmsnorm fwd (jt_rmsnorm_fwd, ライブラリ核)
 //   - rmsnorm bwd (jt_rmsnorm_bwd, ライブラリ核)
-// NOTE: swiglu/rmsnorm の forward は現時点でライブラリ核が存在しないため、
-//   train_bwd.h の forward 定義式に整合する bench 内参照実装 (スカラーfp32)
-//   を測定する。bwd との対照用であり、将来ライブラリ核が追加されたら
-//   そちらへ置き換えること (TODO)。
+// (旧NOTE: swiglu/rmsnorm forwardはbench内参照実装で測定していたが、
+//  jt_swiglu_fwd/jt_rmsnorm_fwd追加に伴いライブラリ核呼び出しへ置換済み。)
 //
 // A100M級想定のFLOP外挿コメント:
 //   本計測の1ケースは単一カーネル・小次元で約 0.2k〜80k FLOP 程度
@@ -103,51 +101,7 @@ static float cb_pat(int a, int b, int s) {
     return (float)(v - 5) / 5.0f;
 }
 
-// ---- bench内参照 forward (swiglu/rmsnorm。train_bwd.h の定義式に整合) ----
-static float cb_silu_f(float z) {
-    return z / (1.0f + expf(-z));
-}
-
-// forward定義: G=XWg, U=XWu, s=silu(G)*U, Y=sWd。Wg/Wu/Wd は [h][n] row-major。
-static void cb_swiglu_fwd(const float *restrict X, const float *restrict Wg,
-                           const float *restrict Wu, const float *restrict Wd,
-                           float *restrict G, float *restrict U,
-                           float *restrict Y, int n, int h) {
-    for (int i = 0; i < h; i++) {
-        double g = 0.0;
-        double u = 0.0;
-        for (int j = 0; j < n; j++) {
-            g += (double)X[j] * (double)Wg[(size_t)i * (size_t)n + (size_t)j];
-            u += (double)X[j] * (double)Wu[(size_t)i * (size_t)n + (size_t)j];
-        }
-        G[i] = (float)g;
-        U[i] = (float)u;
-    }
-    for (int j = 0; j < n; j++) {
-        double acc = 0.0;
-        for (int i = 0; i < h; i++) {
-            double s = (double)cb_silu_f(G[i]) * (double)U[i];
-            acc += s * (double)Wd[(size_t)i * (size_t)n + (size_t)j];
-        }
-        Y[j] = (float)acc;
-    }
-}
-
-// forward定義: r=1/sqrt(mean(X^2)+eps), Y=W*X*r。
-static void cb_rmsnorm_fwd(const float *restrict X, const float *restrict W,
-                            float *restrict Y, int n, float eps) {
-    double mean = 0.0;
-    for (int i = 0; i < n; i++) {
-        mean += (double)X[i] * (double)X[i];
-    }
-    mean /= (double)n;
-    {
-        float r = (float)(1.0 / sqrt(mean + (double)eps));
-        for (int i = 0; i < n; i++) {
-            Y[i] = W[i] * X[i] * r;
-        }
-    }
-}
+// ---- forward計測はライブラリ核を直接呼ぶ (bench内参照実装は廃止) ----
 
 // ---- 計測コンテキスト ----
 typedef struct cb_gdn2_fwd_ctx {
@@ -272,8 +226,12 @@ static void cb_gdn2_bwd_case(void *ctx) {
 static void cb_sw_fwd_case(void *ctx) {
     cb_sw_fwd_ctx_t *c = (cb_sw_fwd_ctx_t *)ctx;
     for (int r = 0; r < c->repeat; r++) {
-        cb_swiglu_fwd(c->X, c->Wg, c->Wu, c->Wd, c->G, c->U, c->Y, c->n,
-                      c->h);
+        int rc = jt_swiglu_fwd(c->X, c->Wg, c->Wu, c->Wd, c->G, c->U,
+                               c->Y, c->n, c->h);
+        if (rc != JT_OK) {
+            g_kernel_rc = rc;
+            return;
+        }
         g_sink += (double)c->Y[0];
     }
 }
@@ -295,7 +253,11 @@ static void cb_sw_bwd_case(void *ctx) {
 static void cb_rms_fwd_case(void *ctx) {
     cb_rms_fwd_ctx_t *c = (cb_rms_fwd_ctx_t *)ctx;
     for (int r = 0; r < c->repeat; r++) {
-        cb_rmsnorm_fwd(c->X, c->W, c->Y, c->n, c->eps);
+        int rc = jt_rmsnorm_fwd(c->X, c->W, c->Y, c->n, c->eps);
+        if (rc != JT_OK) {
+            g_kernel_rc = rc;
+            return;
+        }
         g_sink += (double)c->Y[0];
     }
 }
@@ -631,12 +593,14 @@ int main(void) {
                 0.3f * cb_pat(i, j, 25);
         }
     }
-    // swiglu-bwd 用 G/U は forward 定義どおり事前計算 (cached中間値)。
+    // swiglu-bwd 用 G/U はライブラリforward核で事前計算 (cached中間値)。
     {
-        cb_sw_fwd_ctx_t pre = {sX, sWg, sWu, sWd, sG,
-                               sU, sY, CB_N, CB_H, 1};
-        cb_swiglu_fwd(pre.X, pre.Wg, pre.Wu, pre.Wd, pre.G, pre.U, pre.Y,
-                      pre.n, pre.h);
+        int prc = jt_swiglu_fwd(sX, sWg, sWu, sWd, sG, sU, sY, CB_N,
+                                CB_H);
+        CB_CHECK(prc == JT_OK, "swiglu fwd precompute rc=%d", prc);
+        if (prc != JT_OK) {
+            goto cleanup;
+        }
     }
 
     // ---- 計測 (完走のみ assert。目標超過は OVER 表示で fail にしない) ----

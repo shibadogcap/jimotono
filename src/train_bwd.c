@@ -499,3 +499,147 @@ int jt_rmsnorm_bwd(const float *restrict dY, const float *restrict X,
 cleanup:
     return rc;
 }
+
+// SwiGLU順伝播 (bwd前提式と同一。double累積 + double sigmoid)。
+int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
+                  const float *restrict Wu, const float *restrict Wd,
+                  float *restrict G, float *restrict U,
+                  float *restrict Y, int n, int h) {
+    int rc = JT_ERR_INVAL;
+    if (X == NULL || Wg == NULL || Wu == NULL || Wd == NULL || G == NULL ||
+        U == NULL || Y == NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (n <= 0 || h <= 0 || n > JT_BWD_MAX_WIDE || h > JT_BWD_MAX_WIDE) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (!jt_bwd_all_finite(X, (size_t)n) ||
+        !jt_bwd_all_finite(Wg, (size_t)h * (size_t)n) ||
+        !jt_bwd_all_finite(Wu, (size_t)h * (size_t)n) ||
+        !jt_bwd_all_finite(Wd, (size_t)h * (size_t)n)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+
+    {
+        // G/U/Yは検証通過後のみ書き込む (fail-closed: 拒否時は出力不変)。
+        // h<=4096のため固定上限の自動配列で中間sを保持する。
+        // G/Uも途中書き込みせず一時配列に退避し、全要素の有限確認後に
+        // 一括commitする。
+        static const int kMax = JT_BWD_MAX_WIDE;
+        double s[JT_BWD_MAX_WIDE];
+        double gg[JT_BWD_MAX_WIDE];
+        double uu[JT_BWD_MAX_WIDE];
+        double yacc[JT_BWD_MAX_WIDE];
+        if (h > kMax || n > kMax) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        for (int i = 0; i < h; i++) {
+            double g = 0.0;
+            double u = 0.0;
+            const float *wgr = Wg + (size_t)i * (size_t)n;
+            const float *wur = Wu + (size_t)i * (size_t)n;
+            for (int j = 0; j < n; j++) {
+                g += (double)X[j] * (double)wgr[j];
+                u += (double)X[j] * (double)wur[j];
+            }
+            if (!isfinite(g) || !isfinite(u)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            {
+                double sig = jt_bwd_sigmoid(g);
+                double silu = g * sig;
+                s[i] = silu * u;
+                gg[i] = g;
+                uu[i] = u;
+            }
+        }
+        for (int j = 0; j < n; j++) {
+            double acc = 0.0;
+            for (int i = 0; i < h; i++) {
+                acc += s[i] * (double)Wd[(size_t)i * (size_t)n + (size_t)j];
+            }
+            if (!isfinite(acc)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            yacc[j] = acc;
+        }
+        // 全要素の有限確認後に一括commit (拒否時はG/U/Y不変)。
+        for (int i = 0; i < h; i++) {
+            if (!isfinite(s[i]) || !isfinite(gg[i]) || !isfinite(uu[i])) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+        }
+        for (int i = 0; i < h; i++) {
+            G[i] = (float)gg[i];
+            U[i] = (float)uu[i];
+        }
+        for (int j = 0; j < n; j++) {
+            Y[j] = (float)yacc[j];
+        }
+    }
+
+    rc = JT_OK;
+cleanup:
+    return rc;
+}
+
+// RMSNorm順伝播 (bwd前提式と同一。double累積)。
+int jt_rmsnorm_fwd(const float *restrict X, const float *restrict W,
+                   float *restrict Y, int n, float eps) {
+    int rc = JT_ERR_INVAL;
+    if (X == NULL || W == NULL || Y == NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (n <= 0 || n > JT_BWD_MAX_WIDE) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (!(eps > 0.0f) || !isfinite((double)eps)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (!jt_bwd_all_finite(X, (size_t)n) ||
+        !jt_bwd_all_finite(W, (size_t)n)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+
+    {
+        double mean = 0.0;
+        double r = 0.0;
+        double yacc[JT_BWD_MAX_WIDE];
+        for (int i = 0; i < n; i++) {
+            mean += (double)X[i] * (double)X[i];
+        }
+        mean /= (double)n;
+        r = 1.0 / sqrt(mean + (double)eps);
+        if (!isfinite(r)) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        for (int i = 0; i < n; i++) {
+            double v = (double)W[i] * (double)X[i] * r;
+            if (!isfinite(v)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            yacc[i] = v;
+        }
+        // 有限確認後に一括commit (拒否時はY不変)。
+        for (int i = 0; i < n; i++) {
+            Y[i] = (float)yacc[i];
+        }
+    }
+
+    rc = JT_OK;
+cleanup:
+    return rc;
+}

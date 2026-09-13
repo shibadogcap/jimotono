@@ -6,8 +6,8 @@
 // のループが回り、損失が明確に減少すること (初期比50%以上減少) をassertする。
 //
 // ループ構成 (1ステップ = 全バッチ平均勾配で1更新):
-//   forward : gdn2_decode_step (S_prev=0の単一トークン) → rmsnorm手計算 →
-//             swiglu手計算 → 線形ヘッド (pred = dot(y2,Wo)+bo)
+// forward : gdn2_decode_step (S_prev=0の単一トークン) → jt_rmsnorm_fwd →
+//             jt_swiglu_fwd → 線形ヘッド (pred = dot(y2,Wo)+bo)
 //   loss    : MSE + StickyMoE損失の加算 (実MoEルーティングは使わない)
 //   backward: 線形ヘッド手計算 → jt_swiglu_bwd → jt_rmsnorm_bwd →
 //             jt_gdn2_decode_bwd (dW_gdnのみ更新に使用、他は勾配疎通確認)
@@ -88,10 +88,6 @@ static int g_fail = 0;
 static float epat(int a, int b, int salt) {
     int v = (a * 31 + b * 17 + salt * 13) % 11;  // 0..10
     return (float)(v - 5) / 5.0f;
-}
-
-static float esilu(float z) {
-    return z / (1.0f + expf(-z));
 }
 
 static int eckpt_stub(int layer, void *ctx) {
@@ -250,39 +246,21 @@ int main(void) {
             if (rc != JT_OK) {
                 goto fail;
             }
-            // rmsnorm forward。
-            double ms = 0.0;
-            for (int j = 0; j < EP_N; j++) {
-                ms += (double)o[j] * (double)o[j];
-            }
-            ms /= (double)EP_N;
-            float r = (float)(1.0 / sqrt(ms + (double)EP_EPS));
+            // rmsnorm forward (ライブラリ核)。
             float y1[EP_N];
-            for (int j = 0; j < EP_N; j++) {
-                y1[j] = Wr[j] * o[j] * r;
+            rc = jt_rmsnorm_fwd(o, Wr, y1, EP_N, EP_EPS);
+            CHECK(rc == JT_OK, "rms fwd rc=%d s=%d k=%d", rc, step, k);
+            if (rc != JT_OK) {
+                goto fail;
             }
-            // swiglu forward。
+            // swiglu forward (ライブラリ核。G/Uはbwd用cached中間値)。
             float Gc[EP_H], Uc[EP_H];
-            for (int i = 0; i < EP_H; i++) {
-                double g = 0.0, u = 0.0;
-                for (int j = 0; j < EP_N; j++) {
-                    g += (double)y1[j] * (double)Wg[i * EP_N + j];
-                    u += (double)y1[j] * (double)Wu[i * EP_N + j];
-                }
-                Gc[i] = (float)g;
-                Uc[i] = (float)u;
-            }
-            float sc_[EP_H];
-            for (int i = 0; i < EP_H; i++) {
-                sc_[i] = esilu(Gc[i]) * Uc[i];
-            }
             float y2[EP_N];
-            for (int j = 0; j < EP_N; j++) {
-                double acc = 0.0;
-                for (int i = 0; i < EP_H; i++) {
-                    acc += (double)sc_[i] * (double)Wd[i * EP_N + j];
-                }
-                y2[j] = (float)acc;
+            rc = jt_swiglu_fwd(y1, Wg, Wu, Wd, Gc, Uc, y2, EP_N, EP_H);
+            CHECK(rc == JT_OK, "swiglu fwd rc=%d s=%d k=%d", rc, step,
+                  k);
+            if (rc != JT_OK) {
+                goto fail;
             }
             double pred = (double)bo;
             for (int j = 0; j < EP_N; j++) {
@@ -372,31 +350,18 @@ int main(void) {
         // JT_ERR_NOSUPが正常系 (実forward結合は1B級TODO)。
         if (y1_has0) {
             memcpy(ckpt_saved, y1_saved0, sizeof(ckpt_saved));
-            // 手動再計算: 保存境界からswiglu+headを再実行しy2一致を確認。
+            // 手動再計算: 保存境界からswiglu+headを再実行しy2一致を確認
+            // (ライブラリforward核を使用)。
             const float *Wg = &P[EP_OFF_WG];
             const float *Wu = &P[EP_OFF_WU];
             const float *Wd = &P[EP_OFF_WD];
             float Gc2[EP_H], Uc2[EP_H];
-            for (int i = 0; i < EP_H; i++) {
-                double g = 0.0, u = 0.0;
-                for (int j = 0; j < EP_N; j++) {
-                    g += (double)ckpt_saved[j] *
-                         (double)Wg[i * EP_N + j];
-                    u += (double)ckpt_saved[j] *
-                         (double)Wu[i * EP_N + j];
-                }
-                Gc2[i] = (float)g;
-                Uc2[i] = (float)u;
-            }
             float y2b[EP_N];
-            for (int j = 0; j < EP_N; j++) {
-                double acc = 0.0;
-                for (int i = 0; i < EP_H; i++) {
-                    acc += (double)(esilu(Gc2[i]) * Uc2[i]) *
-                           (double)Wd[i * EP_N + j];
-                }
-                y2b[j] = (float)acc;
-            }
+            int frc =
+                jt_swiglu_fwd(ckpt_saved, Wg, Wu, Wd, Gc2, Uc2, y2b,
+                              EP_N, EP_H);
+            CHECK(frc == JT_OK, "ckpt fwd recompute rc=%d s=%d", frc,
+                  step);
             float worst = 0.0f;
             for (int j = 0; j < EP_N; j++) {
                 float e = fabsf(y2b[j] - y2_ref[j]);
