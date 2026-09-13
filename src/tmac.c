@@ -28,15 +28,34 @@
 //
 // 将来SIMD拡張点:
 // - LUT参照は本質的にshuffle (g=4/int8で16B=NEON 128bitに丁度)。
-// - 下記#ifdefは将来の置換点を明示するもので、P1は全経路スカラー核に落とす。
+// - P2: LUT参照(gather的8 lookup)はスカラー維持、集計FMAのみベクトル化。
+//   shuffle/gather回避。int8 8要素のshuffle化はlane複製・mirror符号復元
+//   分岐が増え、8要素ではペイしないため。16B=NEON 128bit一致は将来の
+//   lookup完全ベクトル化 (vqtbl1q_u8 / _mm256_shuffle_epi8) の予約位置。
+// - 集計 (sc*acc+bi)*0.5*2^b のブロック内bits方向 (最大4) をベクトル化。
+//   __m256d (4xdouble) / float64x2_t (2xdouble) で1ブロック分を一括計算し、
+//   レーン合算は b=0..bits-1 のスカラー順序で加算してbit同一性を保つ。
+//   FMA (fmadd/vfmaq) は使わない: 1丸め化でスカラー (mul→add 2丸め) と
+//   bit同一にならないため。mul/add分離でIEEE丸め順序を保存する。
+// - AVX-512見送り理由: ZMM使用で最大30%ダウンクロック (DESIGN.MD §2.3、
+//   ARCHITECTURE.MD §1)。1C1T帯域律速設計では周波数低下がそのままtok/sに
+//   直結する。bits<=4は256bit (4xdouble) に丁度収まり512bitの追加スループット
+//   はない。LUT参照がgather律速で演算律速でない以上ZMMの利益はなく、
+//   N100/i5-8th baselineの移植性 (CMakeLists: SIMDはTU毎opt-in、global強制不可)
+//   を優先し、AVX-512パスは設けない。将来演算律速部が出れば再検討。
+// - アライメント: 全経路アライメント非依存 (P1互換)。SIMD側は非整列
+//   load/store (_mm256_storeu、vst1q)のみ、gather部はスカラーのため
+//   64B整列は推奨のまま必須化しない。fail-closed・量子化境界は不変。
 #if defined(__AVX512__)
-/* TODO(P2): AVX-512 VBMI _mm512_permutexvar_epi8 で64B一括lookup。 */
-#elif defined(__AVX2__)
-/* TODO(P2): AVX2 _mm256_shuffle_epi8 (lane複製要) で32B一括lookup。 */
-#elif defined(__ARM_NEON)
-/* TODO(P2): NEON vqtbl1q_u8 で16B常駐lookup。 */
+/* P2: AVX-512パスなし (上記ダウンクロック懸念のため意図的に見送り)。 */
 #endif
-/* P1: ポータブルなスカラー核 (アライメント非依存、K-first走査は呼び出し側)。 */
+#ifdef __AVX2__
+/* P2: 下部 jt_tmac_block_sum_avx2 で集計FMAをベクトル化。LUT参照はスカラー。 */
+#endif
+#ifdef __ARM_NEON
+/* P2: 下部 jt_tmac_block_sum_neon で集計FMAをベクトル化。LUT参照はスカラー。 */
+#endif
+/* P1: ポータブルなスカラー核 (アライメント非依存、K-first走査は呼び出し側)。フォールバックは常時スカラー。 */
 
 #include "jimotono/tmac.h"
 
@@ -47,6 +66,91 @@
 #include <stdint.h>
 
 #include "jimotono/common.h"
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+// 1プレーン分のLUT参照+int32累積 (全経路共通スカラー。8加算で±1024以内)。
+// mirror復元: p>=8は格納値そのまま、p<8は F(p)=-F(15-p) より格納index (7-p) の符号反転。
+// -128の符号反転はint域で行いint32 accに加算するため厳密 (P1互換)。
+static int32_t jt_tmac_plane_acc(const int8_t *restrict qblk, const uint8_t *restrict plane) {
+    int32_t acc = 0;
+    for (size_t gi = 0; gi < 8u; gi++) {
+        uint8_t p = (uint8_t)(plane[gi] & 0x0Fu);
+        int qv = 0;
+        if (p >= 8u) {
+            qv = (int)qblk[gi * 8u + (size_t)(p - 8u)];
+        } else {
+            qv = -(int)qblk[gi * 8u + (size_t)(7u - p)];
+        }
+        acc += qv;
+    }
+    return acc;
+}
+
+#ifdef __AVX2__
+// 1ブロック分の集計 (sc*acc+bi)*0.5*2^b を__m256d 1本で処理。
+// 要素毎の演算順序はスカラーと同一 (mul→add→mul(0.5)→mul(pow2))、
+// レーン合算のみb昇順スカラー加算 → スカラーとbit同一。FMA不使用。
+static double jt_tmac_block_sum_avx2(double sc, double bi, const int32_t *restrict acc,
+                                     int bits) {
+    __m256d vacc = _mm256_setr_pd((double)acc[0], bits > 1 ? (double)acc[1] : 0.0,
+                                  bits > 2 ? (double)acc[2] : 0.0,
+                                  bits > 3 ? (double)acc[3] : 0.0);
+    __m256d vsc = _mm256_set1_pd(sc);
+    __m256d vbi = _mm256_set1_pd(bi);
+    __m256d v = _mm256_add_pd(_mm256_mul_pd(vsc, vacc), vbi);
+    __m256d vhalf = _mm256_set1_pd(0.5);
+    __m256d vpow = _mm256_setr_pd(1.0, 2.0, 4.0, 8.0);
+    double lane[4];
+    double bsum = 0.0;
+    v = _mm256_mul_pd(v, vhalf);
+    v = _mm256_mul_pd(v, vpow);
+    _mm256_storeu_pd(lane, v);
+    for (int b = 0; b < bits; b++) {
+        bsum += lane[b];
+    }
+    return bsum;
+}
+#endif
+
+#ifdef __ARM_NEON
+// NEON版 (float64x2_tで2要素ずつ、要素内順序はスカラー同一、合算はb昇順)。
+// 16B=128bit整列は要求しない (vst1qのみ・gather部スカラーのため非整列可)。
+// FMA (vfmaq_f64) 不使用、mul/add分離。
+static double jt_tmac_block_sum_neon(double sc, double bi, const int32_t *restrict acc,
+                                     int bits) {
+    double bsum = 0.0;
+    float64x2_t vsc = vdupq_n_f64(sc);
+    float64x2_t vbi = vdupq_n_f64(bi);
+    float64x2_t vhalf = vdupq_n_f64(0.5);
+    for (int b = 0; b < bits; b += 2) {
+        int n = (bits - b) >= 2 ? 2 : 1;
+        float64x2_t vacc = vdupq_n_f64(0.0);
+        float64x2_t vpow = vdupq_n_f64(0.0);
+        float64x2_t v = vdupq_n_f64(0.0);
+        double lane[2];
+        vacc = vsetq_lane_f64((double)acc[b], vacc, 0);
+        vpow = vsetq_lane_f64((double)(1 << b), vpow, 0);
+        if (n == 2) {
+            vacc = vsetq_lane_f64((double)acc[b + 1], vacc, 1);
+            vpow = vsetq_lane_f64((double)(1 << (b + 1)), vpow, 1);
+        }
+        v = vaddq_f64(vmulq_f64(vsc, vacc), vbi);
+        v = vmulq_f64(v, vhalf);
+        v = vmulq_f64(v, vpow);
+        vst1q_f64(lane, v);
+        for (int k = 0; k < n; k++) {
+            bsum += lane[k];
+        }
+    }
+    return bsum;
+}
+#endif
 
 // size_t積のオーバーフロー検査。成功時*outに積、失敗時1。
 static int jt_size_mul_ov(size_t a, size_t b, size_t *restrict out) {
@@ -337,35 +441,49 @@ int jt_tmac_lookup_accum(const int8_t *restrict qlut, const uint8_t *restrict id
     }
 
     // int32累積→ブロック毎にscale/bias乗算 (逆量子化回避)。
-    // 将来SIMD: 内側giループがshuffle+加算に置換される位置。
+    // P2: LUT参照はスカラー維持 (jt_tmac_plane_acc)、集計FMAのみベクトル化。
     for (size_t bb = 0; bb < nblocks; bb++) {
         double sc = (double)scales[bb];
         double bi = (double)biases[bb];
         const int8_t *restrict qblk = qlut + bb * 8u * (size_t)JT_TMAC_LUT_HALF;
+        int32_t accs[4] = {0, 0, 0, 0};
         for (int b = 0; b < bits; b++) {
             const uint8_t *restrict plane = idx + (size_t)b * ngroups + bb * 8u;
-            int32_t acc = 0;
-            for (size_t gi = 0; gi < 8u; gi++) {
-                uint8_t p = (uint8_t)(plane[gi] & 0x0Fu);
-                int qv = 0;
-                if (p >= 8u) {
-                    qv = (int)qblk[gi * 8u + (size_t)(p - 8u)];
-                } else {
-                    // mirror: F(p) = -F(15-p)。格納indexは (15-p)-8 = 7-p。
-                    qv = -(int)qblk[gi * 8u + (size_t)(7u - p)];
-                }
-                acc += (int32_t)qv;  // ±1024以内で安全
-            }
-            {
-                double contrib = (sc * (double)acc + bi) * 0.5;
-                total += contrib * (double)(1 << b);
-                if (!isfinite(total)) {
-                    errno = ERANGE;
-                    rc = JT_ERR_INVAL;
-                    goto cleanup;
-                }
+            accs[b] = jt_tmac_plane_acc(qblk, plane);
+        }
+#ifdef __AVX2__
+        {
+            double bsum = jt_tmac_block_sum_avx2(sc, bi, accs, bits);
+            total += bsum;
+            if (!isfinite(total)) {
+                errno = ERANGE;
+                rc = JT_ERR_INVAL;
+                goto cleanup;
             }
         }
+#else
+#ifdef __ARM_NEON
+        {
+            double bsum = jt_tmac_block_sum_neon(sc, bi, accs, bits);
+            total += bsum;
+            if (!isfinite(total)) {
+                errno = ERANGE;
+                rc = JT_ERR_INVAL;
+                goto cleanup;
+            }
+        }
+#else
+        for (int b = 0; b < bits; b++) {
+            double contrib = (sc * (double)accs[b] + bi) * 0.5;
+            total += contrib * (double)(1 << b);
+            if (!isfinite(total)) {
+                errno = ERANGE;
+                rc = JT_ERR_INVAL;
+                goto cleanup;
+            }
+        }
+#endif
+#endif
     }
     total *= (double)w_scale;
     if (!isfinite(total)) {
