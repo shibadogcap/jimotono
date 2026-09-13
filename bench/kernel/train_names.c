@@ -150,11 +150,15 @@ static void tn_usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [--data names.txt] [--pack names.jtdp] "
             "[--write-pack out.jtdp] [--steps N] [--time SECS] [--lr LR] "
-            "[--batch B] [--d DIM] [--layers L] [--val-every K]\n"
+            "[--batch B] [--d DIM] [--layers L] [--val-every K] "
+            "[--sample N] [--temp T] [--seed S] [--maxlen M]\n"
             "  defaults: data=data/names.txt pack=data/names.jtdp steps=500 "
-            "time=1200 lr=1e-3 batch=256 d=64 layers=2 val-every=25\n"
+            "time=1200 lr=1e-3 batch=256 d=64 layers=2 val-every=25 "
+            "sample=0 temp=0 seed=0x53414D50 maxlen=20\n"
             "  --write-pack: names.txt -> .jtdp変換のみ行い終了 "
-            "(data_pack正規経路)\n",
+            "(data_pack正規経路)\n"
+            "  --sample N: 学習完了後に最終重みでN個の名前を生成 (forwardのみ)\n"
+            "  --temp T: 0でgreedy(argmax)、T>0で温度サンプリング (決定論的)\n",
             prog);
 }
 
@@ -585,6 +589,10 @@ int main(int argc, char **argv) {
     int d = 64;
     int n_layers = 2;
     long val_every = 25;
+    long n_sample = 0; /* --sample N: 学習後にN個生成 (0=生成なし) */
+    double temp = 0.0; /* --temp T: 0=greedy、>0で温度サンプリング */
+    uint64_t seed = 0x53414D50ULL; /* 決定論的既定seed */
+    int max_len = 20;  /* 1名前あたり最大文字数 */
     uint32_t **seqs = NULL;
     size_t *lens = NULL;
     long n_names = 0;
@@ -647,6 +655,16 @@ int main(int argc, char **argv) {
             n_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--val-every") == 0 && i + 1 < argc) {
             val_every = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--sample") == 0 && i + 1 < argc) {
+            n_sample = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            temp = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = strtoull(argv[++i], NULL, 0);
+        } else if ((strcmp(argv[i], "--maxlen") == 0 ||
+                    strcmp(argv[i], "--max-len") == 0) &&
+                   i + 1 < argc) {
+            max_len = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             tn_usage(argv[0]);
@@ -660,7 +678,9 @@ int main(int argc, char **argv) {
     }
     if (max_steps <= 0 || !(time_limit > 0.0) || !(lr > 0.0f) ||
         !isfinite(lr) || batch <= 0 || batch > 4096 || d < 8 || d > 256 ||
-        n_layers < 1 || n_layers > 4 || val_every <= 0) {
+        n_layers < 1 || n_layers > 4 || val_every <= 0 || n_sample < 0 ||
+        n_sample > 100000 || !isfinite(temp) || temp < 0.0 || temp > 5.0 ||
+        max_len < 1 || max_len > 64) {
         fprintf(stderr, "train_names: invalid limits/args\n");
         errno = EINVAL;
         goto cleanup;
@@ -1002,6 +1022,98 @@ int main(int argc, char **argv) {
            step, init_train_ce, last_train_ce, init_val_ce, last_val_ce,
            (init_val_ce > 0.0f) ? last_val_ce / init_val_ce : 0.0f);
     fflush(stdout);
+
+    /* ---- デモ用サンプリング: 最終重みでN個生成 (forwardのみ・更新なし) ----
+       BOS開始、EOS/BOSまたはmax_lenで打切り。temp<=0はgreedy(argmax)、
+       temp>0はlogits/Tのsoftmaxから温度サンプリング。乱数はtn_u01による
+       決定論的ハッシュ (seed + sample_idx + pos由来) のみを使用。 */
+    if (n_sample > 0) {
+        long si = 0;
+        printf("train_names: sampling n=%ld temp=%.3f seed=%llu maxlen=%d\n",
+               n_sample, temp, (unsigned long long)seed, max_len);
+        fflush(stdout);
+        for (si = 0; si < n_sample; si++) {
+            int cur = TN_BOS;
+            int pos = 0;
+            char out[65];
+            int olen = 0;
+            for (pos = 0; pos < max_len; pos++) {
+                float dummy_loss = 0.0f;
+                int nxt = 0;
+                int v = 0;
+                int rc = tn_fwd_one(&m, cur, acts, cids, cw, cgsel, cusel,
+                                    cysel, cgs, cus, logits, probs,
+                                    &dummy_loss, 0);
+                if (rc != JT_OK) {
+                    fprintf(stderr,
+                            "train_names: sample fwd failed at %ld/%d\n", si,
+                            pos);
+                    goto cleanup;
+                }
+                if (!(temp > 0.0)) {
+                    /* greedy: argmax (同値は先勝ち・決定論的) */
+                    nxt = 0;
+                    for (v = 1; v < TN_VOCAB; v++) {
+                        if (logits[v] > logits[nxt]) {
+                            nxt = v;
+                        }
+                    }
+                } else {
+                    /* 温度サンプリング: exp((logit-mx)/T) → 累積分布 */
+                    double mx = (double)logits[0];
+                    double sum = 0.0;
+                    double acc = 0.0;
+                    double thr = 0.0;
+                    double u = 0.0;
+                    uint64_t key = seed +
+                                   (uint64_t)si * 0x9e3779b97f4a7c15ULL +
+                                   (uint64_t)pos * 0xbf58476d1ce4e5b9ULL +
+                                   0x123456789abcdefULL;
+                    for (v = 1; v < TN_VOCAB; v++) {
+                        if ((double)logits[v] > mx) {
+                            mx = (double)logits[v];
+                        }
+                    }
+                    for (v = 0; v < TN_VOCAB; v++) {
+                        sum += exp(((double)logits[v] - mx) / temp);
+                    }
+                    if (!(sum > 0.0) || !isfinite(sum)) {
+                        fprintf(stderr,
+                                "train_names: sample temper failed at "
+                                "%ld/%d\n",
+                                si, pos);
+                        errno = EINVAL;
+                        goto cleanup;
+                    }
+                    u = tn_u01(key);
+                    thr = u * sum;
+                    nxt = TN_VOCAB - 1;
+                    for (v = 0; v < TN_VOCAB; v++) {
+                        acc += exp(((double)logits[v] - mx) / temp);
+                        if (thr < acc) {
+                            nxt = v;
+                            break;
+                        }
+                    }
+                }
+                if (nxt == TN_EOS || nxt == TN_BOS) {
+                    break;
+                }
+                if (nxt < TN_A_OFF || nxt >= TN_VOCAB || olen >= max_len) {
+                    fprintf(stderr,
+                            "train_names: sample bad id at %ld/%d\n", si,
+                            pos);
+                    errno = EINVAL;
+                    goto cleanup;
+                }
+                out[olen++] = (char)('a' + (nxt - TN_A_OFF));
+                cur = nxt;
+            }
+            out[olen] = '\0';
+            printf("sample[%04ld]: %s\n", si, out);
+        }
+        fflush(stdout);
+    }
     rc_all = 0;
 
 cleanup:
