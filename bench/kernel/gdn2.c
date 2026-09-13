@@ -392,6 +392,113 @@ static void test_invalid_decode(void) {
             CHECK(zo[j] == 0.0f, "zero qk o[%d]=%f", j, zo[j]);
         }
     }
+    // MAJOR-2: 非有限・範囲外は JT_ERR_INVAL で拒否し S/o 不変 (fail-closed)。
+    {
+        float tq[4], tk[4], tv[4], tb[4], tw[4], ta[4], to[4];
+        float Sref[16];
+        float oref[4] = {7.0f, 8.0f, 9.0f, 10.0f};
+        int rc;
+        for (int i = 0; i < 4; i++) {
+            tq[i] = q[i];
+            tk[i] = k[i];
+            tb[i] = b[i];
+            ta[i] = 0.9f;
+            tv[i] = v[i];
+            tw[i] = w[i];
+        }
+        for (int i = 0; i < 16; i++) {
+            S[i] = 0.25f * (float)(i + 1);
+        }
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        // q NaN → 拒否。
+        tq[0] = NAN;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "nan q rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "nan q S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "nan q o mutated");
+        tq[0] = q[0];
+        // k Inf → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        tk[1] = INFINITY;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "inf k rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "inf k S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "inf k o mutated");
+        tk[1] = k[1];
+        // v NaN → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        tv[2] = NAN;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "nan v rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "nan v S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "nan v o mutated");
+        tv[2] = v[2];
+        // b Inf → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        tb[0] = INFINITY;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "inf b rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "inf b S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "inf b o mutated");
+        tb[0] = b[0];
+        // w NaN → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        tw[3] = NAN;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "nan w rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "nan w S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "nan w o mutated");
+        tw[3] = w[3];
+        // alpha NaN → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        ta[0] = NAN;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "nan alpha rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "nan alpha S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "nan alpha o mutated");
+        ta[0] = 0.9f;
+        // alpha=2 (範囲外) → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        ta[1] = 2.0f;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "alpha=2 rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "alpha=2 S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "alpha=2 o mutated");
+        ta[1] = 0.9f;
+        // alpha<0 (範囲外) → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        ta[2] = -0.25f;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "alpha<0 rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "alpha<0 S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "alpha<0 o mutated");
+        ta[2] = 0.9f;
+        // alpha Inf → 拒否。
+        memcpy(Sref, S, sizeof(Sref));
+        memcpy(to, oref, sizeof(to));
+        ta[3] = INFINITY;
+        rc = jt_gdn2_decode_step(S, to, tq, tk, tv, tb, tw, ta, 4, 4,
+                                 scratch, need);
+        CHECK(rc == JT_ERR_INVAL, "inf alpha rc=%d", rc);
+        CHECK(memcmp(S, Sref, sizeof(Sref)) == 0, "inf alpha S mutated");
+        CHECK(memcmp(to, oref, sizeof(oref)) == 0, "inf alpha o mutated");
+    }
     free(scratch);
     jt_gdn2_state_free(S);
 }

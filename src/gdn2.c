@@ -46,6 +46,16 @@ static int jt_gdn2_valid_dims(int dk, int dv) {
     return dk > 0 && dv > 0 && dk <= JT_GDN2_MAX_D && dv <= JT_GDN2_MAX_D;
 }
 
+// MAJOR-2: fail-closed 有限検査用。全要素が有限なら1、1つでも NaN/Inf なら0。
+static int jt_gdn2_all_finite(const float *restrict x, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(x[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int jt_gdn2_state_bytes(int dk, int dv, size_t *restrict out_bytes) {
     if (out_bytes == NULL) {
         errno = EINVAL;
@@ -198,6 +208,21 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
     if (scratch_n < need) {
         errno = EINVAL;
         goto cleanup;
+    }
+    // MAJOR-2: 非有限入力は state 更新前に拒否 (fail-closed, tmac/routing整合)。
+    // ホットパス検査コストは許容 (P1 正しさ優先)。
+    if (!jt_gdn2_all_finite(q, dk) || !jt_gdn2_all_finite(k, dk) ||
+        !jt_gdn2_all_finite(b, dk) || !jt_gdn2_all_finite(alpha, dk) ||
+        !jt_gdn2_all_finite(v, dv) || !jt_gdn2_all_finite(w, dv)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    for (int i = 0; i < dk; i++) {
+        float ai = alpha[i];
+        if (!(ai >= 0.0f && ai <= 1.0f)) {  // NaN もここで拒否される
+            errno = EINVAL;
+            goto cleanup;
+        }
     }
 
     {

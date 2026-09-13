@@ -11,7 +11,7 @@
 // - state S (dk×dv, row-major, 先頭次元=dk) は fp32 維持。量子化しない。
 // - q/k は核内で L2 正規化 (eps ガード)。呼び出し側の事前正規化は不要。
 // - D_t=Diag(alpha): log-decay の累積・exp は fp32 で核外計算し、
-//   本核には alpha (呼び出し側で [0,1] 保証) を渡すこと。
+//   本核には alpha ([0,1]。範囲外・非有限は核内で拒否) を渡すこと。
 // - b_t (erase, key側) は精度優先で常に fp32 ベクトル維持。
 //   削減は w_t (write, value側) から行う (スカラー化・量子化の候補)。
 // - S は 64B 整列必須。不正時は JT_ERR_ALIGN。
@@ -71,9 +71,12 @@ int jt_gdn2_l2norm(const float *restrict x, float *restrict y, int n, float eps)
 // デコード逐次核 (1トークン更新)。完全実装。
 //   S: [dk][dv] 入出力 (64B 整列必須)。out_o: [dv] 出力。
 //   q/k: [dk] (核内で正規化)。v/w: [dv]。b: [dk] (erase, fp32維持)。
-//   alpha: [dk] (核外で fp32 累積済みの decay)。
+//   alpha: [dk] (核外で fp32 累積済みの decay。範囲 [0,1])。
 //   scratch: jt_gdn2_scratch_floats() 個以上の作業域 (S/out_o と非重複)。
 // 別名禁止: S・out_o・scratch・各入力は互いに重ねないこと (restrict)。
+// fail-closed (tmac/routing と同一方針): q/k/v/b/w/alpha に非有限
+// (NaN/Inf) がある場合、および alpha が [0,1] 外の場合は
+// JT_ERR_INVAL (errno=EINVAL) を返し、S・out_o を更新しない (state不変)。
 // 戻り値: JT_OK / JT_ERR_INVAL / JT_ERR_ALIGN (errno 併用)。
 int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
                         const float *restrict q, const float *restrict k,
