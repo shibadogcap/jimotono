@@ -27,6 +27,11 @@
 //   階のため測定のみ)。loss/steps-sec/tokens-sec/RSSをstderrへ1行ログ。
 // held-out検証: train_proxy100mと同一方式 (salt 7・VAL_OFFSETで重なりなし)。
 //   5ステップ毎＋開始前＋最終に計測し val_loss 列に記録する。
+//   F4汎化課題 (--gen-task stream, 既定): trainはステップ毎に新規サンプルを
+//   決定論的ストリーム生成 (salt 17・索引=step*TOKS+t) し、同一の真の関数
+//   (T=dot(X,w_star)/4) のまま memorization を無効化する。固定64点の丸暗記
+//   では将来ステップ・valは下がらない。valは固定held-out (salt 7) で真の
+//   関数への汎化を評価する。--gen-task fixedで旧来の固定64点に戻せる。
 // 起動時に解析目標の会計 (total/active/dense INT4/SSD/学習peak) と当該物理
 //   構成のFLOPs/byte概算 (analysis/roofline.md §D4式) を表示する。
 // 時間上限 (既定6000秒) とステップ上限のどちらかで正常終了 (exit 0)。
@@ -479,8 +484,12 @@ static float px_sched_lr(long step, long total, float base) {
 static void px_usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [--steps N] [--time SECS] [--lr LR] [--threads T] "
-            "[--profile] [--no-offload] [--no-ckpt] [--no-sched]\n"
-            "  defaults: steps=1073741824 time=6000 lr=2e-4 threads=6\n"
+            "[--profile] [--no-offload] [--no-ckpt] [--no-sched] "
+            "[--gen-task stream|fixed]\n"
+            "  defaults: steps=1073741824 time=6000 lr=2e-4 threads=6 "
+            "gen-task=stream\n"
+            "  --gen-task stream: F4汎化課題 (既定。ステップ毎に新規train点)\n"
+            "  --gen-task fixed: 旧来の固定64点 (暗記可能。比較用)\n"
             "  --profile: F2 breakdown (10-phase wall/csw/io, measurement "
             "only)\n"
             "  --no-offload: disable ESMoE roundtrip (28M resident, skip "
@@ -490,6 +499,31 @@ static void px_usage(const char *prog) {
             "  --no-sched: disable lr schedule (fixed lr; default is warmup "
             "100 + cosine decay)\n",
             prog);
+}
+
+// 合成回帰データ生成 (T = dot(X, w_star)/4。決定論的)。
+// F4汎化課題のtrain/val分割:
+//   stream(既定): trainはステップs毎に salt=17・索引=s*TOKS+t の新規64点。
+//     saltがval(salt 7)と異なるため長期漬けでもvalと重ならない。同一真関数。
+//   fixed(旧来): trainは salt=7・t∈[0,TOKS) の固定64点 (暗記可能。step無視)。
+// valは常に salt=7・VAL_OFFSETずらしの固定64点 (更新に一切使わない)。
+static void px_fill_train(float *restrict X, float *restrict T,
+                          const float *restrict w_star, long step,
+                          int stream) {
+    int salt = stream ? 17 : 7;
+    long base = stream ? step * (long)PX_TOKS : 0L;
+    for (int t = 0; t < PX_TOKS; t++) {
+        long idx = base + (long)t;
+        // px_patはint引数のため31bitへ折り畳み (決定論性は維持)。
+        int tt = (int)(idx % 2000000000L);
+        double acc = 0.0;
+        for (int j = 0; j < PX_N; j++) {
+            float v = px_pat(tt, j, salt);
+            X[(size_t)t * (size_t)PX_N + (size_t)j] = v;
+            acc += (double)v * (double)w_star[j];
+        }
+        T[t] = (float)(acc / 4.0);
+    }
 }
 
 // ---- 並列ワーカー共有コンテキスト (読み取り専用。Gpart/dtmpは线程毎) ----
@@ -964,6 +998,7 @@ int main(int argc, char **argv) {
     int no_offload = 0; // F3-1: --no-offloadでESMoE往復を無効化
     int no_ckpt = 0;    // F3-2: --no-ckptでckpt recompute照合を無効化
     int no_sched = 0;   // F3-5: --no-schedでlrスケジュール無効化 (固定lr)
+    int gen_stream = 1; // F4: 1=stream既定 (汎化課題), 0=fixed (旧来暗記可能)
     px_snap_t prof_run0;   // F2 probe: run全体のio差分開始点
     jt_esmoe_stats_t prof_es0; // F2 probe: esmoe stats開始点
 
@@ -992,6 +1027,20 @@ int main(int argc, char **argv) {
             no_ckpt = 1;
         } else if (strcmp(argv[i], "--no-sched") == 0) {
             no_sched = 1;
+        } else if (strcmp(argv[i], "--gen-task") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "stream") == 0) {
+                gen_stream = 1;
+            } else if (strcmp(argv[i], "fixed") == 0) {
+                gen_stream = 0;
+            } else {
+                fprintf(stderr, "train_proxy100m: unknown --gen-task '%s' "
+                                "(want stream|fixed)\n",
+                        argv[i]);
+                px_usage(argv[0]);
+                errno = EINVAL;
+                goto cleanup;
+            }
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             px_usage(argv[0]);
@@ -1131,8 +1180,12 @@ int main(int argc, char **argv) {
     }
 
     // ---- 決定論的初期化 ----
+    // F4汎化課題の真関数 w_star: sparse (64/1024次元のみ非ゼロ。j%16==0)。
+    // dense旧来 (全1024次元×0.5) と目標分散を一致 (kC^2/144: 64*4/144≈1.78)
+    // させ val_init を同等に保ちつつ、有効次元を絞って200ステップ以内の
+    // 汎化学習を可能にする。非ゼロ値は決定論的ハッシュ。stream/fixed共通。
     for (int j = 0; j < PX_N; j++) {
-        w_star[j] = 0.5f * px_pat(j, 0, 101);
+        w_star[j] = (j % 16 == 0) ? 2.0f * px_pat(j, 0, 101) : 0.0f;
     }
     for (int l = 0; l < PX_LAYERS; l++) {
         float *base = P + layer_off[(size_t)l];
@@ -1166,18 +1219,10 @@ int main(int argc, char **argv) {
         }
         P[head_off + (size_t)PX_N] = 0.0f;
     }
-    // 合成回帰データ: T = dot(X, w_star)/4。
-    // trainは t∈[0,TOKS) のみで更新に使用。valは同一生成式で索引を
-    // VAL_OFFSETずらし (重なりなし) たheld-outであり更新には一切使わない。
-    for (int t = 0; t < PX_TOKS; t++) {
-        double acc = 0.0;
-        for (int j = 0; j < PX_N; j++) {
-            float v = px_pat(t, j, 7);
-            X[(size_t)t * (size_t)PX_N + (size_t)j] = v;
-            acc += (double)v * (double)w_star[j];
-        }
-        T[t] = (float)(acc / 4.0);
-    }
+    // 合成回帰データ: T = dot(X, w_star)/4。train/val分割はpx_fill_train。
+    // fixed時はここで1回だけ固定64点を生成。stream時は毎ステップ先頭で
+    // 新規64点を生成する (ループ内)。valは常に固定held-out (更新に不使用)。
+    px_fill_train(X, T, w_star, 0L, gen_stream);
     for (int t = 0; t < PX_VAL_TOKS; t++) {
         double acc = 0.0;
         for (int j = 0; j < PX_N; j++) {
@@ -1233,10 +1278,12 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "train_proxy100m: start max_steps=%ld time_limit=%.0fs lr=%g%s%s%s\n",
+            "train_proxy100m: start max_steps=%ld time_limit=%.0fs lr=%g%s%s%s "
+            "gen-task=%s\n",
             max_steps, time_limit, (double)lr,
             no_offload ? " --no-offload" : "",
-            no_ckpt ? " --no-ckpt" : "", no_sched ? " --no-sched" : "");
+            no_ckpt ? " --no-ckpt" : "", no_sched ? " --no-sched" : "",
+            gen_stream ? "stream" : "fixed");
     if (no_ckpt) {
         fprintf(stderr,
                 "train_proxy100m: ckpt recompute check disabled (--no-ckpt): "
@@ -1293,6 +1340,11 @@ int main(int argc, char **argv) {
         float loss = 0.0f;
         double gnorm = 0.0;
         double el = 0.0;
+        // F4 stream: ステップ毎に新規train64点を決定論生成 (暗記無効化)。
+        // fixed時は初期生成のまま (旧来動作)。valには一切触れない。
+        if (gen_stream && step > 0) {
+            px_fill_train(X, T, w_star, step, 1);
+        }
         // ---- ステップ冒頭: 重み全体を1回だけ検証 (unchecked区間の前提)。
         // 以降のトークン×層 (3072コール/ステップ) のper-call重みスキャンを
         // 省略する。ステップ内P不変のため等価。非有限時はfail-closed abort。
