@@ -36,6 +36,7 @@ add_library(jimotono_core
   src/tmac.c
   src/gdn2.c
   src/routing.c
+  src/io_batch.c
 )
 target_include_directories(jimotono_core PUBLIC include)
 # tmac/gdn2/routing use round()/isfinite()/exp() from <math.h>; libm on Unix.
@@ -57,6 +58,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_routing bench/kernel/test_routing.c)
   target_link_libraries(test_routing PRIVATE jimotono_core)
 
+  add_executable(test_io bench/kernel/test_io.c)
+  target_link_libraries(test_io PRIVATE jimotono_core)
+
 endif()
 
 enable_testing()
@@ -65,6 +69,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME tmac COMMAND bench_tmac)
   add_test(NAME gdn2 COMMAND bench_gdn2)
   add_test(NAME routing COMMAND test_routing)
+  add_test(NAME io_batch COMMAND test_io)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
