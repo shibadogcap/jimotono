@@ -48,6 +48,7 @@ add_library(jimotono_core
   src/lut_aware.c
   src/model1b.c
   src/moe_layer.c
+  src/data_pack.c
 )
 # POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
@@ -142,6 +143,14 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_model1b bench/kernel/test_model1b.c)
   target_link_libraries(test_model1b PRIVATE jimotono_core)
 
+  add_executable(test_data_pack bench/kernel/test_data_pack.c)
+  target_link_libraries(test_data_pack PRIVATE jimotono_core)
+
+  # pack_jsonl: 空白区切り整数テキスト→.jtdp変換ツール (実行バイナリのみ。
+  # ctestには追加しない。JSONL本格パーサは禁止=トークナイザ確定前の暫定)。
+  add_executable(pack_jsonl bench/data/pack_jsonl.c)
+  target_link_libraries(pack_jsonl PRIVATE jimotono_core)
+
   # train_longrun: 長時間学習ベンチ (実行バイナリのみ。ctestには追加しない)。
   add_executable(train_longrun bench/kernel/train_longrun.c)
   target_link_libraries(train_longrun PRIVATE jimotono_core)
@@ -164,6 +173,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME cycle COMMAND test_cycle_bench)
   add_test(NAME model1b COMMAND test_model1b)
   add_test(NAME moe_layer COMMAND test_moe_layer)
+  add_test(NAME data_pack COMMAND test_data_pack)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
