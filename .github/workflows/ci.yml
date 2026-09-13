@@ -1,0 +1,58 @@
+name: ci
+
+# MINOR-4 (reviews/p1-integration.md): 3OS同一ソース (AGENTS.MD 7.1) をCIで担保する。
+# macOSのみで実ビルドされていた問題に対し、ubuntu / macOS / Windows での
+# cmake configure (Debug) -> build -> ctest を matrix 化する。
+# Linux は gcc と clang の2ジョブ (最低1つ必須の条件を満たしつつ両方検証)。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-gcc
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            name: linux-clang
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            name: macos-clang
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            name: windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # POSIX (Linux/macOS): Debug を configure 時に指定。
+      # CC/CXX は matrix 由来 (gcc / clang)。MSVC ジョブでは使わない。
+      - name: Configure (POSIX)
+        if: runner.os != 'Windows'
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Debug
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+
+      # Windows (MSVC): 既定ジェネレータ (Visual Studio) を使用。
+      # /W4 は CMakeLists.txt 側で付与済みのため追加フラグ不要。
+      # Debug は --config で build/test 時に選択 (単一構成との互換のため)。
+      - name: Configure (Windows MSVC)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build-ci
+
+      - name: Build
+        run: cmake --build build-ci --config Debug
+
+      - name: Test
+        run: ctest --test-dir build-ci -C Debug --output-on-failure
