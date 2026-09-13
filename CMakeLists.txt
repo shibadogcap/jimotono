@@ -25,6 +25,7 @@ endif()
 
 option(JIMOTONO_BUILD_BENCH "Build microbenchmarks" ON)
 option(JIMOTONO_NATIVE "Build with -march=native (bench only, never for release)" OFF)
+option(JIMOTONO_USE_URING "Enable Linux io_uring batch-read via liburing (default OFF, fallback ENOSYS)" OFF)
 
 if(JIMOTONO_NATIVE AND NOT MSVC)
   add_compile_options(-march=native)
@@ -37,8 +38,28 @@ add_library(jimotono_core
   src/gdn2.c
   src/routing.c
   src/io_batch.c
+  src/io_batch_uring.c
 )
 target_include_directories(jimotono_core PUBLIC include)
+# io_uring (Linuxのみ, Phase 2足場)。既定OFFでfallback (ENOSYS) ビルド。
+# 有効時のみ <liburing.h> をincludeしliburingにリンクする。
+# O_DIRECTは本タスク範囲外 (buffered fd前提)。
+if(JIMOTONO_USE_URING)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(WARNING "JIMOTONO_USE_URING is Linux-only; ignoring on ${CMAKE_SYSTEM_NAME} (fallback ENOSYS)")
+  else()
+    find_path(LIBURING_INCLUDE_DIR NAMES liburing.h DOC "liburing headers")
+    find_library(LIBURING_LIBRARY NAMES uring DOC "liburing library")
+    if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+      target_compile_definitions(jimotono_core PUBLIC HAVE_LIBURING)
+      target_include_directories(jimotono_core PRIVATE ${LIBURING_INCLUDE_DIR})
+      target_link_libraries(jimotono_core PRIVATE ${LIBURING_LIBRARY})
+      message(STATUS "io_uring enabled: ${LIBURING_LIBRARY}")
+    else()
+      message(FATAL_ERROR "JIMOTONO_USE_URING=ON but liburing not found (install liburing-dev). Fallback build uses -DJIMOTONO_USE_URING=OFF.")
+    endif()
+  endif()
+endif()
 # tmac/gdn2/routing use round()/isfinite()/exp() from <math.h>; libm on Unix.
 if(UNIX)
   target_link_libraries(jimotono_core PUBLIC m)
@@ -74,6 +95,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(bench_smoke bench/kernel/bench_smoke.c)
   target_link_libraries(bench_smoke PRIVATE jimotono_bench_common)
 
+  add_executable(test_uring bench/kernel/test_uring.c)
+  target_link_libraries(test_uring PRIVATE jimotono_core)
+
 endif()
 
 enable_testing()
@@ -84,6 +108,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME routing COMMAND test_routing)
   add_test(NAME io_batch COMMAND test_io)
   add_test(NAME bench_smoke COMMAND bench_smoke)
+  add_test(NAME uring COMMAND test_uring)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):

@@ -72,6 +72,21 @@ typedef struct jt_io_run {
 //   1C1T前提)。OVERLAPPED化は Phase 2 TODO。
 int jt_io_pread_batch(int fd, const jt_io_spec_t *restrict specs, size_t n);
 
+// ---- io_uring batch-read (Linuxのみ有効, Phase 2足場) ----
+//   buffered fd前提。O_DIRECTは使わない (HOT/COLD方針どおり。4096整列要求なし。
+//   O_DIRECT有効化禁止の既存注意と矛盾させないこと)。
+//   sliding-window: batch=256、ring depthは2の冪(256)、
+//   prep_read → submit → wait_cqe + peekでdrain → resubmit の窓進行。
+//   jt_io_pread_batch は同期fallbackとして残す。
+//   戻り値: JT_OK / JT_ERR_INVAL (引数不正, errno=EINVAL)
+//            JT_ERR_IO (read失敗・EOF前打ち切り。liburing有効時のみ)
+//            JT_ERR_INVAL + errno=ENOSYS (liburing無効時fallback)
+//   TODO(NOSUP追従): MINOR-1で JT_ERR_NOSUP が新設され次第、本fallbackの
+//   JT_ERR_INVAL+ENOSYS を JT_ERR_NOSUP に置き換える。common.hには手を出さない。
+#ifdef __linux__
+int jt_io_pread_batch_uring(int fd, const jt_io_spec_t *restrict specs, size_t n);
+#endif
+
 // ソート済みID列を連続runに結合する (find_runs_gap1相当)。
 //   ids[0..n): 昇順ソート済み行/expert ID。重複は無視 (同一runに畳む)。
 //   record_bytes: 1行あたりバイト数 (>0)。1ならID単位の (offset,length)。
