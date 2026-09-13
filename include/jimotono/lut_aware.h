@@ -86,8 +86,12 @@ typedef struct jt_lut_export_desc {
 int jt_lut_export_desc(uint32_t rows, uint32_t cols, int bits,
                        uint32_t block, jt_lut_export_desc_t *restrict desc);
 
-// 実バイナリ出力 (TODO): 現状は JT_ERR_NOSUP (errno=ENOSYS)。
-// シグネチャ予約 (テーブル+スケールを同ページ配置で書き出す将来位置)。
+// 実バイナリ出力: 記述子レイアウト通りにLUTテーブル+スケールを同ページ配置で
+// メモリバッファへ書き出す (DESIGN 5.1-5、64B整列、LE前提)。
+// packingはlut_aware.cのjt_lut_export_binary注記を参照 (8bit素直、4bitニブル、
+// 2bit 4要素/B、パディングはゼロ)。outは64B整列・out_cap>=page_bytesを要求。
+// 戻り値: JT_OK / JT_ERR_INVAL (NULL/不整列/サイズ不足/非有限/不正dims) /
+//   JT_ERR_NOMEM (積オーバーフロー/malloc失敗)。失敗時は*out_written=0。
 int jt_lut_export_binary(const float *restrict W, uint32_t rows,
                          uint32_t cols, int bits, uint32_t block,
                          void *restrict out, size_t out_cap,
