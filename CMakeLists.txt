@@ -113,6 +113,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_mixed_lut bench/kernel/test_mixed_lut.c)
   target_link_libraries(test_mixed_lut PRIVATE jimotono_core)
 
+  add_executable(test_e2e_pipe bench/kernel/test_e2e_pipe.c)
+  target_link_libraries(test_e2e_pipe PRIVATE jimotono_core)
+
 endif()
 
 enable_testing()
@@ -127,6 +130,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME train_bwd COMMAND test_train_bwd)
   add_test(NAME optim_offload COMMAND test_optim_offload)
   add_test(NAME mixed_lut COMMAND test_mixed_lut)
+  add_test(NAME e2e_pipe COMMAND test_e2e_pipe)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
