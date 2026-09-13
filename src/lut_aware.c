@@ -1,6 +1,7 @@
 // jt_lut_aware: HGQ-LUT方式の学習足場。
 // forwardはfp32テンソル演算 + 量子化誤差記録、backwardはSTE素通し。
-// exportはレイアウト記述子のみ (実バイナリはTODO/NOSUP)。
+// exportはレイアウト記述子 + 実バイナリ (jt_lut_export_binary、64B整列・
+// 同ページ配置、行単位per-block量子化をパック書出し)。
 // C11, restrict, errno + goto cleanup。スカラー核。
 
 #include "jimotono/lut_aware.h"
