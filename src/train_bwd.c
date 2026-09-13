@@ -389,6 +389,9 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
         static const int kMax = JT_BWD_MAX_WIDE;
         double dg[JT_BWD_MAX_WIDE];
         double du[JT_BWD_MAX_WIDE];
+        // s[i] = silu(G[i])*U[i] の保存域。下のdWループでsigmoid再計算を
+        // 省くための使い回し (同一入力→同一ビットのため数値は不変)。
+        double ss[JT_BWD_MAX_WIDE];
         if (h > kMax) {
             errno = EINVAL;
             goto cleanup;
@@ -407,6 +410,7 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
             }
             dg[i] = acc * ui * dsilu;
             du[i] = acc * silu;
+            ss[i] = silu * ui;
             (void)silu;
         }
         // DESIGN.MD §4.1: dXを先に計算して伝播させ、dWは後回し。
@@ -420,17 +424,15 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
             dX[j] = (float)acc;
         }
         // dWは後回し (上記dX転送とパイプライン化可能)。
-        // dWd[i,j] = s[i]*dY[j] (sはforward中間値の再計算)。
+        // dWd[i,j] = s[i]*dY[j] (sは上記ループで保存した中間値の使い回し。
+        // sigmoid再計算を省く。同一入力の再評価のためビット不変)。
         for (int i = 0; i < h; i++) {
             float *dwg = dWg + (size_t)i * (size_t)n;
             float *dwu = dWu + (size_t)i * (size_t)n;
             float *dwd = dWd + (size_t)i * (size_t)n;
             double gi_d = dg[i];
             double ui_d = du[i];
-            double gi = (double)G[i];
-            double ui = (double)U[i];
-            double sig = jt_bwd_sigmoid(gi);
-            double s = gi * sig * ui;
+            double s = ss[i];
             for (int j = 0; j < n; j++) {
                 double xj = (double)X[j];
                 dwg[j] = (float)(gi_d * xj);

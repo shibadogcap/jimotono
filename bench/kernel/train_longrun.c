@@ -166,6 +166,10 @@ static void lr_usage(const char *prog) {
 }
 
 // ---- 並列ワーカー共有コンテキスト (読み取り専用。Gpart/dtmpは线程毎) ----
+// fwdが書き込む中間値キャッシュ (Cids/Cw/CGsel/CUsel/CYsel/CGs/CUs) は
+// bwdの再計算除去用。fwdがトークン非重複に書き込み、bwdは読み取りのみの
+// ためトークン並列で安全。勾配加算は選択expertのみのスパース加算
+// (非選択のtWはbwd契約で0のため加算不要。要素毎の加算順序は不変)。
 typedef struct lr_ctx {
     const float *restrict P;
     float *restrict acts;  // [(LAYERS+1)][TOKS][N]
@@ -173,6 +177,13 @@ typedef struct lr_ctx {
     const float *restrict Tdata;
     const size_t *restrict layer_off;
     size_t head_off;
+    size_t *restrict Cids;   // [L][TOKS][K] fwdの選択ids
+    float *restrict Cw;      // [L][TOKS][K] fwdの選択weights
+    float *restrict CGsel;   // [L][TOKS][K*H]
+    float *restrict CUsel;   // [L][TOKS][K*H]
+    float *restrict CYsel;   // [L][TOKS][K*N]
+    float *restrict CGs;     // [L][TOKS][S*H] (S==0時はNULL)
+    float *restrict CUs;     // [L][TOKS][S*H] (S==0時はNULL)
 } lr_ctx_t;
 
 // forward 1層分 [a,b) トークン。rc_outにJT_OK/ERR。
@@ -195,12 +206,26 @@ static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
             ctx->acts +
             ((size_t)(layer + 1) * (size_t)LR_TOKS + (size_t)t) *
                 (size_t)LR_N;
+        // bwd使い回し用の中間値を保存 (再計算除去。同一入力のためビット不変)。
+        size_t cbase = ((size_t)layer * (size_t)LR_TOKS + (size_t)t);
+        size_t *ids = ctx->Cids + cbase * (size_t)LR_K;
+        float *weights = ctx->Cw + cbase * (size_t)LR_K;
+        float *Gsel =
+            ctx->CGsel + cbase * (size_t)LR_K * (size_t)LR_H;
+        float *Usel =
+            ctx->CUsel + cbase * (size_t)LR_K * (size_t)LR_H;
+        float *Ysel =
+            ctx->CYsel + cbase * (size_t)LR_K * (size_t)LR_N;
+        float *Gs = (LR_S > 0 && ctx->CGs != NULL)
+                        ? (ctx->CGs + cbase * (size_t)LR_S * (size_t)LR_H)
+                        : NULL;
+        float *Us = (LR_S > 0 && ctx->CUs != NULL)
+                        ? (ctx->CUs + cbase * (size_t)LR_S * (size_t)LR_H)
+                        : NULL;
         float M[LR_N];
-        size_t ids[LR_K];
-        float weights[LR_K];
         int frc = jt_moe_fwd(xin, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, M,
                              LR_N, LR_H, LR_E, LR_K, LR_S, ids, weights,
-                             NULL, NULL, NULL, NULL, NULL, NULL);
+                             NULL, Gsel, Usel, Ysel, Gs, Us);
         if (frc != JT_OK) {
             rc = frc;
             break;
@@ -257,27 +282,27 @@ static void lr_bwd_range(const lr_ctx_t *restrict ctx, size_t n_total,
                 const float *xin =
                     ctx->acts +
                     ((size_t)l * (size_t)LR_TOKS + (size_t)t) * (size_t)LR_N;
-                float M[LR_N];
-                size_t ids[LR_K];
-                float weights[LR_K];
-                float Gsel[(size_t)LR_K * (size_t)LR_H];
-                float Usel[(size_t)LR_K * (size_t)LR_H];
-                float Ysel[(size_t)LR_K * (size_t)LR_N];
-                float Gs[(size_t)LR_S * (size_t)LR_H];
-                float Us[(size_t)LR_S * (size_t)LR_H];
+                // fwd保存中間値の使い回し (再計算除去。同一値のためビット不変)。
+                size_t cbase = ((size_t)l * (size_t)LR_TOKS + (size_t)t);
+                const size_t *ids = ctx->Cids + cbase * (size_t)LR_K;
+                const float *weights = ctx->Cw + cbase * (size_t)LR_K;
+                const float *Gsel =
+                    ctx->CGsel + cbase * (size_t)LR_K * (size_t)LR_H;
+                const float *Usel =
+                    ctx->CUsel + cbase * (size_t)LR_K * (size_t)LR_H;
+                const float *Ysel =
+                    ctx->CYsel + cbase * (size_t)LR_K * (size_t)LR_N;
+                const float *Gs =
+                    (LR_S > 0 && ctx->CGs != NULL)
+                        ? (ctx->CGs +
+                           cbase * (size_t)LR_S * (size_t)LR_H)
+                        : NULL;
+                const float *Us =
+                    (LR_S > 0 && ctx->CUs != NULL)
+                        ? (ctx->CUs +
+                           cbase * (size_t)LR_S * (size_t)LR_H)
+                        : NULL;
                 float dXmoe[LR_N];
-                float dM[LR_N];
-                int frc = jt_moe_fwd(xin, Wgate, Wg, Wu, Wd, Wgs, Wus,
-                                     Wds, M, LR_N, LR_H, LR_E, LR_K, LR_S,
-                                     ids, weights, NULL, Gsel, Usel, Ysel,
-                                     Gs, Us);
-                if (frc != JT_OK) {
-                    rc = frc;
-                    break;
-                }
-                for (int j = 0; j < LR_N; j++) {
-                    dM[j] = dcur[j];
-                }
                 {
                     float *tWgate = dtmp;
                     float *tWg = tWgate + LR_P_WGATE;
@@ -286,7 +311,7 @@ static void lr_bwd_range(const lr_ctx_t *restrict ctx, size_t n_total,
                     float *tWgs = tWd + LR_P_ROUTED;
                     float *tWus = tWgs + LR_P_SHARED;
                     float *tWds = tWus + LR_P_SHARED;
-                    int brc = jt_moe_bwd(dM, xin, Wgate, Wg, Wu, Wd, Wgs,
+                    int brc = jt_moe_bwd(dcur, xin, Wgate, Wg, Wu, Wd, Wgs,
                                          Wus, Wds, ids, weights, Gsel, Usel,
                                          Ysel, Gs, Us, dXmoe, tWgate, tWg,
                                          tWu, tWd, tWgs, tWus, tWds, NULL,
@@ -305,13 +330,23 @@ static void lr_bwd_range(const lr_ctx_t *restrict ctx, size_t n_total,
                         float *gWgs = gWd + LR_P_ROUTED;
                         float *gWus = gWgs + LR_P_SHARED;
                         float *gWds = gWus + LR_P_SHARED;
-                        for (size_t i = 0; i < LR_P_WGATE; i++) {
-                            gWgate[i] += tWgate[i];
-                        }
-                        for (size_t i = 0; i < LR_P_ROUTED; i++) {
-                            gWg[i] += tWg[i];
-                            gWu[i] += tWu[i];
-                            gWd[i] += tWd[i];
+                        // スパース加算: 選択expert行のみ (非選択のtWはbwd契約
+                        // で0のため加算不要。共有は常時発火で全行)。
+                        // 要素毎のトークン方向の加算順序は密版と同一。
+                        for (int p = 0; p < LR_K; p++) {
+                            size_t e = ids[p];
+                            size_t erow = e * (size_t)LR_H * (size_t)LR_N;
+                            size_t egate = e * (size_t)LR_N;
+                            size_t hhn = (size_t)LR_H * (size_t)LR_N;
+                            for (size_t i = 0; i < hhn; i++) {
+                                gWg[erow + i] += tWg[erow + i];
+                                gWu[erow + i] += tWu[erow + i];
+                                gWd[erow + i] += tWd[erow + i];
+                            }
+                            for (int j = 0; j < LR_N; j++) {
+                                gWgate[egate + (size_t)j] +=
+                                    tWgate[egate + (size_t)j];
+                            }
                         }
                         for (size_t i = 0; i < LR_P_SHARED; i++) {
                             gWgs[i] += tWgs[i];
@@ -375,6 +410,14 @@ int main(int argc, char **argv) {
     float *dtmp = NULL;
     float *Gpart = NULL;   // [nthr][n_total] スレッド別勾配部分和
     float *dtmps = NULL;   // [nthr][P_LAYER] スレッド別bwd私用域
+    // fwd中間値キャッシュ (bwd再計算除去用。[L][TOKS] 単位)。
+    size_t *Cids = NULL;   // [L][TOKS][K]
+    float *Cw = NULL;      // [L][TOKS][K]
+    float *CGsel = NULL;   // [L][TOKS][K*H]
+    float *CUsel = NULL;   // [L][TOKS][K*H]
+    float *CYsel = NULL;   // [L][TOKS][K*N]
+    float *CGs = NULL;     // [L][TOKS][S*H] (S==0時はNULLのまま)
+    float *CUs = NULL;     // [L][TOKS][S*H] (S==0時はNULLのまま)
     long nthr_req = 0;     // 0=自動
     long nthr = 1;
     size_t layer_off[(size_t)LR_LAYERS + 1];
@@ -465,16 +508,26 @@ int main(int argc, char **argv) {
                          (double)LR_N * 4.0;
         double t_bytes = (double)nthr * (double)n_total * 4.0 +
                          (double)nthr * (double)LR_P_LAYER * 4.0;
-        double est = w_bytes + g_bytes + o_bytes + a_bytes + t_bytes;
+        // fwd中間値キャッシュ: [L][TOKS]×(ids/weights + K*H×2 + K*N + S*H×2)。
+        double c_bytes =
+            (double)LR_LAYERS * (double)LR_TOKS *
+            ((double)(LR_K * sizeof(size_t)) +
+             (double)((size_t)LR_K + (size_t)2 * (size_t)LR_K * (size_t)LR_H +
+                      (size_t)LR_K * (size_t)LR_N +
+                      (size_t)2 * (size_t)LR_S * (size_t)LR_H) *
+                 4.0);
+        double est =
+            w_bytes + g_bytes + o_bytes + a_bytes + t_bytes + c_bytes;
         printf("train_longrun: layers=%d d=%d E=%d h=%d k=%d S=%d "
                "seq=%d batch=%d toks/step=%d fp32 threads=%ld\n",
                LR_LAYERS, LR_N, LR_E, LR_H, LR_K, LR_S, LR_SEQ, LR_BATCH,
                LR_TOKS, nthr);
         printf("train_longrun: params=%zu weight=%.2fMiB grad=%.2fMiB "
-               "optim=%.2fMiB acts=%.2fMiB thr=%.2fMiB est_resident=%.2fMiB\n",
+               "optim=%.2fMiB acts=%.2fMiB thr=%.2fMiB cache=%.2fMiB "
+               "est_resident=%.2fMiB\n",
                n_total, w_bytes / 1048576.0, g_bytes / 1048576.0,
                o_bytes / 1048576.0, a_bytes / 1048576.0,
-               t_bytes / 1048576.0, est / 1048576.0);
+               t_bytes / 1048576.0, c_bytes / 1048576.0, est / 1048576.0);
         fflush(stdout);
         if (est > LR_MAX_GB * 1024.0 * 1024.0 * 1024.0) {
             fprintf(stderr, "train_longrun: est %.2fMiB exceeds %.0fGB\n",
@@ -491,6 +544,23 @@ int main(int argc, char **argv) {
     acts = (float *)malloc((size_t)(LR_LAYERS + 1) * (size_t)LR_TOKS *
                            (size_t)LR_N * sizeof(float));
     dtmp = (float *)malloc(LR_P_LAYER * sizeof(float));
+    {
+        size_t nct = (size_t)LR_LAYERS * (size_t)LR_TOKS;
+        Cids = (size_t *)malloc(nct * (size_t)LR_K * sizeof(size_t));
+        Cw = (float *)malloc(nct * (size_t)LR_K * sizeof(float));
+        CGsel = (float *)malloc(nct * (size_t)LR_K * (size_t)LR_H *
+                               sizeof(float));
+        CUsel = (float *)malloc(nct * (size_t)LR_K * (size_t)LR_H *
+                               sizeof(float));
+        CYsel = (float *)malloc(nct * (size_t)LR_K * (size_t)LR_N *
+                               sizeof(float));
+        if (LR_S > 0) {
+            CGs = (float *)malloc(nct * (size_t)LR_S * (size_t)LR_H *
+                                  sizeof(float));
+            CUs = (float *)malloc(nct * (size_t)LR_S * (size_t)LR_H *
+                                  sizeof(float));
+        }
+    }
     if (nthr > 1) {
         Gpart =
             (float *)malloc((size_t)nthr * n_total * sizeof(float));
@@ -498,7 +568,10 @@ int main(int argc, char **argv) {
             (float *)malloc((size_t)nthr * LR_P_LAYER * sizeof(float));
     }
     if (P == NULL || G == NULL || X == NULL || T == NULL || acts == NULL ||
-        dtmp == NULL || (nthr > 1 && (Gpart == NULL || dtmps == NULL))) {
+        dtmp == NULL || Cids == NULL || Cw == NULL || CGsel == NULL ||
+        CUsel == NULL || CYsel == NULL ||
+        (LR_S > 0 && (CGs == NULL || CUs == NULL)) ||
+        (nthr > 1 && (Gpart == NULL || dtmps == NULL))) {
         fprintf(stderr, "train_longrun: OOM\n");
         errno = ENOMEM;
         goto cleanup;
@@ -609,6 +682,13 @@ int main(int argc, char **argv) {
             wctx.Tdata = T;
             wctx.layer_off = layer_off;
             wctx.head_off = head_off;
+            wctx.Cids = Cids;
+            wctx.Cw = Cw;
+            wctx.CGsel = CGsel;
+            wctx.CUsel = CUsel;
+            wctx.CYsel = CYsel;
+            wctx.CGs = CGs;
+            wctx.CUs = CUs;
             for (int l = 0; l < LR_LAYERS; l++) {
 #if LR_HAVE_PTHREAD
                 if (nthr > 1) {
@@ -938,5 +1018,12 @@ cleanup:
     free(dtmp);
     free(Gpart);
     free(dtmps);
+    free(Cids);
+    free(Cw);
+    free(CGsel);
+    free(CUsel);
+    free(CYsel);
+    free(CGs);
+    free(CUs);
     return rc_all;
 }
