@@ -71,6 +71,7 @@
 - worktree作成・破棄はROADMAP 2.3手順に従う（`git worktree add ~/jimotono-wt-<name> -b <branch> develop`、`git worktree list`で確認）
 - worktreeは使い捨て：用済みは`git worktree remove ~/jimotono-wt-<name>`で破棄し、残骸があれば`rm -rf`＋`git worktree prune`。`list`に出ない orphan を溜めない。`build-*/`・`artifacts/*`は各wtに複製されるため放置でディスクを食う
 - 一時作業も担当wt内に限定：スクラッチ・一時ファイルは担当wt内の`tmp/`等に置き、`/tmp`・他wt・ホーム直下への書き出しは禁止。wt破棄時にまとめて消す
+- ベンチ計測の相互排除：負荷のかかるベンチ（train_longrun、cycle、tmac計測等）を複数エージェントが同時実行するとメモリ帯域を潰し合い数値が歪む。性能数値を取る実行は常時1プロセスのみ。サブエージェントへの指示では「実装＋短時間correctness確認まで」とし、性能比較計測は親（統合者）が逐次実行する。やむを得ず並列時はスレッド数を半分以下に制限し、数値を参考扱いと明記する
 
 ## 5. 参照すべき研究・実装一覧
 
