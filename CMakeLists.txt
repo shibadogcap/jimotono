@@ -164,6 +164,11 @@ if(JIMOTONO_BUILD_BENCH)
   # 実行バイナリのみ。ctestには追加しない (学習ループのため)。
   add_executable(train_names bench/kernel/train_names.c)
   target_link_libraries(train_names PRIVATE jimotono_core)
+
+  # train_tinystories: バイトレベル次トークン予測 (Phase G評価用実言語タスク)。
+  # 実行バイナリのみ。ctestには追加しない (学習ループのため)。
+  add_executable(train_tinystories bench/kernel/train_tinystories.c)
+  target_link_libraries(train_tinystories PRIVATE jimotono_core)
 endif()
 
 enable_testing()
