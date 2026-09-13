@@ -277,6 +277,160 @@ static void test_roundtrip_bits3(void) {
     }
 }
 
+// P2: SIMD集計 vs スカラー参照の一致テスト。
+// jt_tmac_lookup_accum内部はAVX2/NEONでベクトル化され得るため、テスト側に
+// スカラー参照実装 (P1核と同一の演算順序: mul→add→mul(0.5)→mul(pow2)、
+// b昇順加算、double累積→最後にw_scale) を持ち、bit同一を検証する。
+// 整数LUT系 (sc=1/bi=0) は完全一致 (==) を要求。量子化スケール系も設計上
+// bit同一 (FMA不使用・合算順序保存) のため完全一致を期待し、不一致時は
+// float bit表示で丸め起因か判定できるようにする。
+static float simd_ref_scalar(const int8_t *restrict qlut, const uint8_t *restrict idx,
+                             const float *restrict scales, const float *restrict biases,
+                             size_t ngroups, size_t nblocks, int bits, float w_scale) {
+    double total = 0.0;
+    for (size_t bb = 0; bb < nblocks; bb++) {
+        double sc = (double)scales[bb];
+        double bi = (double)biases[bb];
+        const int8_t *qblk = qlut + bb * 8u * (size_t)JT_TMAC_LUT_HALF;
+        for (int b = 0; b < bits; b++) {
+            const uint8_t *plane = idx + (size_t)b * ngroups + bb * 8u;
+            int32_t acc = 0;
+            for (size_t gi = 0; gi < 8u; gi++) {
+                unsigned p = (unsigned)(plane[gi] & 0x0Fu);
+                int qv = 0;
+                if (p >= 8u) {
+                    qv = (int)qblk[gi * 8u + (p - 8u)];
+                } else {
+                    qv = -(int)qblk[gi * 8u + (7u - p)];
+                }
+                acc += qv;
+            }
+            total += ((sc * (double)acc + bi) * 0.5) * (double)(1 << b);
+        }
+    }
+    total *= (double)w_scale;
+    return (float)total;
+}
+
+static void check_exact(float got, float want, const char *msg) {
+    if (got != want) {
+        uint32_t gb = 0;
+        uint32_t wb = 0;
+        char buf[192];
+        memcpy(&gb, &got, sizeof gb);
+        memcpy(&wb, &want, sizeof wb);
+        snprintf(buf, sizeof buf, "%s got=%g(0x%08X) want=%g(0x%08X)", msg, (double)got, gb,
+                 (double)want, wb);
+        fail_at(__LINE__, buf);
+    }
+}
+
+static void test_simd_match(void) {
+#ifdef __AVX2__
+    printf("simd path: AVX2\n");
+#else
+#ifdef __ARM_NEON
+    printf("simd path: NEON\n");
+#else
+    printf("simd path: scalar\n");
+#endif
+#endif
+    // A: 整数LUT (sc=1/bi=0/w=1) × bits 1..4 × 2ブロック → 完全一致。
+    {
+        enum { ANB = 2, ANG = 16 };
+        int8_t q[ANG * 8];
+        uint8_t idx[4 * ANG];
+        float sc[ANB] = {1.0f, 1.0f};
+        float bi[ANB] = {0.0f, 0.0f};
+        for (size_t i = 0; i < (size_t)(ANG * 8); i++) {
+            q[i] = (int8_t)((int)(i % 25u) - 12);
+        }
+        for (size_t i = 0; i < (size_t)(4 * ANG); i++) {
+            idx[i] = (uint8_t)((i * 7u + 1u) % 16u);
+        }
+        for (int bits = 1; bits <= 4; bits++) {
+            float out = 0.0f;
+            float ref = 0.0f;
+            char msg[64];
+            if (jt_tmac_lookup_accum(q, idx, sc, bi, (size_t)ANG, (size_t)ANB, bits, 1.0f,
+                                     &out)
+                != JT_OK) {
+                snprintf(msg, sizeof msg, "simd int bits=%d rc", bits);
+                fail_at(__LINE__, msg);
+                continue;
+            }
+            ref = simd_ref_scalar(q, idx, sc, bi, (size_t)ANG, (size_t)ANB, bits, 1.0f);
+            snprintf(msg, sizeof msg, "simd int exact bits=%d", bits);
+            check_exact(out, ref, msg);
+        }
+    }
+    // B: ctor生成QLUT (量子化スケール丸めあり) × bits 1..4 × 正負w_scale → 完全一致を期待。
+    {
+        enum { BNK = 64, BNG = 16, BNB = 2 };
+        float act[BNK];
+        int8_t q[BNG * 8];
+        float sc[BNB];
+        float bi[BNB];
+        uint8_t idx[4 * BNG];
+        const float ws[2] = {1.5f, -0.75f};
+        for (size_t i = 0; i < (size_t)BNK; i++) {
+            int v = (int)((i * 37u + 11u) % 13u) - 6;
+            act[i] = (float)v * 0.25f;
+        }
+        for (size_t i = 0; i < (size_t)(4 * BNG); i++) {
+            idx[i] = (uint8_t)((i * 5u + 3u) % 16u);
+        }
+        CHECK(jt_tmac_lut_ctor(act, 1u, (size_t)BNK, q, sc, bi) == JT_OK, "simd ctor");
+        for (int bits = 1; bits <= 4; bits++) {
+            for (int wi = 0; wi < 2; wi++) {
+                float out = 0.0f;
+                float ref = 0.0f;
+                char msg[64];
+                if (jt_tmac_lookup_accum(q, idx, sc, bi, (size_t)BNG, (size_t)BNB, bits,
+                                         ws[wi], &out)
+                    != JT_OK) {
+                    snprintf(msg, sizeof msg, "simd q bits=%d w=%d rc", bits, wi);
+                    fail_at(__LINE__, msg);
+                    continue;
+                }
+                ref = simd_ref_scalar(q, idx, sc, bi, (size_t)BNG, (size_t)BNB, bits,
+                                      ws[wi]);
+                snprintf(msg, sizeof msg, "simd q exact bits=%d w=%d", bits, wi);
+                check_exact(out, ref, msg);
+            }
+        }
+    }
+    // C: 非整列ポインタでも一致 (align要件なし維持。+1 byte offset)。
+    {
+        enum { CNB = 1, CNG = 8 };
+        int8_t q0[CNG * 8];
+        uint8_t i0[4 * CNG];
+        float s0[CNB] = {0.25f};
+        float b0[CNB] = {1.0f};
+        static uint8_t qbuf[CNG * 8 + 8];
+        static uint8_t ibuf[4 * CNG + 8];
+        int8_t *qa = (int8_t *)(qbuf + 1);
+        uint8_t *ia = ibuf + 1;
+        float out0 = 0.0f;
+        float outa = 0.0f;
+        for (size_t i = 0; i < (size_t)(CNG * 8); i++) {
+            q0[i] = (int8_t)((int)(i % 17u) - 8);
+        }
+        for (size_t i = 0; i < (size_t)(4 * CNG); i++) {
+            i0[i] = (uint8_t)((i * 3u + 2u) % 16u);
+        }
+        memcpy(qa, q0, sizeof q0);
+        memcpy(ia, i0, sizeof i0);
+        CHECK(jt_tmac_lookup_accum(q0, i0, s0, b0, (size_t)CNG, (size_t)CNB, 4, 2.0f, &out0)
+                  == JT_OK,
+              "simd unaligned base rc");
+        CHECK(jt_tmac_lookup_accum(qa, ia, s0, b0, (size_t)CNG, (size_t)CNB, 4, 2.0f, &outa)
+                  == JT_OK,
+              "simd unaligned off rc");
+        check_exact(outa, out0, "simd unaligned match");
+    }
+}
+
 static void test_errors(void) {
     float act[32] = {0.0f};
     int8_t q[64];
@@ -425,6 +579,7 @@ int main(void) {
     test_bits();
     test_roundtrip();
     test_roundtrip_bits3();
+    test_simd_match();
     test_errors();
     test_arena_align();
     if (g_fail != 0) {
