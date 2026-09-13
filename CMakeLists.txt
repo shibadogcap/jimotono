@@ -47,7 +47,10 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_arena bench/kernel/test_arena.c)
   target_link_libraries(test_arena PRIVATE jimotono_core)
 
-  enable_testing()
+endif()
+
+enable_testing()
+if(JIMOTONO_BUILD_BENCH)
   add_test(NAME arena COMMAND test_arena)
 endif()
 

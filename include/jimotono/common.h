@@ -1,4 +1,6 @@
 #pragma once
+#ifndef JIMOTONO_COMMON_H
+#define JIMOTONO_COMMON_H
 // JIMOTONO common definitions: C11, little-endian only, cross-platform.
 // AGENTS.MD 7.1: restrict積極使用, errnoベース, goto cleanup.
 
@@ -30,3 +32,5 @@ static inline int jt_imax(int a, int b) { return a > b ? a : b; }
 #define JT_VERSION_MAJOR 0
 #define JT_VERSION_MINOR 0
 #define JT_VERSION_PATCH 1
+
+#endif  // JIMOTONO_COMMON_H

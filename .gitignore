@@ -10,3 +10,4 @@ artifacts/route/*
 !artifacts/kv/.gitkeep
 !artifacts/route/.gitkeep
 .DS_Store
+*.dSYM/

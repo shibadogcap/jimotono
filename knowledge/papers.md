@@ -16,12 +16,12 @@
 
 ### 学習→推論の流れ (注意: HGQ-LUTとは別物)
 - T-MACは **CPU動的LUT**: (1) オフラインで重みをbit-plane分割+タイル順permutation+interleave、(2) オンラインで activation から `QLUT + LUT_Scales/Biases` を動的量子化で生成 (`act_group=32/64`)、(3) `TBL/PSHUF` lookup + int32累積 → 最後にweight scale×LUT scaleを乗算。
-- 学習は通常のQAT/GPTQ/BitNetでよく、推論時コンパイル不要。HGQ (FPGA用、BN+Dense+Actを真理値表に静的展開) とは目的も実装も異なる。JIMOTONO文書の「HGQ-LUT方式」という表現はT-MAC文脈では使わない。
+- 学習は通常のQAT/GPTQ/BitNetでよく、推論時コンパイル不要。HGQ (FPGA用、BN+Dense+Actを真理値表に静的展開) とは目的も実装も異なる。JIMOTONO文書の「HGQ-LUT方式」という表現はT-MAC文脈では使わない (AGENTS.MD 3.3の修正が必要。P1着手前にAGENTS側を「T-MAC動的LUT」に修正すること)。
 
 ### C実装への示唆
 1. **レジスタ常駐 + 64B整列 + K-first**: LUTはL1でなくレジスタに (`NEON:vqtbl1q_u8`, `AVX2:_mm256_shuffle_epi8`)。`g=4,int8`で16B=NEON 128bitに丁度。workspaceは `posix_memalign(64)` / `_aligned_malloc(64)`。tilingは `Mt_m` を大きくし同一LUT再利用最大化。
-2. **group size 3種を区別**: `g=4` (LUT粒度、5以上は遅いので固定推奨)、`group_size=128` (weight scale粒度)、`act_group_size=32/64` (LUT動的量子化粒度)。
-3. **逆量子化回避**: (a) オフラインbit-plane+permuteでunpack消去、(b) LUT値int8化・累積int32・スケール乗算は最後に1回だけ、(c) nibble分割lookup (`&0x0F` と `>>4` で1命令2 lookup)。fast 8-bit集約 (`avg/rhadd`) は精度劣化 (NMSE 2.5倍) のためデフォルトOFF。
+2. **group size 3種を区別**: `g=4` (LUT粒度、5以上は遅いので固定推奨)、`group_size=128` (weight scale粒度)、`act_group_size=32/64` (LUT動的量子化粒度、JIMOTONO仮定。T-MAC原典は `g=4で8値量子化` のみ明示)。
+3. **逆量子化回避**: (a) オフラインbit-plane+permuteでunpack消去、(b) LUT値int8化・累積int32・スケール乗算は最後に1回だけ、(c) nibble分割lookup案 (`&0x0F` と `>>4` で1命令2 lookup。JIMOTONO独自提案、原典記述ではない)。fast 8-bit集約 (`avg/rhadd`) は精度劣化 (NMSE 2.5倍) のためデフォルトOFF。
 4. **C11注意**: `restrict` + `_Alignas(64)`、ホットパスは `#ifdef __AVX512__ / __AVX2__ / __ARM_NEON` 分岐、`errno + goto cleanup`。
 
 ### 性能数値
@@ -87,7 +87,7 @@ o_t = S_t^T q_t
 
 ### fine-grained smoothness と coarse-grained commitment / Wの選び方
 - Soft=ステップ幅 (微視的滑らかさ)、Hard=半径 (窓内全トークンが同一常駐expertで捌ける巨視的拘束)。片方だけでは「小刻みドリフト」「窓内ジッタ」が残る。
-- 論文値: Soft-Hardは `W=4` 固定。Hard単体は `W=2` が最良、`W=8` は逆に悪化。初期値は `W=4〜8` から開始しSR/CHRでPareto選択。
+- 論文値: Soft-Hardは `W=4` 固定。Hard単体は `W=2` が最良、`W=8` は逆に悪化。初期値は `W=2〜4` から開始し (W=8はPareto確認用に留める)、SR/CHRでPareto選択。
 - W選び方針: (a) LRU容量Cと対応 (C=2評価でW=4が最良)、(b) 意味的コヒーレンスspanに合わせる、(c) 大きすぎるWはPPL悪化。
 
 ### C実装・学習実装への示唆
@@ -97,7 +97,7 @@ o_t = S_t^T q_t
 - **案3 (境界-aware緩和)**: 文・関数境界ではペナルティをマスク。無差別ペナルティは `λ≥0.2` でPPL悪化要因。
 
 ### 性能数値
-- SR削減59%: Soft `λ=0.5` で 0.71→0.30。miss削減3.92倍: CHR 0.54→0.88。
+- SR削減59%: Soft `λ=0.5` で 0.71→0.30 (条件: top-1・C=2・4 experts・WikiText-2・8.8M/22M小規模)。miss削減3.92倍: CHR 0.54→0.88 (同条件)。JIMOTONO (数千expert×top-8〜16) への直置きは過大評価のため測定定義の再定義が必須。
 - 品質: 低λは正則化として改善 (`λ=0.05` でPPL -4.1%)。`λ≥0.2` でトレードオフ顕在。
 - 崩壊なし: 利用エントロピー全条件1.92bit以上。post-hoc router微調整は無効 (<0.5%)。
 - 層別ではL1が最大改善 (85%減)、L0は抵抗大 (embedding未混合のため)。
@@ -124,18 +124,18 @@ o_t = S_t^T q_t
 
 ### Delta Prefetching と Router-lookahead
 - **Delta**: sparse行の82〜85%が前トークンと同一。残り15〜18%のincoming行のみ読み込み。neuron-major単一ファイル + `find_runs_gap1` で `(offset,length)` 結合しランダムI/O削減。初トークンは全層一括、2トークン目以降deltaのみ。
-- **Router-lookahead 71.6%** (Colibri `PILOT=1` 実測): 層Lのpost-attention状態に層L+1のrouterを適用すると真のtop-8を71.6% recall (ベースライン41.3%)。専用I/Oスレッドが次層expertを先読み。
+- **Router-lookahead 71.6%** (Colibri `PILOT=1` 実測、GLM-5.2固有測定のためJIMOTONO MoEでは再測定要): 層Lのpost-attention状態に層L+1のrouterを適用すると真のtop-8を71.6% recall (ベースライン41.3%)。専用I/Oスレッドが次層expertを先読み。
 - 両者は相補: NeuroPrefetcher型=トークン間delta (時間局所性)、Router-lookahead=層間先読み (空間局所性)。
 
 ### io_uring + O_DIRECT 要点 / Colibri式との使い分け
-- `liburing` sliding-window: `batch=256`、ring sizeは2の冪、`prep_read→submit→wait_cqe+peekでdrain→resubmit`。GIL解放しdense計算と並列。
+- `liburing` sliding-window: `batch=256`、ring sizeは2の冪、`prep_read→submit→wait_cqe+peekでdrain→resubmit`。GIL解放しdense計算と並列。(未確認: `engine/fast_pread_uring.c` のコード確認が必要。`find_runs_gap1`、`初トークン全層一括` も同様に要確認)
 - `O_DIRECT` 前提: `posix_memalign(4096)` バッファ、short-readは `pread` リトライ。
 - 判断基準: ホット (共有expert/attention/頻出routed) はLRU+pin+buffered、コールドdelta streamingはO_DIRECT。macOSに `O_DIRECT` なし→ `F_NOCACHE`、Windowsは `FILE_FLAG_NO_BUFFERING` のため抽象化層でbuffered fallback必須。
 
 ### 性能数値
 - llama.cpp比 **7.9〜12.0倍** (model-exceeds-memory帯)。major page fault **11453/s→0.21/s**、CPU iowait **77%→4%**。
-- トークン当りNVMe読み **103MiB** (14.8GiB時) → 9.0GiB時1GiB弱。遅延の80〜87%がNVMe I/O。
-- 品質: 予測正解率~99%、dense精度の92〜96%保持。
+- トークン当りNVMe読み **103MiB** (条件: Mistral-7B FP16・62% sparsity・14.8GiB時。JIMOTONO目標化は条件付き)→ 9.0GiB時1GiB弱。遅延の80〜87%がNVMe I/O。
+- 品質: 予測正解率~99% (centroid選択率。活性予測≠e2e正解率)、dense精度の92〜96%保持。
 
 ### JIMOTONOへの適用注意
 1. **I/O抽象化は機能差を吸収**: C11層は `jt_io_pread_batch(fd,specs,dsts)` のspec配列I/Fに統一。Linuxのみio_uring+O_DIRECT、macOSは `F_NOCACHE`+`preadv`、Windowsは `OVERLAPPED`+buffered fallback。起動時 `iobench` 相当で実効帯域を測り較正。
@@ -151,7 +151,18 @@ o_t = S_t^T q_t
 
 ## 5. Phase 1への申し送り (共通)
 
-- [ ] T-MAC: `g=4` 固定、fast aggregation OFF、独自バイナリはbit-plane済みで焼く。64x64タイル形状は再検討要。
+> 注意: `103MiB / 99% / 59% / 3.92x` のJIMOTONO目標化は条件付き (上記各章の条件を参照)。DESIGN.MD 6章の無条件目標化は過大評価のため、測定定義 (モデル・量子化・sparsity・C・top-k) を付記して評価すること。
+
+- [ ] T-MAC: `g=4` 固定、fast aggregation OFF、独自バイナリはbit-plane済みで焼く。64x64タイル形状は再検討要 (Mt大/Kt小のsweep、expert並列束ねの実験計画をPhase 1で策定)。
 - [ ] GDN-2: デコード逐次核 + プリフィル C=16/32、state fp32維持、q/k L2正規化、`b_t` 精度優先。
-- [ ] StickyMoE: `λ=0.05〜0.1, W=4〜8` 開始、共有expertは損失対象外、層別λ＋境界マスク。
+- [ ] StickyMoE: `λ=0.05〜0.1, W=2〜4` 開始 (W=8はPareto確認用)、共有expertは損失対象外、層別λ＋境界マスク。
 - [ ] NeuroPrefetcher: `jt_io_pread_batch` 抽象化、共起クラスタリング＋4K倍数レコード、ホット=LRU/コールド=O_DIRECT。
+
+## 6. llm.c / GPT-2 forward-backward (Phase 0完了条件の補完)
+
+> ROADMAP 10の完了条件「llm.cをビルドし、GPT-2のforward/backwardを理解」の証跡。P0時点ではビルド実行なし・読解メモのみ。Phase 2 (学習エンジン) 着手前に実ビルドで検証すること。
+
+- **対象**: karpathy/llm.c (GPT-2 forward/backwardのC/CUDA参照実装)。JIMOTONO学習エンジン (Phase 2) の出発点。
+- **要点**: (a) forwardは layernorm→matmul→gelu→residual の融合単位で理解する、(b) backwardは dX先行・dW後回しのオーバーラップ (DESIGN 4.1) が前提、(c) Adam状態の8bit化・勾配チェックポインティングはPhase 2で実装。
+- **未実施**: llm.cの実ビルド・GPT-2 tinyでの数値再現。Phase 2開始条件とする。
+- 参照: https://github.com/karpathy/llm.c
