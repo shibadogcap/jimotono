@@ -1,7 +1,7 @@
 #pragma once
 #ifndef JIMOTONO_GDN2_H
 #define JIMOTONO_GDN2_H
-// Gated DeltaNet-2 デコード逐次核 + プリフィル chunk スタブ (Phase 1)。
+// Gated DeltaNet-2 デコード逐次核 + プリフィル chunk 核 (WY 型、C=16/32)。
 // knowledge/papers.md §2:
 //
 //   S_t = (I - k_t (b_t⊙k_t)^T) D_t S_{t-1} + k_t (w_t⊙v_t)^T
@@ -16,10 +16,10 @@
 //   削減は w_t (write, value側) から行う (スカラー化・量子化の候補)。
 // - S は 64B 整列必須。不正時は JT_ERR_ALIGN。
 // - レイアウトは密・連続 (ld==dv 固定)。可変長は cuSeqlens 境界で
-//   jt_gdn2_state_reset() し、P1 ではチャンク核を使わない。
+//   jt_gdn2_state_reset() し、チャンクを跨がないこと。
 // - リトルエンディアン前提 (common.h が BE で #error)。
 // - SIMD: 下部の JT_GDN2_SIMD_WIDTH ifdef ガード参照。
-//   P1 はスカラー核。P2 で AVX-512/AVX2/NEON パスを追加する。
+//   現状スカラー核。AVX-512/AVX2/NEON パスは別タスクで追加予定。
 
 #include <stddef.h>
 
@@ -85,12 +85,20 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
                         int dk, int dv, float *restrict scratch,
                         size_t scratch_n);
 
-// プリフィル用チャンク核 (P1 はスタブ: 宣言 + ENOSYS 返却のみ)。
-// P2 で WY 型 (intra-chunk 64×64→C=16/32 縮小 solve + inter-chunk 漸化式、
-// L1/L2 常駐優先) を実装予定。Q/K/B/Alpha: [C][dk]、V/W: [C][dv]、
-// Out: [C][dv]、S: [dk][dv] 入出力。C は関数名に固定 (16 / 32)。
-// 現状の戻り値 (MINOR-1): 正常入力は JT_ERR_NOSUP+errno=ENOSYS (未実装)、
-// 不正入力は JT_ERR_INVAL+errno=EINVAL。戻り値のみで区別可能。
+// プリフィル用チャンク核 (P2 実装済み、WY 型、C 固定)。
+// intra-chunk: C×C 下三角 solve ((I+L)^{-1}) + 密行列積、
+// inter-chunk: チャンク間のみ漸化式 (papers.md §2、decay 吸収で純粋非対称 delta 化)。
+// Q/K/B/Alpha: [C][dk]、V/W: [C][dv]、Out: [C][dv]、S: [dk][dv] 入出力。
+// C は関数名に固定 (16 / 32)。C 回の jt_gdn2_decode_step() 逐次実行と等価
+// (同一初期 S・同一順序入力に対し fp32 丸めを除き一致。bench は倍精度参照と tol=2e-5)。
+// q/k は核内で L2 正規化 (eps ガード)。alpha は核外累積済み [0,1]。
+// b (erase) は fp32 維持。S は fp32 維持・64B 整列必須。
+// scratch: 4*C*dk + 2*C*dv + C*C + dk 個以上の作業域
+// (内訳 Qn/Kn/E/P + U/G + L + tmp)。不足時は JT_ERR_INVAL。
+// S・Out・各入力・scratch は互いに重ねないこと (restrict)。
+// fail-closed (デコード核と同一方針): Q/K/V/B/W/Alpha に非有限がある場合、
+// alpha が [0,1] 外の場合は JT_ERR_INVAL (errno=EINVAL) を返し S・Out 不変。
+// 戻り値: JT_OK / JT_ERR_INVAL / JT_ERR_ALIGN (errno 併用)。NOSUP は返さない。
 int jt_gdn2_prefill_chunk16(float *restrict S, float *restrict Out,
                             const float *restrict Q, const float *restrict K,
                             const float *restrict V, const float *restrict B,

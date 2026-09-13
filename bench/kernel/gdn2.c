@@ -503,32 +503,347 @@ static void test_invalid_decode(void) {
     jt_gdn2_state_free(S);
 }
 
-static void test_prefill_stub(void) {
+// ---- P2 プリフィル chunk 核の等価性 (逐次 decode×C 回 vs chunk 一発) ----
+// 方針: 同一初期 S・同一順序入力で両者を走らせ、Out・S を tol=2e-5 で比較
+// (gdn2.h 契約: C 回の decode_step と fp32 丸めを除き一致)。
+
+static size_t prefill_need(int C, int dk, int dv) {
+    return (size_t)4 * (size_t)C * (size_t)dk +
+           (size_t)2 * (size_t)C * (size_t)dv + (size_t)C * (size_t)C +
+           (size_t)dk;
+}
+
+typedef int (*prefill_fn_t)(float *restrict, float *restrict,
+                            const float *restrict, const float *restrict,
+                            const float *restrict, const float *restrict,
+                            const float *restrict, const float *restrict, int,
+                            int, float *restrict, size_t);
+
+static void test_prefill_equiv(int C, int dk, int dv, int seed,
+                               prefill_fn_t fn, const char *name) {
+    float *Sseq = NULL;
+    float *Schunk = NULL;
+    CHECK(jt_gdn2_state_alloc(&Sseq, dk, dv) == JT_OK && Sseq != NULL,
+          "%s seq alloc", name);
+    CHECK(jt_gdn2_state_alloc(&Schunk, dk, dv) == JT_OK && Schunk != NULL,
+          "%s chunk alloc", name);
+    if (Sseq == NULL || Schunk == NULL) {
+        jt_gdn2_state_free(Sseq);
+        jt_gdn2_state_free(Schunk);
+        return;
+    }
+    size_t cneed = prefill_need(C, dk, dv);
+    size_t dneed = 0;
+    CHECK(jt_gdn2_scratch_floats(dk, dv, &dneed) == JT_OK, "%s dscratch",
+          name);
+    float *Q = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *K = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *B = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *A = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *V = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *W = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *Ochunk = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *Oseq = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *cs = (float *)malloc(cneed * sizeof(float));
+    float *ds = (float *)malloc(dneed * sizeof(float));
+    CHECK(Q && K && B && A && V && W && Ochunk && Oseq && cs && ds,
+          "%s malloc", name);
+    if (!(Q && K && B && A && V && W && Ochunk && Oseq && cs && ds)) {
+        goto free_all;
+    }
+    for (int t = 0; t < C; t++) {
+        for (int i = 0; i < dk; i++) {
+            Q[t * dk + i] = fd(t, i, seed) + 0.37f;
+            K[t * dk + i] = fd(t, i, seed + 1) - 0.23f;
+            B[t * dk + i] = 0.5f + 0.1f * fd(t, i, seed + 2);
+            A[t * dk + i] = 0.9f + 0.05f * fd(t, i, seed + 3);
+        }
+        for (int j = 0; j < dv; j++) {
+            V[t * dv + j] = fd(t, j, seed + 4) + 0.11f;
+            W[t * dv + j] = 0.6f + 0.1f * fd(t, j, seed + 5);
+        }
+    }
+    for (int i = 0; i < dk * dv; i++) {
+        float s0 = 0.25f * fd(i, 0, seed + 6);
+        Sseq[i] = s0;
+        Schunk[i] = s0;
+    }
+    for (int t = 0; t < C; t++) {
+        int rc = jt_gdn2_decode_step(
+            Sseq, Oseq + (size_t)t * (size_t)dv, Q + (size_t)t * (size_t)dk,
+            K + (size_t)t * (size_t)dk, V + (size_t)t * (size_t)dv,
+            B + (size_t)t * (size_t)dk, W + (size_t)t * (size_t)dv,
+            A + (size_t)t * (size_t)dk, dk, dv, ds, dneed);
+        CHECK(rc == JT_OK, "%s seq step %d rc=%d", name, t, rc);
+        if (rc != JT_OK) {
+            goto free_all;
+        }
+    }
+    {
+        int rc = fn(Schunk, Ochunk, Q, K, V, B, W, A, dk, dv, cs, cneed);
+        CHECK(rc == JT_OK, "%s chunk rc=%d", name, rc);
+        if (rc != JT_OK) {
+            goto free_all;
+        }
+    }
+    {
+        const double tol = 2e-5;
+        for (int i = 0; i < C * dv; i++) {
+            double d = fabs((double)Ochunk[i] - (double)Oseq[i]);
+            CHECK(d <= tol, "%s Out[%d] diff=%g", name, i, d);
+            if (d > tol) {
+                break;
+            }
+        }
+        for (int i = 0; i < dk * dv; i++) {
+            double d = fabs((double)Schunk[i] - (double)Sseq[i]);
+            CHECK(d <= tol, "%s S[%d] diff=%g", name, i, d);
+            if (d > tol) {
+                break;
+            }
+        }
+    }
+free_all:
+    free(Q);
+    free(K);
+    free(B);
+    free(A);
+    free(V);
+    free(W);
+    free(Ochunk);
+    free(Oseq);
+    free(cs);
+    free(ds);
+    jt_gdn2_state_free(Sseq);
+    jt_gdn2_state_free(Schunk);
+}
+
+// 境界条件: alpha=0/1 混在 + ゼロ q/k 行 (eps ガード) でも逐次と一致すること。
+static void test_prefill_boundary(void) {
+    const int C = 16, dk = 8, dv = 8;
+    const char *name = "c16-bound";
+    float *Sseq = NULL;
+    float *Schunk = NULL;
+    CHECK(jt_gdn2_state_alloc(&Sseq, dk, dv) == JT_OK && Sseq != NULL,
+          "bound seq alloc");
+    CHECK(jt_gdn2_state_alloc(&Schunk, dk, dv) == JT_OK && Schunk != NULL,
+          "bound chunk alloc");
+    if (Sseq == NULL || Schunk == NULL) {
+        jt_gdn2_state_free(Sseq);
+        jt_gdn2_state_free(Schunk);
+        return;
+    }
+    size_t cneed = prefill_need(C, dk, dv);
+    size_t dneed = 0;
+    CHECK(jt_gdn2_scratch_floats(dk, dv, &dneed) == JT_OK, "bound dscratch");
+    float *Q = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *K = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *B = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *A = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *V = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *W = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *Ochunk = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *Oseq = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *cs = (float *)malloc(cneed * sizeof(float));
+    float *ds = (float *)malloc(dneed * sizeof(float));
+    CHECK(Q && K && B && A && V && W && Ochunk && Oseq && cs && ds,
+          "bound malloc");
+    if (!(Q && K && B && A && V && W && Ochunk && Oseq && cs && ds)) {
+        goto free_all;
+    }
+    for (int t = 0; t < C; t++) {
+        for (int i = 0; i < dk; i++) {
+            Q[t * dk + i] = fd(t, i, 21) + 0.37f;
+            K[t * dk + i] = fd(t, i, 22) - 0.23f;
+            B[t * dk + i] = 0.5f;
+            // alpha 境界: 0 (全忘却) / 1 (無忘却) / 中間を混在。
+            A[t * dk + i] = (t % 3 == 0) ? 0.0f : ((t % 3 == 1) ? 1.0f : 0.9f);
+        }
+        for (int j = 0; j < dv; j++) {
+            V[t * dv + j] = fd(t, j, 23) + 0.11f;
+            W[t * dv + j] = 0.6f;
+        }
+    }
+    // ゼロ q/k 行 (L2 eps ガード経路)。
+    for (int i = 0; i < dk; i++) {
+        Q[3 * dk + i] = 0.0f;
+        K[5 * dk + i] = 0.0f;
+    }
+    for (int i = 0; i < dk * dv; i++) {
+        float s0 = 0.25f * fd(i, 0, 24);
+        Sseq[i] = s0;
+        Schunk[i] = s0;
+    }
+    for (int t = 0; t < C; t++) {
+        int rc = jt_gdn2_decode_step(
+            Sseq, Oseq + (size_t)t * (size_t)dv, Q + (size_t)t * (size_t)dk,
+            K + (size_t)t * (size_t)dk, V + (size_t)t * (size_t)dv,
+            B + (size_t)t * (size_t)dk, W + (size_t)t * (size_t)dv,
+            A + (size_t)t * (size_t)dk, dk, dv, ds, dneed);
+        CHECK(rc == JT_OK, "%s seq step %d rc=%d", name, t, rc);
+        if (rc != JT_OK) {
+            goto free_all;
+        }
+    }
+    {
+        int rc = jt_gdn2_prefill_chunk16(Schunk, Ochunk, Q, K, V, B, W, A, dk,
+                                         dv, cs, cneed);
+        CHECK(rc == JT_OK, "%s chunk rc=%d", name, rc);
+        if (rc != JT_OK) {
+            goto free_all;
+        }
+    }
+    {
+        const double tol = 2e-5;
+        for (int i = 0; i < C * dv; i++) {
+            double d = fabs((double)Ochunk[i] - (double)Oseq[i]);
+            CHECK(d <= tol, "%s Out[%d] diff=%g", name, i, d);
+            if (d > tol) {
+                break;
+            }
+        }
+        for (int i = 0; i < dk * dv; i++) {
+            double d = fabs((double)Schunk[i] - (double)Sseq[i]);
+            CHECK(d <= tol, "%s S[%d] diff=%g", name, i, d);
+            if (d > tol) {
+                break;
+            }
+        }
+    }
+free_all:
+    free(Q);
+    free(K);
+    free(B);
+    free(A);
+    free(V);
+    free(W);
+    free(Ochunk);
+    free(Oseq);
+    free(cs);
+    free(ds);
+    jt_gdn2_state_free(Sseq);
+    jt_gdn2_state_free(Schunk);
+}
+
+static void test_prefill_invalid(prefill_fn_t fn, int C, const char *name) {
+    const int dk = 4, dv = 4;
     float *S = NULL;
-    CHECK(jt_gdn2_state_alloc(&S, 4, 4) == JT_OK, "pre alloc");
+    CHECK(jt_gdn2_state_alloc(&S, dk, dv) == JT_OK && S != NULL, "%s alloc",
+          name);
     if (S == NULL) {
         return;
     }
-    float Out[16] = {0}, Q[16] = {0}, K[16] = {0}, V[16] = {0}, B[16] = {0},
-          W[16] = {0}, A[16] = {0}, sc[8] = {0};
+    size_t need = prefill_need(C, dk, dv);
+    float *sc = (float *)malloc(need * sizeof(float));
+    float *Q = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *K = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *B = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *A = (float *)malloc((size_t)C * (size_t)dk * sizeof(float));
+    float *V = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *W = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    float *Out = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+    CHECK(sc && Q && K && B && A && V && W && Out, "%s malloc", name);
+    if (!(sc && Q && K && B && A && V && W && Out)) {
+        goto free_all;
+    }
+    for (int i = 0; i < C * dk; i++) {
+        Q[i] = 0.5f;
+        K[i] = 0.25f;
+        B[i] = 0.5f;
+        A[i] = 0.9f;
+    }
+    for (int i = 0; i < C * dv; i++) {
+        V[i] = 0.3f;
+        W[i] = 0.6f;
+        Out[i] = 0.0f;
+    }
+    for (int i = 0; i < dk * dv; i++) {
+        S[i] = 0.1f * (float)(i + 1);
+    }
     errno = 0;
-    int rc16 = jt_gdn2_prefill_chunk16(S, Out, Q, K, V, B, W, A, 4, 4, sc,
-                                       8);
-    CHECK(rc16 == JT_ERR_NOSUP && errno == ENOSYS, "chunk16 stub rc=%d e=%d",
-          rc16, errno);
+    CHECK(fn(NULL, Out, Q, K, V, B, W, A, dk, dv, sc, need) == JT_ERR_INVAL &&
+              errno == EINVAL,
+          "%s NULL S", name);
     errno = 0;
-    int rc32 = jt_gdn2_prefill_chunk32(S, Out, Q, K, V, B, W, A, 4, 4, sc,
-                                       8);
-    CHECK(rc32 == JT_ERR_NOSUP && errno == ENOSYS, "chunk32 stub rc=%d e=%d",
-          rc32, errno);
+    CHECK(fn(S, NULL, Q, K, V, B, W, A, dk, dv, sc, need) == JT_ERR_INVAL &&
+              errno == EINVAL,
+          "%s NULL Out", name);
     errno = 0;
-    CHECK(jt_gdn2_prefill_chunk16(NULL, Out, Q, K, V, B, W, A, 4, 4, sc,
-                                  8) == JT_ERR_INVAL && errno == EINVAL,
-          "chunk16 NULL");
+    CHECK(fn(S, Out, Q, K, V, B, W, A, 0, dv, sc, need) == JT_ERR_INVAL &&
+              errno == EINVAL,
+          "%s dk=0", name);
     errno = 0;
-    CHECK(jt_gdn2_prefill_chunk16(S, Out, Q, K, V, B, W, A, 0, 4, sc,
-                                  8) == JT_ERR_INVAL && errno == EINVAL,
-          "chunk16 bad dims");
+    CHECK(fn(S, Out, Q, K, V, B, W, A, dk, dv, sc, need - 1) ==
+                  JT_ERR_INVAL &&
+              errno == EINVAL,
+          "%s scratch short", name);
+    // 非整列 S は JT_ERR_ALIGN。
+    {
+        void *raw =
+            malloc((size_t)dk * (size_t)dv * sizeof(float) + 64);
+        CHECK(raw != NULL, "%s raw malloc", name);
+        if (raw != NULL) {
+            float *mis = (float *)((char *)raw + 1);  // 1B ずらし
+            errno = 0;
+            int rc =
+                fn(mis, Out, Q, K, V, B, W, A, dk, dv, sc, need);
+            CHECK(rc == JT_ERR_ALIGN && errno == EINVAL, "%s misalign rc=%d",
+                  name, rc);
+            free(raw);
+        }
+    }
+    // fail-closed: 非有限・alpha 範囲外は S/Out 不変。
+    {
+        float *Sref = (float *)malloc((size_t)dk * (size_t)dv * sizeof(float));
+        float *Oref = (float *)malloc((size_t)C * (size_t)dv * sizeof(float));
+        CHECK(Sref != NULL && Oref != NULL, "%s ref malloc", name);
+        if (Sref != NULL && Oref != NULL) {
+            memcpy(Sref, S, (size_t)dk * (size_t)dv * sizeof(float));
+            for (int i = 0; i < C * dv; i++) {
+                Out[i] = 7.0f + (float)i;
+            }
+            memcpy(Oref, Out, (size_t)C * (size_t)dv * sizeof(float));
+            Q[0] = NAN;
+            errno = 0;
+            CHECK(fn(S, Out, Q, K, V, B, W, A, dk, dv, sc, need) ==
+                          JT_ERR_INVAL &&
+                      errno == EINVAL,
+                  "%s nan q", name);
+            CHECK(memcmp(S, Sref, (size_t)dk * (size_t)dv * sizeof(float)) ==
+                      0,
+                  "%s nan q S mutated", name);
+            CHECK(memcmp(Out, Oref,
+                         (size_t)C * (size_t)dv * sizeof(float)) == 0,
+                  "%s nan q Out mutated", name);
+            Q[0] = 0.5f;
+            A[1] = 2.0f;
+            memcpy(Sref, S, (size_t)dk * (size_t)dv * sizeof(float));
+            memcpy(Oref, Out, (size_t)C * (size_t)dv * sizeof(float));
+            errno = 0;
+            CHECK(fn(S, Out, Q, K, V, B, W, A, dk, dv, sc, need) ==
+                          JT_ERR_INVAL &&
+                      errno == EINVAL,
+                  "%s alpha=2", name);
+            CHECK(memcmp(S, Sref, (size_t)dk * (size_t)dv * sizeof(float)) ==
+                      0,
+                  "%s alpha=2 S mutated", name);
+            CHECK(memcmp(Out, Oref,
+                         (size_t)C * (size_t)dv * sizeof(float)) == 0,
+                  "%s alpha=2 Out mutated", name);
+            A[1] = 0.9f;
+        }
+        free(Sref);
+        free(Oref);
+    }
+free_all:
+    free(sc);
+    free(Q);
+    free(K);
+    free(B);
+    free(A);
+    free(V);
+    free(W);
+    free(Out);
     jt_gdn2_state_free(S);
 }
 
@@ -543,12 +858,18 @@ int main(void) {
     test_numeric_sequence();
     test_kda_reduction();
     test_invalid_decode();
-    test_prefill_stub();
+    test_prefill_equiv(16, 8, 8, 11, jt_gdn2_prefill_chunk16, "c16-8x8");
+    test_prefill_equiv(16, 16, 16, 12, jt_gdn2_prefill_chunk16, "c16-16x16");
+    test_prefill_equiv(32, 8, 16, 13, jt_gdn2_prefill_chunk32, "c32-8x16");
+    test_prefill_equiv(32, 16, 8, 14, jt_gdn2_prefill_chunk32, "c32-16x8");
+    test_prefill_boundary();
+    test_prefill_invalid(jt_gdn2_prefill_chunk16, 16, "c16");
+    test_prefill_invalid(jt_gdn2_prefill_chunk32, 32, "c32");
     if (g_fail != 0) {
         fprintf(stderr, "gdn2: FAIL\n");
         return 1;
     }
-    printf("gdn2: OK (decode numeric + invalid + prefill-stub)\n");
+    printf("gdn2: OK (decode numeric + invalid + prefill-equiv)\n");
     return 0;
 }
 
