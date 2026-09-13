@@ -69,6 +69,8 @@
 - サブエージェントへの指示はworktreeパス・ブランチ・ビルドdirを明示し、`checkout/switch`禁止・他wtへの接触禁止・ビルドdir分離（各wt内の`build-*`を使用し共有`build-dbg`を使わない）を毎回含める
 - main wt（`/Users/shibadogcap/jimotono`）は`develop`専用の統合場所とし、P1個別実装は各wtでのみ行う
 - worktree作成・破棄はROADMAP 2.3手順に従う（`git worktree add ~/jimotono-wt-<name> -b <branch> develop`、`git worktree list`で確認）
+- worktreeは使い捨て：用済みは`git worktree remove ~/jimotono-wt-<name>`で破棄し、残骸があれば`rm -rf`＋`git worktree prune`。`list`に出ない orphan を溜めない。`build-*/`・`artifacts/*`は各wtに複製されるため放置でディスクを食う
+- 一時作業も担当wt内に限定：スクラッチ・一時ファイルは担当wt内の`tmp/`等に置き、`/tmp`・他wt・ホーム直下への書き出しは禁止。wt破棄時にまとめて消す
 
 ## 5. 参照すべき研究・実装一覧
 
