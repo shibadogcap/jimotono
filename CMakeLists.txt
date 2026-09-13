@@ -159,6 +159,11 @@ if(JIMOTONO_BUILD_BENCH)
   # 実行バイナリのみ。ctestには追加しない (重負荷のため)。
   add_executable(train_proxy100m bench/kernel/train_proxy100m.c)
   target_link_libraries(train_proxy100m PRIVATE jimotono_core)
+
+  # train_names: 文字レベル次文字予測の小規模言語モデル (Phase F4実データ)。
+  # 実行バイナリのみ。ctestには追加しない (学習ループのため)。
+  add_executable(train_names bench/kernel/train_names.c)
+  target_link_libraries(train_names PRIVATE jimotono_core)
 endif()
 
 enable_testing()
