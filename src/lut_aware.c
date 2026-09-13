@@ -266,18 +266,130 @@ int jt_lut_export_binary(const float *restrict W, uint32_t rows,
                          uint32_t cols, int bits, uint32_t block,
                          void *restrict out, size_t out_cap,
                          size_t *restrict out_written) {
-    (void)W;
-    (void)rows;
-    (void)cols;
-    (void)bits;
-    (void)block;
-    (void)out;
-    (void)out_cap;
+    int rc = JT_ERR_INVAL;
+    jt_lut_export_desc_t desc;
+    uint64_t elems = 0;
+    uint64_t colblocks = 0;
+    uint64_t scale_elems = 0;
+    size_t nelems = 0;
+    size_t nscales = 0;
+    int8_t *q = NULL;
+    float *scales = NULL;
+    unsigned char *dst = NULL;
+
     if (out_written != NULL) {
         *out_written = 0;
     }
-    // TODO: Wをper-block量子化→bit-planeパックし、記述子レイアウトで
-    // table+scaleを同ページ配置で書き出す。現状は未実装。
-    errno = ENOSYS;
-    return JT_ERR_NOSUP;
+    if (W == NULL || out == NULL) {
+        errno = EINVAL;
+        rc = JT_ERR_INVAL;
+        goto cleanup;
+    }
+    // 64B整列要求 (DESIGN §5.1-5、T-MAC kAllocAlignment=64)。
+    // 既存流儀ではなくタスク指定により不整列はINVAL (errno=EINVAL)。
+    if (((uintptr_t)(const void *)out % (uintptr_t)JT_LUT_ALIGN) != 0u) {
+        errno = EINVAL;
+        rc = JT_ERR_INVAL;
+        goto cleanup;
+    }
+    // レイアウトは記述子が唯一の真実 (table/scale/scale_off/page/same_page)。
+    memset(&desc, 0, sizeof(desc));
+    rc = jt_lut_export_desc(rows, cols, bits, block, &desc);
+    if (rc != JT_OK) {
+        goto cleanup;  // errnoは下位で設定済み
+    }
+    if (out_cap < (size_t)desc.page_bytes) {
+        // page_bytesはalign_up済み64の倍数。out_cap不足はINVAL (既存流儀)。
+        errno = EINVAL;
+        rc = JT_ERR_INVAL;
+        goto cleanup;
+    }
+    elems = (uint64_t)rows * (uint64_t)cols;
+    colblocks = ((uint64_t)cols + (uint64_t)block - 1u) / (uint64_t)block;
+    scale_elems = (uint64_t)rows * colblocks;
+    if (elems > (uint64_t)SIZE_MAX || scale_elems > (uint64_t)SIZE_MAX) {
+        errno = ENOMEM;
+        rc = JT_ERR_NOMEM;
+        goto cleanup;
+    }
+    nelems = (size_t)elems;
+    nscales = (size_t)scale_elems;
+
+    // fail-closed: 先にW全体の有限性を検査 (outには触らない)。
+    for (size_t i = 0; i < nelems; i++) {
+        if (!isfinite((double)W[i])) {
+            errno = EINVAL;
+            rc = JT_ERR_INVAL;
+            goto cleanup;
+        }
+    }
+
+    q = (int8_t *)malloc((nelems > 0 ? nelems : 1) * sizeof(int8_t));
+    scales = (float *)malloc((nscales > 0 ? nscales : 1) * sizeof(float));
+    if (q == NULL || scales == NULL) {
+        errno = ENOMEM;
+        rc = JT_ERR_NOMEM;
+        goto cleanup;
+    }
+
+    // 行単位per-block量子化 (1行=cols要素をblock粒度で分割)。
+    // scale配置: scales[r*colblocks + cb] (row-major、fp32 LE)。
+    for (uint32_t r = 0; r < rows; r++) {
+        const float *wrow = W + (size_t)r * (size_t)cols;
+        int8_t *qrow = q + (size_t)r * (size_t)cols;
+        float *srow = scales + (size_t)r * (size_t)colblocks;
+        rc = jt_mp_quantize(wrow, (size_t)cols, bits, (size_t)block, qrow,
+                            srow, (size_t)colblocks);
+        if (rc != JT_OK) {
+            goto cleanup;  // errnoは下位で設定済み
+        }
+    }
+
+    // 記述子レイアウト通りに書き出す。パディングはゼロ埋め。
+    // テーブル packing (LE前提、row-major線形順):
+    // - bits=8: 生int8をそのまま1B/要素 (two's complement)。
+    // - bits=4: 2要素/B、下位ニブル=偶数index、上位ニブル=奇数index、
+    //   各ニブルは4bit two's complement (q & 0xF)。端数Bの上位は0。
+    // - bits=2: 4要素/B、bits[1:0]=i%4==0、[3:2]==1、[5:4]==2、[7:6]==3、
+    //   各2bitはtwo's complement (q & 0x3)。端数Bの未使用上位は0。
+    dst = (unsigned char *)out;
+    memset(dst, 0, (size_t)desc.page_bytes);
+    if (bits == 8) {
+        for (size_t i = 0; i < nelems; i++) {
+            dst[i] = (unsigned char)q[i];
+        }
+    } else if (bits == 4) {
+        for (size_t i = 0; i < nelems; i++) {
+            unsigned nib = ((unsigned)q[i]) & 0xFu;
+            size_t bi = i / 2u;
+            if ((i % 2u) == 0u) {
+                dst[bi] |= (unsigned char)nib;
+            } else {
+                dst[bi] |= (unsigned char)(nib << 4);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < nelems; i++) {
+            unsigned v = ((unsigned)q[i]) & 0x3u;
+            size_t bi = i / 4u;
+            unsigned sh = (unsigned)(i % 4u) * 2u;
+            dst[bi] |= (unsigned char)(v << sh);
+        }
+    }
+    memcpy(dst + (size_t)desc.scale_offset, scales,
+           (size_t)desc.scale_bytes);
+    // 末尾パディングは既にゼロ (align_up分)。
+
+    if (out_written != NULL) {
+        *out_written = (size_t)desc.page_bytes;
+    }
+    rc = JT_OK;
+
+cleanup:
+    free(q);
+    free(scales);
+    if (rc != JT_OK && out_written != NULL) {
+        *out_written = 0;
+    }
+    return rc;
 }
