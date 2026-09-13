@@ -937,6 +937,55 @@ static void test_checkpoint(void) {
     }
 }
 
+// ---- swiglu unchecked経路の数値一致 (検証ありAPIとbit一致) ----
+// unchecked使用条件: 重み事前検証済み＋区間内不変の呼び出しでのみ使うこと。
+// 有限の固定入力で通常経路とunchecked経路の全出力をmemcmpする。
+// fail-closed不変 (INVAL系) は既存の不正系テストで担保する。
+static void test_swiglu_unchecked_match(void) {
+    float X[2] = {1.0f, -0.5f};
+    float Wg[4] = {1.0f, 0.5f, -1.0f, 2.0f};
+    float Wu[4] = {0.5f, -1.0f, 2.0f, 0.0f};
+    float Wd[4] = {1.0f, 2.0f, -0.5f, 1.5f};
+    float G1[2] = {0, 0}, G2[2] = {0, 0};
+    float U1[2] = {0, 0}, U2[2] = {0, 0};
+    float Y1[2] = {0, 0}, Y2[2] = {0, 0};
+    int fr1 = jt_swiglu_fwd(X, Wg, Wu, Wd, G1, U1, Y1, 2, 2);
+    int fr2 = jt_swiglu_fwd_unchecked(X, Wg, Wu, Wd, G2, U2, Y2, 2, 2);
+    CHECK(fr1 == JT_OK && fr2 == JT_OK, "swiglu unchecked fwd rc %d/%d",
+          fr1, fr2);
+    if (fr1 == JT_OK && fr2 == JT_OK) {
+        CHECK(memcmp(G1, G2, sizeof(G1)) == 0,
+              "swiglu unchecked fwd G bits");
+        CHECK(memcmp(U1, U2, sizeof(U1)) == 0,
+              "swiglu unchecked fwd U bits");
+        CHECK(memcmp(Y1, Y2, sizeof(Y1)) == 0,
+              "swiglu unchecked fwd Y bits");
+    }
+    {
+        float dY[2] = {0.3f, -0.2f};
+        float dX1[2] = {0, 0}, dX2[2] = {0, 0};
+        float dwg1[4] = {0, 0, 0, 0}, dwg2[4] = {0, 0, 0, 0};
+        float dwu1[4] = {0, 0, 0, 0}, dwu2[4] = {0, 0, 0, 0};
+        float dwd1[4] = {0, 0, 0, 0}, dwd2[4] = {0, 0, 0, 0};
+        int br1 = jt_swiglu_bwd(dY, X, G1, U1, Wd, Wg, Wu, dX1, dwg1,
+                                dwu1, dwd1, 2, 2);
+        int br2 = jt_swiglu_bwd_unchecked(dY, X, G1, U1, Wd, Wg, Wu, dX2,
+                                          dwg2, dwu2, dwd2, 2, 2);
+        CHECK(br1 == JT_OK && br2 == JT_OK,
+              "swiglu unchecked bwd rc %d/%d", br1, br2);
+        if (br1 == JT_OK && br2 == JT_OK) {
+            CHECK(memcmp(dX1, dX2, sizeof(dX1)) == 0,
+                  "swiglu unchecked bwd dX bits");
+            CHECK(memcmp(dwg1, dwg2, sizeof(dwg1)) == 0,
+                  "swiglu unchecked bwd dWg bits");
+            CHECK(memcmp(dwu1, dwu2, sizeof(dwu1)) == 0,
+                  "swiglu unchecked bwd dWu bits");
+            CHECK(memcmp(dwd1, dwd2, sizeof(dwd1)) == 0,
+                  "swiglu unchecked bwd dWd bits");
+        }
+    }
+}
+
 int main(void) {
     test_gdn2_grad(4, 4);
     test_gdn2_grad(4, 8);
@@ -946,6 +995,7 @@ int main(void) {
     test_swiglu_fwd();
     test_rmsnorm_fwd();
     test_checkpoint();
+    test_swiglu_unchecked_match();
     if (g_fail != 0) {
         fprintf(stderr, "train_bwd: FAIL\n");
         return 1;

@@ -105,6 +105,28 @@ static double lr_rss_mib(void) {
 #endif
 }
 
+// ステップ冒頭の重み一括検証 (unchecked区間の前提)。
+// P[n_total] (全層重み＋head) 全体を1回だけ走査し、全有限なら1を返す。
+// ステップ内ではP不変 (更新はステップ末のoptim stepのみ) のため、この
+// 1回をもって当該ステップ内のトークン×層のper-call重み有限スキャンを
+// 省略できる (unchecked使用条件 (1)(2) の充足)。
+// 活性化由来の非有限は従来通り残る3点で検出する:
+//   (a) fwd残差合算点のisfinite (lr_fwd_layer_range内)、
+//   (b) unchecked内の計算途中ガード (gate acc・yacc・dw_dp等)、
+//   (c) loss合算点のisfinite＋更新前G全走査ガード。
+// 重み自体の非有限はここでステップ粒度fail-closed (即時abort)。
+static int lr_weights_finite(const float *restrict P, size_t n) {
+    if (P == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite((double)P[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 typedef struct lr_ckpt_ctx {
     const float *restrict P;
     const size_t *restrict layer_off;
@@ -115,6 +137,8 @@ typedef struct lr_ckpt_ctx {
 } lr_ckpt_ctx_t;
 
 // ckpt再計算コールバック: cur = cur + MoE(cur)。
+// 検証用途 (10ステップ毎・token0のみ) のため検証ありAPIのまま残す。
+// コストは無視できる (全fwdコールの1/3000以下)。
 static int lr_ckpt_layer_fn(int seg_idx, int layer, void *vctx) {
     lr_ckpt_ctx_t *c = (lr_ckpt_ctx_t *)vctx;
     if (c == NULL || c->P == NULL || c->cur == NULL ||
@@ -223,9 +247,13 @@ static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
                         ? (ctx->CUs + cbase * (size_t)LR_S * (size_t)LR_H)
                         : NULL;
         float M[LR_N];
-        int frc = jt_moe_fwd(xin, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, M,
-                             LR_N, LR_H, LR_E, LR_K, LR_S, ids, weights,
-                             NULL, Gsel, Usel, Ysel, Gs, Us);
+        // unchecked: 重みはステップ冒頭で一括検証済み＋ステップ内不変のため
+        // per-call重みスキャンを省略 (同一計算核のためbit一致)。
+        // 活性化NaNは内側途中ガード＋残差合算点isfiniteで検出する。
+        int frc = jt_moe_fwd_unchecked(xin, Wgate, Wg, Wu, Wd, Wgs, Wus,
+                                       Wds, M, LR_N, LR_H, LR_E, LR_K,
+                                       LR_S, ids, weights, NULL, Gsel,
+                                       Usel, Ysel, Gs, Us);
         if (frc != JT_OK) {
             rc = frc;
             break;
@@ -311,11 +339,15 @@ static void lr_bwd_range(const lr_ctx_t *restrict ctx, size_t n_total,
                     float *tWgs = tWd + LR_P_ROUTED;
                     float *tWus = tWgs + LR_P_SHARED;
                     float *tWds = tWus + LR_P_SHARED;
-                    int brc = jt_moe_bwd(dcur, xin, Wgate, Wg, Wu, Wd, Wgs,
-                                         Wus, Wds, ids, weights, Gsel, Usel,
-                                         Ysel, Gs, Us, dXmoe, tWgate, tWg,
-                                         tWu, tWd, tWgs, tWus, tWds, NULL,
-                                         LR_N, LR_H, LR_E, LR_K, LR_S);
+                    // unchecked: 重みはステップ冒頭で一括検証済み＋ステップ内不変、
+                    // ids/weightsは同一ステップ内fwd産のため範囲検査を省略
+                    // (同一計算核のためbit一致)。活性化NaNは内側途中ガード＋
+                    // 更新前G全走査ガードで検出する。
+                    int brc = jt_moe_bwd_unchecked(
+                        dcur, xin, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, ids,
+                        weights, Gsel, Usel, Ysel, Gs, Us, dXmoe, tWgate,
+                        tWg, tWu, tWd, tWgs, tWus, tWds, NULL, LR_N, LR_H,
+                        LR_E, LR_K, LR_S);
                     if (brc != JT_OK) {
                         rc = brc;
                         break;
@@ -671,6 +703,14 @@ int main(int argc, char **argv) {
         float loss = 0.0f;
         double gnorm = 0.0;
         double el = 0.0;
+        // ---- ステップ冒頭: 重み全体を1回だけ検証 (unchecked区間の前提)。
+        // 以降のトークン×層 (3072コール/ステップ) のper-call重みスキャンを
+        // 省略する。ステップ内P不変のため等価。非有限時はfail-closed abort。
+        if (!lr_weights_finite(P, n_total)) {
+            fprintf(stderr,
+                    "train_longrun: non-finite weights step=%ld\n", step);
+            goto cleanup;
+        }
         // ---- forward: acts[0]=X, acts[l+1]=acts[l]+MoE(acts[l]) ----
         memcpy(acts, X,
                (size_t)LR_TOKS * (size_t)LR_N * sizeof(float));
