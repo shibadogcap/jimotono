@@ -340,6 +340,8 @@ cleanup:
 }
 
 // チャンク核スタブの共通処理: 入力検査のみ行い ENOSYS を返す。
+// MINOR-1: 正常入力は JT_ERR_NOSUP+errno=ENOSYS、不正入力は
+// JT_ERR_INVAL+errno=EINVAL (戻り値のみで区別可能)。
 static int jt_gdn2_prefill_stub(const float *S, const float *Out,
                                 const float *Q, const float *K,
                                 const float *V, const float *B,
@@ -356,7 +358,7 @@ static int jt_gdn2_prefill_stub(const float *S, const float *Out,
     }
     // P2 で WY 型チャンク核 (C 固定 solve + inter-chunk 漸化式) を実装。
     errno = ENOSYS;
-    return JT_ERR_INVAL;
+    return JT_ERR_NOSUP;
 }
 
 int jt_gdn2_prefill_chunk16(float *restrict S, float *restrict Out,

@@ -89,8 +89,8 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
 // P2 で WY 型 (intra-chunk 64×64→C=16/32 縮小 solve + inter-chunk 漸化式、
 // L1/L2 常駐優先) を実装予定。Q/K/B/Alpha: [C][dk]、V/W: [C][dv]、
 // Out: [C][dv]、S: [dk][dv] 入出力。C は関数名に固定 (16 / 32)。
-// 現状の戻り値: 正常入力には errno=ENOSYS で JT_ERR_INVAL、不正入力は
-// errno=EINVAL で JT_ERR_INVAL。
+// 現状の戻り値 (MINOR-1): 正常入力は JT_ERR_NOSUP+errno=ENOSYS (未実装)、
+// 不正入力は JT_ERR_INVAL+errno=EINVAL。戻り値のみで区別可能。
 int jt_gdn2_prefill_chunk16(float *restrict S, float *restrict Out,
                             const float *restrict Q, const float *restrict K,
                             const float *restrict V, const float *restrict B,

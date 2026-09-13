@@ -514,18 +514,20 @@ static void test_prefill_stub(void) {
     errno = 0;
     int rc16 = jt_gdn2_prefill_chunk16(S, Out, Q, K, V, B, W, A, 4, 4, sc,
                                        8);
-    CHECK(rc16 == JT_ERR_INVAL && errno == ENOSYS, "chunk16 stub rc=%d e=%d",
+    CHECK(rc16 == JT_ERR_NOSUP && errno == ENOSYS, "chunk16 stub rc=%d e=%d",
           rc16, errno);
     errno = 0;
     int rc32 = jt_gdn2_prefill_chunk32(S, Out, Q, K, V, B, W, A, 4, 4, sc,
                                        8);
-    CHECK(rc32 == JT_ERR_INVAL && errno == ENOSYS, "chunk32 stub rc=%d e=%d",
+    CHECK(rc32 == JT_ERR_NOSUP && errno == ENOSYS, "chunk32 stub rc=%d e=%d",
           rc32, errno);
+    errno = 0;
     CHECK(jt_gdn2_prefill_chunk16(NULL, Out, Q, K, V, B, W, A, 4, 4, sc,
-                                  8) == JT_ERR_INVAL,
+                                  8) == JT_ERR_INVAL && errno == EINVAL,
           "chunk16 NULL");
+    errno = 0;
     CHECK(jt_gdn2_prefill_chunk16(S, Out, Q, K, V, B, W, A, 0, 4, sc,
-                                  8) == JT_ERR_INVAL,
+                                  8) == JT_ERR_INVAL && errno == EINVAL,
           "chunk16 bad dims");
     jt_gdn2_state_free(S);
 }
