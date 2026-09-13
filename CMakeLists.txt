@@ -44,6 +44,16 @@ if(UNIX)
   target_link_libraries(jimotono_core PUBLIC m)
 endif()
 
+# ---- bench common harness (ROADMAP 5.1/5.2: median+MAD, monotonic clock) ----
+# NOTE: bench/common は測定基盤のみ。src/*.c と common.h には手を出さない。
+add_library(jimotono_bench_common
+  bench/common/bench_common.c
+)
+target_include_directories(jimotono_bench_common PUBLIC include bench/common)
+if(UNIX)
+  target_link_libraries(jimotono_bench_common PUBLIC m)
+endif()
+
 # ---- microbenchmarks (ROADMAP 5.2: harness + cases + metric) ----
 if(JIMOTONO_BUILD_BENCH)
   add_executable(bench_gdn2 bench/kernel/gdn2.c)
@@ -61,6 +71,9 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_io bench/kernel/test_io.c)
   target_link_libraries(test_io PRIVATE jimotono_core)
 
+  add_executable(bench_smoke bench/kernel/bench_smoke.c)
+  target_link_libraries(bench_smoke PRIVATE jimotono_bench_common)
+
 endif()
 
 enable_testing()
@@ -70,6 +83,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME gdn2 COMMAND bench_gdn2)
   add_test(NAME routing COMMAND test_routing)
   add_test(NAME io_batch COMMAND test_io)
+  add_test(NAME bench_smoke COMMAND bench_smoke)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
