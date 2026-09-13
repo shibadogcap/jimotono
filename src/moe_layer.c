@@ -13,6 +13,76 @@
 #include "jimotono/routing.h"
 #include "jimotono/train_bwd.h"
 
+// P2 SIMD (Phase D) AVX2 パス (train_bwd.c と同一方針)。
+// - 出力 dim 方向の elementwise/f64累積は演算順序同一・FMA 不使用で bit同一。
+// - reduction dim 方向のドット (jt_moe_avx2_dot: gate logits・dw_dp) のみ
+//   合算順序が変わるため tol内一致 (相対 ~1e-16。テスト tol=1e-5/1e-3)。
+// - gate 経路の dX 寄与 (dl!=0 の分岐付き疎加算) はスカラー維持
+//   (分岐混じりでベクトル化の利益なし)。
+// - AVX-512 には手を出さない (tmac.c と同一理由)。
+// - アライメント非依存 (loadu/storeu のみ)。フォールバックは既存スカラー。
+#ifdef __AVX2__
+#include <immintrin.h>
+
+// ドット (f64累積)。reduction 順序が変わるため tol内一致 (bit一致ではない)。
+static double jt_moe_avx2_dot(const float *restrict x,
+                              const float *restrict y, int n) {
+    __m256d acc = _mm256_setzero_pd();
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vx =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(x + j)));
+        __m256d vy =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(y + j)));
+        acc = _mm256_add_pd(acc, _mm256_mul_pd(vx, vy));
+    }
+    double lane[4];
+    _mm256_storeu_pd(lane, acc);
+    double s = (lane[0] + lane[1]) + (lane[2] + lane[3]);
+    for (; j < n; j++) {
+        s += (double)x[j] * (double)y[j];
+    }
+    return s;
+}
+
+// dst[j] += k*src[j] (f64。yacc/dx_acc 累積と同一形。レーン毎順序同一で bit同一)。
+static void jt_moe_avx2_f64_add(double *restrict dst, double k,
+                                const float *restrict src, int n) {
+    __m256d vk = _mm256_set1_pd(k);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vd = _mm256_loadu_pd(dst + j);
+        __m256d vs =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(src + j)));
+        vd = _mm256_add_pd(vd, _mm256_mul_pd(vk, vs));
+        _mm256_storeu_pd(dst + j, vd);
+    }
+    for (; j < n; j++) {
+        dst[j] += k * (double)src[j];
+    }
+}
+
+// dst[j] = (float)(k*src[j]) (f64→f32 commit。dWgate 行と同一形。bit同一)。
+static void jt_moe_avx2_f64_mulk_commit(float *restrict dst, double k,
+                                        const float *restrict src, int n) {
+    __m256d vk = _mm256_set1_pd(k);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vs =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(src + j)));
+        __m128 v = _mm256_cvtpd_ps(_mm256_mul_pd(vk, vs));
+        _mm_storeu_ps(dst + j, v);
+    }
+    for (; j < n; j++) {
+        dst[j] = (float)(k * (double)src[j]);
+    }
+}
+
+#endif
+
 static int jt_moe_valid_dims(int n, int h, int e, int k, int s) {
     if (n <= 0 || h <= 0) {
         return 0;
@@ -119,10 +189,15 @@ static int jt_moe_fwd_impl(const float *restrict X,
         }
         for (int e = 0; e < n_experts; e++) {
             const float *wr = Wgate + (size_t)e * (size_t)n;
+#ifdef __AVX2__
+            // reduction 方向のため tol内一致 (jt_moe_avx2_dot 参照)。
+            double acc = jt_moe_avx2_dot(X, wr, n);
+#else
             double acc = 0.0;
             for (int j = 0; j < n; j++) {
                 acc += (double)X[j] * (double)wr[j];
             }
+#endif
             if (!isfinite(acc)) {
                 errno = EINVAL;
                 goto cleanup;
@@ -178,9 +253,13 @@ static int jt_moe_fwd_impl(const float *restrict X,
             if (frc != JT_OK) {
                 goto cleanup;  // errnoは下位で設定済み。Yは未更新。
             }
+#ifdef __AVX2__
+            jt_moe_avx2_f64_add(yacc, (double)w, Yp, n);
+#else
             for (int j = 0; j < n; j++) {
                 yacc[j] += (double)w * (double)Yp[j];
             }
+#endif
         }
         // 共有expert加算 (重み1)。
         for (int s = 0; s < n_shared; s++) {
@@ -205,9 +284,13 @@ static int jt_moe_fwd_impl(const float *restrict X,
             if (frc != JT_OK) {
                 goto cleanup;
             }
+#ifdef __AVX2__
+            jt_moe_avx2_f64_add(yacc, 1.0, tmpY, n);
+#else
             for (int j = 0; j < n; j++) {
                 yacc[j] += (double)tmpY[j];
             }
+#endif
         }
         for (int j = 0; j < n; j++) {
             if (!isfinite(yacc[j])) {
@@ -389,10 +472,15 @@ static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
         // dL/dw_p = dot(Ysel_p, dY)。
         for (int p = 0; p < topk; p++) {
             const float *Yp = Ysel + (size_t)p * (size_t)n;
+#ifdef __AVX2__
+            // reduction 方向のため tol内一致 (jt_moe_avx2_dot 参照)。
+            double acc = jt_moe_avx2_dot(Yp, dY, n);
+#else
             double acc = 0.0;
             for (int j = 0; j < n; j++) {
                 acc += (double)Yp[j] * (double)dY[j];
             }
+#endif
             if (!isfinite(acc)) {
                 errno = EINVAL;
                 goto cleanup;
@@ -476,9 +564,14 @@ static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
         for (int p = 0; p < topk; p++) {
             size_t e = ids[p];
             float w = weights[p];
+#ifdef __AVX2__
+            // f64評価で bit同一 (スカラー核の (double)w*(double)dY と同順序)。
+            jt_moe_avx2_f64_mulk_commit(dYe, (double)w, dY, n);
+#else
             for (int j = 0; j < n; j++) {
                 dYe[j] = (float)((double)w * (double)dY[j]);
             }
+#endif
             const float *Gp = Gsel + (size_t)p * (size_t)h;
             const float *Up = Usel + (size_t)p * (size_t)h;
             const float *wdr = Wd + e * (size_t)h * (size_t)n;
@@ -497,16 +590,24 @@ static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
             if (brc != JT_OK) {
                 goto cleanup;  // errnoは下位で設定済み
             }
+#ifdef __AVX2__
+            jt_moe_avx2_f64_add(dx_acc, 1.0, dxe, n);
+#else
             for (int j = 0; j < n; j++) {
                 dx_acc[j] += (double)dxe[j];
             }
+#endif
             // gate線形の選択行。
             {
                 double dl = dlog[e];
                 float *rg = dWgate + e * (size_t)n;
+#ifdef __AVX2__
+                jt_moe_avx2_f64_mulk_commit(rg, dl, X, n);
+#else
                 for (int j = 0; j < n; j++) {
                     rg[j] = (float)(dl * (double)X[j]);
                 }
+#endif
                 if (dLogits != NULL) {
                     dLogits[e] = (float)dl;
                 }
@@ -533,9 +634,13 @@ static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
             if (brc != JT_OK) {
                 goto cleanup;
             }
+#ifdef __AVX2__
+            jt_moe_avx2_f64_add(dx_acc, 1.0, dxe, n);
+#else
             for (int j = 0; j < n; j++) {
                 dx_acc[j] += (double)dxe[j];
             }
+#endif
         }
         for (int j = 0; j < n; j++) {
             if (!isfinite(dx_acc[j])) {
