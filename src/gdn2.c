@@ -20,11 +20,10 @@
 //   1ストリーム FMA ではレイテンシ (~4cyc) を隠せない。
 // - 対策として dv 方向を4ストリームに分割し、独立な4本の FMA チェーンで
 //   実行する (下記各ループの j/j+1/j+2/j+3 分割がそれ)。
-// - P2 SIMD 対応表:
-//     #if defined(__AVX512F__) → _mm512_fmadd_ps (16-wide) で各ストリーム拡張
-//     #elif defined(__AVX2__)  → _mm256_fmadd_ps (8-wide)
-//     #elif defined(__ARM_NEON) → vfmaq_f32 (4-wide)
-//   head 方向の並列は呼び出し側 (1C1T では層パイプライン側) で行う。
+// - P2 SIMD 対応表 (Phase D 実装済み。FMA は使わず mul/add/sub 分離で
+//   bit同一。AVX-512 には手を出さない):
+//     #if defined(__AVX2__)  → _mm256_mul/add/sub_ps (8-wide、loadu/storeu)
+//   (AVX-512/NEON パスなし。head 方向の並列は呼び出し側で行う)
 
 #include "jimotono/gdn2.h"
 
@@ -36,6 +35,81 @@
 
 #if defined(_WIN32)
 #include <malloc.h>
+#endif
+
+// P2 SIMD (Phase D) AVX2 パス。
+// - dv 方向のホットループ (elementwise streaming) を 8-wide float で処理。
+//   要素毎の演算順序はスカラー核と同一、FMA (_mm256_fmadd_ps) は使わない
+//   (mul→add 2丸めを保存。tmac.c の集計核と同一方針) ためスカラーと bit同一。
+// - l2norm (double 累積の reduction) と L/P ドット (dk 方向 reduction) は
+//   スカラー維持 (reduction 順序保存→bit同一。小規模で非律速のため)。
+// - AVX-512 には手を出さない (ZMM ダウンクロック懸念。tmac.c 見送り理由と同一)。
+// - アライメント非依存 (loadu/storeu のみ)。フォールバックは既存スカラー。
+#ifdef __AVX2__
+#include <immintrin.h>
+
+// row *= a (decode step 1 / S_out scale と同一形)。
+static void jt_gdn2_avx2_scale(float *restrict row, float a, int n) {
+    __m256 va = _mm256_set1_ps(a);
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 v = _mm256_loadu_ps(row + j);
+        _mm256_storeu_ps(row + j, _mm256_mul_ps(v, va));
+    }
+    for (; j < n; j++) {
+        row[j] *= a;
+    }
+}
+
+// c += ke*row (decode step 2 の係数累積と同一形)。
+static void jt_gdn2_avx2_add(float *restrict dst, float k,
+                             const float *restrict src, int n) {
+    __m256 vk = _mm256_set1_ps(k);
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 vd = _mm256_loadu_ps(dst + j);
+        __m256 vs = _mm256_loadu_ps(src + j);
+        vd = _mm256_add_ps(vd, _mm256_mul_ps(vk, vs));
+        _mm256_storeu_ps(dst + j, vd);
+    }
+    for (; j < n; j++) {
+        dst[j] += k * src[j];
+    }
+}
+
+// dst -= k*src (decode step 3 / B 形成 / 前進代入と同一形)。
+static void jt_gdn2_avx2_sub(float *restrict dst, float k,
+                             const float *restrict src, int n) {
+    __m256 vk = _mm256_set1_ps(k);
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 vd = _mm256_loadu_ps(dst + j);
+        __m256 vs = _mm256_loadu_ps(src + j);
+        vd = _mm256_sub_ps(vd, _mm256_mul_ps(vk, vs));
+        _mm256_storeu_ps(dst + j, vd);
+    }
+    for (; j < n; j++) {
+        dst[j] -= k * src[j];
+    }
+}
+
+// dst = a*b (vw 生成 / U 生成と同一形)。
+static void jt_gdn2_avx2_mul(float *restrict dst, const float *restrict a,
+                             const float *restrict b, int n) {
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 va = _mm256_loadu_ps(a + j);
+        __m256 vb = _mm256_loadu_ps(b + j);
+        _mm256_storeu_ps(dst + j, _mm256_mul_ps(va, vb));
+    }
+    for (; j < n; j++) {
+        dst[j] = a[j] * b[j];
+    }
+}
 #endif
 
 static int jt_gdn2_valid_dims(int dk, int dv) {
@@ -240,6 +314,9 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
         for (int i = 0; i < dk; i++) {
             float ai = alpha[i];
             float *row = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_scale(row, ai, dv);
+#else
             int j = 0;
             // dv 4分割: 独立4チェーンで FMA レイテンシ隠蔽 (性能NOTE参照)。
             for (; j + 3 < dv; j += 4) {
@@ -251,6 +328,7 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 row[j] *= ai;
             }
+#endif
         }
 
         // 2) 選択的消去の係数: c^T = (b⊙k)^T S'。
@@ -260,6 +338,9 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
         for (int i = 0; i < dk; i++) {
             float ke = b[i] * kn[i];  // b_t は fp32 維持 (精度優先)。
             const float *row = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_add(c, ke, row, dv);
+#else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 c[j] += ke * row[j];
@@ -270,12 +351,16 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 c[j] += ke * row[j];
             }
+#endif
         }
 
         // 3) 消去: S'' = S' - k c^T。
         for (int i = 0; i < dk; i++) {
             float ki = kn[i];
             float *row = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_sub(row, ki, c, dv);
+#else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 row[j] -= ki * c[j];
@@ -286,18 +371,26 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 row[j] -= ki * c[j];
             }
+#endif
         }
 
         // 4) 選択的書込みの値: vw = w⊙v。
         // 将来の削減はここから: (1) w スカラー化 (2) w 量子化 (b は維持)。
+#ifdef __AVX2__
+        jt_gdn2_avx2_mul(vw, w, v, dv);
+#else
         for (int j = 0; j < dv; j++) {
             vw[j] = w[j] * v[j];
         }
+#endif
 
         // 5) 書込み: S = S'' + k vw^T。
         for (int i = 0; i < dk; i++) {
             float ki = kn[i];
             float *row = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_add(row, ki, vw, dv);
+#else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 row[j] += ki * vw[j];
@@ -308,6 +401,7 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 row[j] += ki * vw[j];
             }
+#endif
         }
 
         // 6) 読出し: o = S^T q (更新後 S を使用)。
@@ -317,6 +411,9 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
         for (int i = 0; i < dk; i++) {
             float qi = qn[i];
             const float *row = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_add(out_o, qi, row, dv);
+#else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 out_o[j] += qi * row[j];
@@ -327,6 +424,7 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 out_o[j] += qi * row[j];
             }
+#endif
         }
     }
 
@@ -486,6 +584,9 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             const float *Vr = V + (size_t)t * (size_t)dv;
             const float *Wr = W + (size_t)t * (size_t)dv;
             float *Ur = U + (size_t)t * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_mul(Ur, Wr, Vr, dv);
+#else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 Ur[j] = Wr[j] * Vr[j];
@@ -496,6 +597,7 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (; j < dv; j++) {
                 Ur[j] = Wr[j] * Vr[j];
             }
+#endif
         }
 
         // 1) L (狭義下三角): L[t][s] = ke_t^T diag(cum(t,s)) k_s。
@@ -550,6 +652,9 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (int i = 0; i < dk; i++) {
                 float wi = KEt[i] * tmp[i];
                 const float *Sr = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+                jt_gdn2_avx2_sub(Gt, wi, Sr, dv);
+#else
                 int j = 0;
                 for (; j + 3 < dv; j += 4) {
                     Gt[j] -= wi * Sr[j];
@@ -560,6 +665,7 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 for (; j < dv; j++) {
                     Gt[j] -= wi * Sr[j];
                 }
+#endif
             }
         }
 
@@ -570,6 +676,9 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (int s = 0; s < t; s++) {
                 float ls = LP[(size_t)t * (size_t)C + (size_t)s];
                 const float *Es = G + (size_t)s * (size_t)dv;
+#ifdef __AVX2__
+                jt_gdn2_avx2_sub(Gt, ls, Es, dv);
+#else
                 int j = 0;
                 for (; j + 3 < dv; j += 4) {
                     Gt[j] -= ls * Es[j];
@@ -580,6 +689,7 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 for (; j < dv; j++) {
                     Gt[j] -= ls * Es[j];
                 }
+#endif
             }
         }
 
@@ -634,6 +744,9 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (int i = 0; i < dk; i++) {
                 float wi = QTt[i] * tmp[i];
                 const float *Sr = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+                jt_gdn2_avx2_add(Ot, wi, Sr, dv);
+#else
                 int j = 0;
                 for (; j + 3 < dv; j += 4) {
                     Ot[j] += wi * Sr[j];
@@ -644,10 +757,14 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 for (; j < dv; j++) {
                     Ot[j] += wi * Sr[j];
                 }
+#endif
             }
             for (int s = 0; s <= t; s++) {
                 float ps = LP[(size_t)t * (size_t)C + (size_t)s];
                 const float *Es = G + (size_t)s * (size_t)dv;
+#ifdef __AVX2__
+                jt_gdn2_avx2_add(Ot, ps, Es, dv);
+#else
                 int j = 0;
                 for (; j + 3 < dv; j += 4) {
                     Ot[j] += ps * Es[j];
@@ -658,6 +775,7 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 for (; j < dv; j++) {
                     Ot[j] += ps * Es[j];
                 }
+#endif
             }
         }
 
@@ -688,6 +806,9 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
         for (int i = 0; i < dk; i++) {
             float cf = tmp[i];
             float *Sr = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_gdn2_avx2_scale(Sr, cf, dv);
+#else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 Sr[j] *= cf;
@@ -698,6 +819,7 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (; j < dv; j++) {
                 Sr[j] *= cf;
             }
+#endif
         }
         for (int s = 0; s < C; s++) {
             const float *Es = G + (size_t)s * (size_t)dv;
@@ -705,6 +827,9 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (int i = 0; i < dk; i++) {
                 float w = Ws[i];
                 float *Sr = S + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+                jt_gdn2_avx2_add(Sr, w, Es, dv);
+#else
                 int j = 0;
                 for (; j + 3 < dv; j += 4) {
                     Sr[j] += w * Es[j];
@@ -715,6 +840,7 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 for (; j < dv; j++) {
                     Sr[j] += w * Es[j];
                 }
+#endif
             }
         }
     }

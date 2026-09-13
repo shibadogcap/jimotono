@@ -24,6 +24,312 @@
 #include <stdint.h>
 #include <string.h>
 
+// P2 SIMD (Phase D) AVX2 パス。
+// - elementwise streaming (f32 8-wide / f64 4-wide) は要素毎の演算順序を
+//   スカラー核と同一にし、FMA は使わない (mul→add 2丸めを保存。tmac.c と
+//   同一方針) ためスカラーと bit同一 (出力 dim 方向のベクトル化のみ)。
+// - reduction dim 方向のドット (jt_bwd_avx2_dot) のみ合算順序が変わるため
+//   tol内一致 (倍精度レーン合算で相対 ~1e-16。テスト tol=1e-5/1e-3 に対し
+//   十分小さい)。該当箇所: SwiGLU fwd G/U ドット・bwd dY Acc・RMS s・
+//   MoE gate logits・dw_dp。
+// - sigmoid/exp はスカラー維持 (ベクトル exp 近似は丸めを変えるため)。
+// - AVX-512 には手を出さない (ZMM ダウンクロック懸念。tmac.c と同一理由)。
+// - アライメント非依存 (loadu/storeu のみ)。フォールバックは既存スカラー。
+#ifdef __AVX2__
+#include <immintrin.h>
+
+// dst[j] = k*src[j] (f32同士の乗算。S1 = D S_prev と同一形。bit同一)。
+static void jt_bwd_avx2_f32_mulk(float *restrict dst, float k,
+                                 const float *restrict src, int n) {
+    __m256 vk = _mm256_set1_ps(k);
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 vs = _mm256_loadu_ps(src + j);
+        _mm256_storeu_ps(dst + j, _mm256_mul_ps(vk, vs));
+    }
+    for (; j < n; j++) {
+        dst[j] = k * src[j];
+    }
+}
+
+// dst[j] = a[j] + k*b[j] (f64評価。G = dS_next + qn*dO^T と同一形。bit同一)。
+static void jt_bwd_avx2_f32_affine(float *restrict dst,
+                                   const float *restrict a, double k,
+                                   const float *restrict b, int n) {
+    __m256d vk = _mm256_set1_pd(k);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d va =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(a + j)));
+        __m256d vb =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(b + j)));
+        __m128 vo =
+            _mm256_cvtpd_ps(_mm256_add_pd(va, _mm256_mul_pd(vk, vb)));
+        _mm_storeu_ps(dst + j, vo);
+    }
+    for (; j < n; j++) {
+        dst[j] = (float)((double)a[j] + k * (double)b[j]);
+    }
+}
+
+// sn = s1 - ki*c + ki*vw (左結合。GDN-2 bwd Sn 再計算と同一形。bit同一)。
+static void jt_bwd_avx2_f32_sn(float *restrict sn, const float *restrict s1,
+                               float ki, const float *restrict c,
+                               const float *restrict vw, int n) {
+    __m256 vki = _mm256_set1_ps(ki);
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 vs = _mm256_loadu_ps(s1 + j);
+        __m256 vc = _mm256_loadu_ps(c + j);
+        __m256 vv = _mm256_loadu_ps(vw + j);
+        vs = _mm256_sub_ps(vs, _mm256_mul_ps(vki, vc));
+        vs = _mm256_add_ps(vs, _mm256_mul_ps(vki, vv));
+        _mm256_storeu_ps(sn + j, vs);
+    }
+    for (; j < n; j++) {
+        sn[j] = s1[j] - ki * c[j] + ki * vw[j];
+    }
+}
+
+// dst[j] = a[j]*b[j] (f32。vw 生成と同一形。bit同一)。
+static void jt_bwd_avx2_f32_mul(float *restrict dst,
+                                const float *restrict a,
+                                const float *restrict b, int n) {
+    int j = 0;
+    int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        __m256 va = _mm256_loadu_ps(a + j);
+        __m256 vb = _mm256_loadu_ps(b + j);
+        _mm256_storeu_ps(dst + j, _mm256_mul_ps(va, vb));
+    }
+    for (; j < n; j++) {
+        dst[j] = a[j] * b[j];
+    }
+}
+
+// dst[j] += k*src[j] (f64。yacc/dx_acc 累積と同一形。レーン毎 i 順序同一で bit同一)。
+static void jt_bwd_avx2_f64_add(double *restrict dst, double k,
+                                const float *restrict src, int n) {
+    __m256d vk = _mm256_set1_pd(k);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vd = _mm256_loadu_pd(dst + j);
+        __m256d vs =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(src + j)));
+        vd = _mm256_add_pd(vd, _mm256_mul_pd(vk, vs));
+        _mm256_storeu_pd(dst + j, vd);
+    }
+    for (; j < n; j++) {
+        dst[j] += k * (double)src[j];
+    }
+}
+
+// dst[j] = (float)(k*src[j]) (f64→f32 commit。dW 行・RMS dW と同一形。bit同一)。
+static void jt_bwd_avx2_f64_mulk_commit(float *restrict dst, double k,
+                                        const float *restrict src, int n) {
+    __m256d vk = _mm256_set1_pd(k);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vs =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(src + j)));
+        __m128 v = _mm256_cvtpd_ps(_mm256_mul_pd(vk, vs));
+        _mm_storeu_ps(dst + j, v);
+    }
+    for (; j < n; j++) {
+        dst[j] = (float)(k * (double)src[j]);
+    }
+}
+
+// ドット (f64累積)。reduction 順序が変わるため tol内一致 (bit一致ではない)。
+// 用途: SwiGLU fwd G/U・bwd dY Acc。
+static double jt_bwd_avx2_dot(const float *restrict x,
+                              const float *restrict y, int n) {
+    __m256d acc = _mm256_setzero_pd();
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vx =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(x + j)));
+        __m256d vy =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(y + j)));
+        acc = _mm256_add_pd(acc, _mm256_mul_pd(vx, vy));
+    }
+    double lane[4];
+    _mm256_storeu_pd(lane, acc);
+    double s = (lane[0] + lane[1]) + (lane[2] + lane[3]);
+    for (; j < n; j++) {
+        s += (double)x[j] * (double)y[j];
+    }
+    return s;
+}
+
+// c[j] = (float)((double)c[j] + ke*(double)s1[j])
+// (GDN-2 bwd c 累積と同一形。レーン毎 i 順序同一で bit同一)。
+static void jt_bwd_avx2_f32_axpy(float *restrict c, double ke,
+                                 const float *restrict s1, int n) {
+    __m256d vke = _mm256_set1_pd(ke);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vc =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(c + j)));
+        __m256d vs =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(s1 + j)));
+        __m128 vo =
+            _mm256_cvtpd_ps(_mm256_add_pd(vc, _mm256_mul_pd(vke, vs)));
+        _mm_storeu_ps(c + j, vo);
+    }
+    for (; j < n; j++) {
+        c[j] = (float)((double)c[j] + ke * (double)s1[j]);
+    }
+}
+
+// dc[j] = -Σ_i G[i,j]*kn[i]、dvw[j] = +Σ_i G[i,j]*kn[i]
+// (G 行 stride=dv。レーン毎 i 順序同一・FMA 不使用で bit同一)。
+static void jt_bwd_avx2_dc_dvw(double *restrict dc, double *restrict dvw,
+                               const float *restrict G,
+                               const float *restrict kn, int dk, int dv) {
+    int j = 0;
+    int n4 = dv & ~3;
+    for (; j < n4; j += 4) {
+        __m256d acc = _mm256_setzero_pd();
+        for (int i = 0; i < dk; i++) {
+            const float *grow =
+                G + (size_t)i * (size_t)dv + (size_t)j;
+            __m256d vg =
+                _mm256_cvtps_pd(_mm_loadu_ps((const float *)grow));
+            __m256d vk = _mm256_set1_pd((double)kn[i]);
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(vk, vg));
+        }
+        double lane[4];
+        _mm256_storeu_pd(lane, acc);
+        for (int t = 0; t < 4; t++) {
+            dc[j + t] = -lane[t];
+            dvw[j + t] = lane[t];
+        }
+    }
+    for (; j < dv; j++) {
+        double s = 0.0;
+        for (int i = 0; i < dk; i++) {
+            s += (double)G[(size_t)i * (size_t)dv + (size_t)j] *
+                 (double)kn[i];
+        }
+        dc[j] = -s;
+        dvw[j] = s;
+    }
+}
+
+// dS1[j] = g[j]+dc[j]*ke、dsp[j] = dS1*alpha、da = Σ dS1*sp。
+// dsp は bit同一。da のみレーン合算順序が変わるため tol (dAlpha 用)。
+static double jt_bwd_avx2_ds1(float *restrict dsp, const float *restrict g,
+                              const double *restrict dc, double ke,
+                              const float *restrict sp, double alpha,
+                              int dv) {
+    __m256d vke = _mm256_set1_pd(ke);
+    __m256d va = _mm256_set1_pd(alpha);
+    __m256d vda = _mm256_setzero_pd();
+    int j = 0;
+    int n4 = dv & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vg =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(g + j)));
+        __m256d vdc = _mm256_loadu_pd(dc + j);
+        __m256d vsp =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(sp + j)));
+        __m256d vd = _mm256_add_pd(vg, _mm256_mul_pd(vdc, vke));
+        __m128 vc = _mm256_cvtpd_ps(_mm256_mul_pd(vd, va));
+        _mm_storeu_ps(dsp + j, vc);
+        vda = _mm256_add_pd(vda, _mm256_mul_pd(vd, vsp));
+    }
+    double lane[4];
+    _mm256_storeu_pd(lane, vda);
+    double da = (lane[0] + lane[1]) + (lane[2] + lane[3]);
+    for (; j < dv; j++) {
+        double d = (double)g[j] + dc[j] * ke;
+        dsp[j] = (float)(d * alpha);
+        da += d * (double)sp[j];
+    }
+    return da;
+}
+
+// dx[j] = r*dY[j]*W[j] - r3n*X[j]*s (左結合。RMSNorm bwd と同一形。bit同一)。
+static void jt_bwd_avx2_rms_dx(float *restrict dx,
+                               const float *restrict dY,
+                               const float *restrict X,
+                               const float *restrict W, double r, double r3n,
+                               double s, int n) {
+    __m256d vr = _mm256_set1_pd(r);
+    __m256d vc = _mm256_set1_pd(r3n);
+    __m256d vs = _mm256_set1_pd(s);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vdy =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(dY + j)));
+        __m256d vw =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(W + j)));
+        __m256d vx =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(X + j)));
+        __m256d t1 = _mm256_mul_pd(_mm256_mul_pd(vr, vdy), vw);
+        __m256d t2 = _mm256_mul_pd(_mm256_mul_pd(vc, vx), vs);
+        __m128 vo = _mm256_cvtpd_ps(_mm256_sub_pd(t1, t2));
+        _mm_storeu_ps(dx + j, vo);
+    }
+    for (; j < n; j++) {
+        double v = r * (double)dY[j] * (double)W[j] -
+                   r3n * (double)X[j] * s;
+        dx[j] = (float)v;
+    }
+}
+
+// yacc[j] = (W[j]*X[j])*r (f64。RMSNorm fwd 中間と同一形。bit同一)。
+static void jt_bwd_avx2_f64_mulr(double *restrict yacc,
+                                 const float *restrict W,
+                                 const float *restrict X, double r, int n) {
+    __m256d vr = _mm256_set1_pd(r);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d vw =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(W + j)));
+        __m256d vx =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(X + j)));
+        _mm256_storeu_pd(yacc + j,
+                         _mm256_mul_pd(_mm256_mul_pd(vw, vx), vr));
+    }
+    for (; j < n; j++) {
+        yacc[j] = (double)W[j] * (double)X[j] * r;
+    }
+}
+
+// dst[j] = (a[j]*b[j])*r (f64→f32 commit。RMSNorm fwd Y・bwd dW と同一形。bit同一)。
+static void jt_bwd_avx2_f64_mulr_commit(float *restrict dst,
+                                        const float *restrict a,
+                                        const float *restrict b, double r,
+                                        int n) {
+    __m256d vr = _mm256_set1_pd(r);
+    int j = 0;
+    int n4 = n & ~3;
+    for (; j < n4; j += 4) {
+        __m256d va =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(a + j)));
+        __m256d vb =
+            _mm256_cvtps_pd(_mm_loadu_ps((const float *)(b + j)));
+        __m128 vo =
+            _mm256_cvtpd_ps(_mm256_mul_pd(_mm256_mul_pd(va, vb), vr));
+        _mm_storeu_ps(dst + j, vo);
+    }
+    for (; j < n; j++) {
+        dst[j] = (float)((double)a[j] * (double)b[j] * r);
+    }
+}
+#endif
+
 static int jt_bwd_valid_dims(int dk, int dv) {
     return dk > 0 && dv > 0 && dk <= JT_BWD_MAX_D && dv <= JT_BWD_MAX_D;
 }
@@ -169,9 +475,13 @@ int jt_gdn2_decode_bwd(const float *restrict S_prev,
             float ai = alpha[i];
             const float *sp = S_prev + (size_t)i * (size_t)dv;
             float *s1 = S1 + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_bwd_avx2_f32_mulk(s1, ai, sp, dv);
+#else
             for (int j = 0; j < dv; j++) {
                 s1[j] = ai * sp[j];
             }
+#endif
         }
         // 2) c^T = ke^T S1, ke = b⊙kn。
         for (int j = 0; j < dv; j++) {
@@ -180,22 +490,34 @@ int jt_gdn2_decode_bwd(const float *restrict S_prev,
         for (int i = 0; i < dk; i++) {
             double ke = (double)b[i] * (double)kn[i];
             const float *s1 = S1 + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_bwd_avx2_f32_axpy(c, ke, s1, dv);
+#else
             for (int j = 0; j < dv; j++) {
                 c[j] = (float)((double)c[j] + ke * (double)s1[j]);
             }
+#endif
         }
         // 3) vw = w⊙v。
+#ifdef __AVX2__
+        jt_bwd_avx2_f32_mul(vw, w, v, dv);
+#else
         for (int j = 0; j < dv; j++) {
             vw[j] = w[j] * v[j];
         }
+#endif
         // 4) Sn = S1 - kn c^T + kn vw^T。
         for (int i = 0; i < dk; i++) {
             float ki = kn[i];
             const float *s1 = S1 + (size_t)i * (size_t)dv;
             float *sn = Sn + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+            jt_bwd_avx2_f32_sn(sn, s1, ki, c, vw, dv);
+#else
             for (int j = 0; j < dv; j++) {
                 sn[j] = s1[j] - ki * c[j] + ki * vw[j];
             }
+#endif
         }
 
         // 5) G = dS_next + qn dO^T、dc、dqn/dkn_sn/dkn_s2/dvwをdouble累積。
@@ -238,11 +560,18 @@ int jt_gdn2_decode_bwd(const float *restrict S_prev,
                 const float *dsn =
                     dS_next + (size_t)i * (size_t)dv;
                 float *g = Sn + (size_t)i * (size_t)dv;  // Gで再利用
+#ifdef __AVX2__
+                jt_bwd_avx2_f32_affine(g, dsn, (double)qi, dO, dv);
+#else
                 for (int j = 0; j < dv; j++) {
                     g[j] = (float)((double)dsn[j] + (double)qi * (double)dO[j]);
                 }
+#endif
             }
             // dc[j] = -sum_i G[i,j]*kn[i]; dvw[j] = sum_i G[i,j]*kn[i]。
+#ifdef __AVX2__
+            jt_bwd_avx2_dc_dvw(dc_tmp, dvw_tmp, Sn, kn, dk, dv);
+#else
             for (int j = 0; j < dv; j++) {
                 double s_dc = 0.0;
                 double s_vw = 0.0;
@@ -255,6 +584,7 @@ int jt_gdn2_decode_bwd(const float *restrict S_prev,
                 dc_tmp[j] = -s_dc;
                 dvw_tmp[j] = s_vw;
             }
+#endif
             // dkn_sn[i] = sum_j G[i,j]*vw[j]; dkn_s2[i] = -sum_j G[i,j]*c[j]。
             for (int i = 0; i < dk; i++) {
                 const float *g = Sn + (size_t)i * (size_t)dv;
@@ -295,6 +625,11 @@ int jt_gdn2_decode_bwd(const float *restrict S_prev,
                 {
                     double da = 0.0;
                     float *dsp = dS_prev + (size_t)i * (size_t)dv;
+#ifdef __AVX2__
+                    da = jt_bwd_avx2_ds1(dsp, g, dc_tmp, ke, sp,
+                                         (double)alpha[i], dv);
+                    dAlpha[i] = (float)da;
+#else
                     for (int j = 0; j < dv; j++) {
                         double dS1 =
                             (double)g[j] + dc_tmp[j] * ke;
@@ -302,6 +637,7 @@ int jt_gdn2_decode_bwd(const float *restrict S_prev,
                         da += dS1 * (double)sp[j];
                     }
                     dAlpha[i] = (float)da;
+#endif
                 }
                 // dqn/dknの正規化逆伝播用にdke等は不要になったので、
                 // dkn_s2をdkn_ke保持に転用しない (上式で合算済み)。
@@ -412,10 +748,15 @@ static int jt_swiglu_bwd_impl(const float *restrict dY,
             // silu'(g) = sig*(1+g*(1-sig))。
             double dsilu = sig * (1.0 + gi * (1.0 - sig));
             const float *wdrow = Wd + (size_t)i * (size_t)n;
+#ifdef __AVX2__
+            // reduction 方向のため tol内一致 (jt_bwd_avx2_dot 参照)。
+            double acc = jt_bwd_avx2_dot(dY, wdrow, n);
+#else
             double acc = 0.0;
             for (int j = 0; j < n; j++) {
                 acc += (double)dY[j] * (double)wdrow[j];
             }
+#endif
             dg[i] = acc * ui * dsilu;
             du[i] = acc * silu;
             ss[i] = silu * ui;
@@ -423,6 +764,41 @@ static int jt_swiglu_bwd_impl(const float *restrict dY,
         }
         // DESIGN.MD §4.1: dXを先に計算して伝播させ、dWは後回し。
         // dW計算→更新→書き戻しのオーバーラップ前提の順序。
+#ifdef __AVX2__
+        // i-outer / j-vector 累積。各レーンの加算順序はスカラー核
+        // (i 昇順に dg*Wg・du*Wu) と同一、FMA 不使用のため bit同一。
+        {
+            double dxd[JT_BWD_MAX_WIDE];
+            for (int j = 0; j < n; j++) {
+                dxd[j] = 0.0;
+            }
+            for (int i = 0; i < h; i++) {
+                __m256d vdg = _mm256_set1_pd(dg[i]);
+                __m256d vdu = _mm256_set1_pd(du[i]);
+                const float *wgr = Wg + (size_t)i * (size_t)n;
+                const float *wur = Wu + (size_t)i * (size_t)n;
+                int j = 0;
+                int n4 = n & ~3;
+                for (; j < n4; j += 4) {
+                    __m256d vdx = _mm256_loadu_pd(dxd + j);
+                    __m256d vgw = _mm256_cvtps_pd(
+                        _mm_loadu_ps((const float *)(wgr + j)));
+                    __m256d vuw = _mm256_cvtps_pd(
+                        _mm_loadu_ps((const float *)(wur + j)));
+                    vdx = _mm256_add_pd(vdx, _mm256_mul_pd(vdg, vgw));
+                    vdx = _mm256_add_pd(vdx, _mm256_mul_pd(vdu, vuw));
+                    _mm256_storeu_pd(dxd + j, vdx);
+                }
+                for (; j < n; j++) {
+                    dxd[j] += dg[i] * (double)wgr[j];
+                    dxd[j] += du[i] * (double)wur[j];
+                }
+            }
+            for (int j = 0; j < n; j++) {
+                dX[j] = (float)dxd[j];
+            }
+        }
+#else
         for (int j = 0; j < n; j++) {
             double acc = 0.0;
             for (int i = 0; i < h; i++) {
@@ -431,6 +807,7 @@ static int jt_swiglu_bwd_impl(const float *restrict dY,
             }
             dX[j] = (float)acc;
         }
+#endif
         // dWは後回し (上記dX転送とパイプライン化可能)。
         // dWd[i,j] = s[i]*dY[j] (sは上記ループで保存した中間値の使い回し。
         // sigmoid再計算を省く。同一入力の再評価のためビット不変)。
@@ -441,12 +818,18 @@ static int jt_swiglu_bwd_impl(const float *restrict dY,
             double gi_d = dg[i];
             double ui_d = du[i];
             double s = ss[i];
+#ifdef __AVX2__
+            jt_bwd_avx2_f64_mulk_commit(dwg, gi_d, X, n);
+            jt_bwd_avx2_f64_mulk_commit(dwu, ui_d, X, n);
+            jt_bwd_avx2_f64_mulk_commit(dwd, s, dY, n);
+#else
             for (int j = 0; j < n; j++) {
                 double xj = (double)X[j];
                 dwg[j] = (float)(gi_d * xj);
                 dwu[j] = (float)(ui_d * xj);
                 dwd[j] = (float)(s * (double)dY[j]);
             }
+#endif
         }
     }
 
@@ -509,20 +892,28 @@ int jt_rmsnorm_bwd(const float *restrict dY, const float *restrict X,
         }
         mean /= (double)n;
         r = 1.0 / sqrt(mean + (double)eps);
+#ifdef __AVX2__
+        jt_bwd_avx2_f64_mulr_commit(dW, dY, X, r, n);
+#else
         for (int i = 0; i < n; i++) {
             dW[i] = (float)((double)dY[i] * (double)X[i] * r);
         }
+#endif
         {
             double r3n = r * r * r / (double)n;
             double s = 0.0;
             for (int i = 0; i < n; i++) {
                 s += (double)dY[i] * (double)W[i] * (double)X[i];
             }
+#ifdef __AVX2__
+            jt_bwd_avx2_rms_dx(dX, dY, X, W, r, r3n, s, n);
+#else
             for (int j = 0; j < n; j++) {
                 double v =
                     r * (double)dY[j] * (double)W[j] - r3n * (double)X[j] * s;
                 dX[j] = (float)v;
             }
+#endif
         }
     }
 
@@ -574,14 +965,20 @@ static int jt_swiglu_fwd_impl(const float *restrict X,
             goto cleanup;
         }
         for (int i = 0; i < h; i++) {
-            double g = 0.0;
-            double u = 0.0;
             const float *wgr = Wg + (size_t)i * (size_t)n;
             const float *wur = Wu + (size_t)i * (size_t)n;
+#ifdef __AVX2__
+            // reduction 方向のため tol内一致 (jt_bwd_avx2_dot 参照)。
+            double g = jt_bwd_avx2_dot(X, wgr, n);
+            double u = jt_bwd_avx2_dot(X, wur, n);
+#else
+            double g = 0.0;
+            double u = 0.0;
             for (int j = 0; j < n; j++) {
                 g += (double)X[j] * (double)wgr[j];
                 u += (double)X[j] * (double)wur[j];
             }
+#endif
             if (!isfinite(g) || !isfinite(u)) {
                 errno = EINVAL;
                 goto cleanup;
@@ -594,6 +991,23 @@ static int jt_swiglu_fwd_impl(const float *restrict X,
                 uu[i] = u;
             }
         }
+#ifdef __AVX2__
+        // i-outer / j-vector 累積。各レーンの加算順序はスカラー核 (i 昇順)
+        // と同一、FMA 不使用のため bit同一。
+        for (int j = 0; j < n; j++) {
+            yacc[j] = 0.0;
+        }
+        for (int i = 0; i < h; i++) {
+            jt_bwd_avx2_f64_add(yacc, s[i],
+                                Wd + (size_t)i * (size_t)n, n);
+        }
+        for (int j = 0; j < n; j++) {
+            if (!isfinite(yacc[j])) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+        }
+#else
         for (int j = 0; j < n; j++) {
             double acc = 0.0;
             for (int i = 0; i < h; i++) {
@@ -605,6 +1019,7 @@ static int jt_swiglu_fwd_impl(const float *restrict X,
             }
             yacc[j] = acc;
         }
+#endif
         // 全要素の有限確認後に一括commit (拒否時はG/U/Y不変)。
         for (int i = 0; i < h; i++) {
             if (!isfinite(s[i]) || !isfinite(gg[i]) || !isfinite(uu[i])) {
@@ -678,6 +1093,15 @@ int jt_rmsnorm_fwd(const float *restrict X, const float *restrict W,
             errno = EINVAL;
             goto cleanup;
         }
+#ifdef __AVX2__
+        jt_bwd_avx2_f64_mulr(yacc, W, X, r, n);
+        for (int i = 0; i < n; i++) {
+            if (!isfinite(yacc[i])) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+        }
+#else
         for (int i = 0; i < n; i++) {
             double v = (double)W[i] * (double)X[i] * r;
             if (!isfinite(v)) {
@@ -686,6 +1110,7 @@ int jt_rmsnorm_fwd(const float *restrict X, const float *restrict W,
             }
             yacc[i] = v;
         }
+#endif
         // 有限確認後に一括commit (拒否時はY不変)。
         for (int i = 0; i < n; i++) {
             Y[i] = (float)yacc[i];
