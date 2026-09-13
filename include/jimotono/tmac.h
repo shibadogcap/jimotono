@@ -61,7 +61,7 @@ int jt_tmac_lut_ctor(const float *restrict act, size_t n, size_t k,
 // LUT参照累積: 1行分のQLUT (ngroups*8) と1列分の重みindex (bits*ngroups) から
 // ドット積1スカラーを求める。GEMM時は呼び出し側で(n,m)ループする。
 // - ngroups>0, nblocks>0, ngroups==nblocks*8 (act_group=32仮定) を要求。
-// - bits ∈ {1,2,4} (bit-serialパス数)。結果は Σ_b 2^b * plane_b。
+// - bits ∈ {1,2,3,4} (bit-serialパス数)。結果は Σ_b 2^b * plane_b。
 // - w_scale: 重みblock scale (P1は単一値に縮退)。
 // - int32累積→最後にscale/bias乗算 (ブロック毎に1回ずつ。逆量子化回避)。
 // 戻り値: JT_OK / JT_ERR_INVAL。

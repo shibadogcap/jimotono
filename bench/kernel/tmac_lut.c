@@ -1,5 +1,5 @@
 // bench+test: T-MAC LUT kernel correctness + microbench (Phase 1).
-// cases: bit-width {1,2,4} x act {dynamic int8 LUT}; metric: us/call.
+// cases: bit-width {1,2,3,4} x act {dynamic int8 LUT}; metric: us/call.
 // 正常系+異常系+アライメントを検証 (成功時 exit 0)、末尾に簡易benchを出力。
 #include <errno.h>
 #include <math.h>
@@ -139,6 +139,14 @@ static void test_bits(void) {
     }
     CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, 2, 1.0f, &out) == JT_OK && out == 376.0f,
           "bits=2 weighting");
+    // bits=3: planes 15,14,13 -> (288 + 280*2 + 272*4)/2 = 968。
+    for (size_t i = 0; i < 8u; i++) {
+        idx[i] = 15u;
+        idx[8u + i] = 14u;
+        idx[16u + i] = 13u;
+    }
+    CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, 3, 1.0f, &out) == JT_OK && out == 968.0f,
+          "bits=3 weighting");
     // bits=4: planes 15,14,13,12 -> (288 + 280*2 + 272*4 + 264*8)/2 = 2024。
     for (size_t i = 0; i < 8u; i++) {
         idx[i] = 15u;
@@ -212,6 +220,63 @@ static void test_roundtrip(void) {
     }
 }
 
+static void test_roundtrip_bits3(void) {
+    enum { TN3 = 1, TK3 = 64, TNG3 = 16, TNB3 = 2, TBITS3 = 3 };
+    float act[TN3 * TK3];
+    int8_t q[TNG3 * 8];
+    float sc[TNB3];
+    float bi[TNB3];
+    uint8_t idx[TBITS3 * TNG3];
+    float w = 1.5f;
+    float out = 0.0f;
+    for (size_t i = 0; i < (size_t)(TN3 * TK3); i++) {
+        int v = (int)((i * 37u + 11u) % 13u) - 6;
+        act[i] = (float)v * 0.25f;
+    }
+    for (size_t i = 0; i < (size_t)(TBITS3 * TNG3); i++) {
+        idx[i] = (uint8_t)((i * 5u + 3u) % 16u);
+    }
+    CHECK(jt_tmac_lut_ctor(act, (size_t)TN3, (size_t)TK3, q, sc, bi) == JT_OK, "roundtrip3 ctor");
+    CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, (size_t)TNG3, (size_t)TNB3, TBITS3, w, &out)
+              == JT_OK,
+          "roundtrip3 lookup");
+    if (g_fail != 0) {
+        return;
+    }
+    {
+        double exact = 0.0;
+        double bound = 0.0;
+        for (size_t bb = 0; bb < (size_t)TNB3; bb++) {
+            const float *abase = act + bb * 32u;
+            double bsum = 0.0;
+            for (size_t i = 0; i < 32u; i++) {
+                bsum += (double)abase[i];
+            }
+            CHECK(bi[bb] == (float)bsum, "roundtrip3 bias");
+            for (int b = 0; b < TBITS3; b++) {
+                const uint8_t *plane = idx + (size_t)b * (size_t)TNG3 + bb * 8u;
+                double f = exact_plane_sum(abase, plane);
+                double pw = (double)(1 << b);
+                exact += ((f + bsum) * 0.5) * pw;
+                bound += (2.0 * (double)sc[bb]) * pw;
+            }
+        }
+        exact *= (double)w;
+        bound *= ((double)w >= 0.0) ? (double)w : -(double)w;
+        {
+            double diff = (double)out - exact;
+            double ad = (diff >= 0.0) ? diff : -diff;
+            double ae = (exact >= 0.0) ? exact : -exact;
+            double tol = bound + 1e-4 * ae + 1e-3;
+            if (!(ad <= tol)) {
+                char buf[160];
+                snprintf(buf, sizeof buf, "roundtrip3 bound ad=%g tol=%g", ad, tol);
+                fail_at(__LINE__, buf);
+            }
+        }
+    }
+}
+
 static void test_errors(void) {
     float act[32] = {0.0f};
     int8_t q[64];
@@ -258,10 +323,10 @@ static void test_errors(void) {
           "lookup ngroups!=8*nblocks");
     CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, 0, 1.0f, &out) == JT_ERR_INVAL,
           "lookup bits==0");
-    CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, 3, 1.0f, &out) == JT_ERR_INVAL,
-          "lookup bits==3");
     CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, 5, 1.0f, &out) == JT_ERR_INVAL,
           "lookup bits==5");
+    CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, -1, 1.0f, &out) == JT_ERR_INVAL,
+          "lookup bits==-1");
     CHECK(jt_tmac_lookup_accum(q, idx, sc, bi, 8u, 1u, 1, (float)NAN, &out) == JT_ERR_INVAL,
           "lookup NaN w_scale");
     sc[0] = (float)NAN;
@@ -319,7 +384,7 @@ static void run_bench(void) {
     static float bbi[BNB];
     static uint8_t bidx[4 * BNG];
     const long iters = 2000L;
-    const int bits_list[3] = {1, 2, 4};
+    const int bits_list[4] = {1, 2, 3, 4};
     for (size_t i = 0; i < (size_t)BK; i++) {
         bact[i] = (float)((int)(i % 9u) - 4) * 0.25f;
     }
@@ -330,7 +395,7 @@ static void run_bench(void) {
         fail_at(__LINE__, "bench ctor");
         return;
     }
-    for (size_t li = 0; li < 3u; li++) {
+    for (size_t li = 0; li < 4u; li++) {
         int bits = bits_list[li];
         clock_t t0 = clock();
         double sink = 0.0;
@@ -359,6 +424,7 @@ int main(void) {
     test_mirror();
     test_bits();
     test_roundtrip();
+    test_roundtrip_bits3();
     test_errors();
     test_arena_align();
     if (g_fail != 0) {

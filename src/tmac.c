@@ -308,7 +308,7 @@ int jt_tmac_lookup_accum(const int8_t *restrict qlut, const uint8_t *restrict id
         rc = JT_ERR_INVAL;
         goto cleanup;
     }
-    if (bits != 1 && bits != 2 && bits != 4) {
+    if (bits < 1 || bits > 4) {
         errno = EINVAL;
         rc = JT_ERR_INVAL;
         goto cleanup;
