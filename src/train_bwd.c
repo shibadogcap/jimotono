@@ -387,7 +387,6 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
         // (ヒープ確保を避け、1C1Tスタック利用を想定)。
         // C11 VLAは使わない (MSVC非対応のため固定上限+検査)。
         static const int kMax = JT_BWD_MAX_WIDE;
-        double dS[JT_BWD_MAX_WIDE];
         double dg[JT_BWD_MAX_WIDE];
         double du[JT_BWD_MAX_WIDE];
         if (h > kMax) {
@@ -406,7 +405,6 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
             for (int j = 0; j < n; j++) {
                 acc += (double)dY[j] * (double)wdrow[j];
             }
-            dS[i] = acc;
             dg[i] = acc * ui * dsilu;
             du[i] = acc * silu;
             (void)silu;
