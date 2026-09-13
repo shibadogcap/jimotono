@@ -49,6 +49,7 @@ add_library(jimotono_core
   src/model1b.c
   src/moe_layer.c
   src/data_pack.c
+  src/bpe.c
 )
 # POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
@@ -146,6 +147,13 @@ if(JIMOTONO_BUILD_BENCH)
   add_executable(test_data_pack bench/kernel/test_data_pack.c)
   target_link_libraries(test_data_pack PRIVATE jimotono_core)
 
+  add_executable(test_bpe bench/kernel/test_bpe.c)
+  target_link_libraries(test_bpe PRIVATE jimotono_core)
+
+  # bench_bpe: 等価性・往復・pack連携・軽性能の実行ツール (ctest外)。
+  add_executable(bench_bpe bench/kernel/bench_bpe.c)
+  target_link_libraries(bench_bpe PRIVATE jimotono_core jimotono_bench_common)
+
   # pack_jsonl: 空白区切り整数テキスト→.jtdp変換ツール (実行バイナリのみ。
   # ctestには追加しない。JSONL本格パーサは禁止=トークナイザ確定前の暫定)。
   add_executable(pack_jsonl bench/data/pack_jsonl.c)
@@ -189,6 +197,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME model1b COMMAND test_model1b)
   add_test(NAME moe_layer COMMAND test_moe_layer)
   add_test(NAME data_pack COMMAND test_data_pack)
+  add_test(NAME bpe COMMAND test_bpe)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
