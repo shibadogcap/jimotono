@@ -567,12 +567,108 @@ static void test_invalid(void) {
     }
 }
 
+// ---- unchecked経路の数値一致 (検証ありAPIとbit一致) ----
+// unchecked使用条件: 重み事前検証済み＋区間内不変の呼び出しでのみ使うこと。
+// ここでは有限の固定入力を与え、通常経路とunchecked経路の全出力をmemcmpする。
+// fail-closed不変 (INVAL系) はtest_invalidで担保し、ここでは正常系の一致のみ見る。
+static void test_unchecked_match(void) {
+    float X[2] = {1.0f, 0.5f};
+    float Wgate[6] = {1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 0.0f};
+    float Wg[6] = {0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f};
+    float Wu[6] = {1.0f, 0.0f, 0.5f, -0.5f, 0.0f, 0.0f};
+    float Wd[6] = {1.0f, 2.0f, -1.0f, 0.5f, 0.0f, 0.0f};
+    float Wg_s[2] = {0.5f, 0.5f};
+    float Wu_s[2] = {1.0f, -1.0f};
+    float Wd_s[2] = {0.5f, -0.5f};
+    float Y1[2] = {0, 0}, Y2[2] = {0, 0};
+    size_t ids1[2] = {99, 99}, ids2[2] = {99, 99};
+    float w1[2] = {0, 0}, w2[2] = {0, 0};
+    float lg1[3] = {0, 0, 0}, lg2[3] = {0, 0, 0};
+    float Gs1[2] = {0, 0}, Gs2[2] = {0, 0};
+    float Us1[2] = {0, 0}, Us2[2] = {0, 0};
+    float Ys1[4] = {0, 0, 0, 0}, Ys2[4] = {0, 0, 0, 0};
+    float Gsel1[2] = {0, 0}, Gsel2[2] = {0, 0};
+    float Usel1[2] = {0, 0}, Usel2[2] = {0, 0};
+    int rc1 = jt_moe_fwd(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Y1,
+                         2, 1, 3, 2, 1, ids1, w1, lg1, Gsel1, Usel1,
+                         Ys1, Gs1, Us1);
+    int rc2 = jt_moe_fwd_unchecked(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s,
+                                   Y2, 2, 1, 3, 2, 1, ids2, w2, lg2,
+                                   Gsel2, Usel2, Ys2, Gs2, Us2);
+    CHECK(rc1 == JT_OK && rc2 == JT_OK, "unchecked fwd rc %d/%d", rc1,
+          rc2);
+    if (rc1 == JT_OK && rc2 == JT_OK) {
+        CHECK(memcmp(Y1, Y2, sizeof(Y1)) == 0, "unchecked fwd Y bits");
+        CHECK(memcmp(ids1, ids2, sizeof(ids1)) == 0,
+              "unchecked fwd ids bits");
+        CHECK(memcmp(w1, w2, sizeof(w1)) == 0,
+              "unchecked fwd weights bits");
+        CHECK(memcmp(lg1, lg2, sizeof(lg1)) == 0,
+              "unchecked fwd logits bits");
+        CHECK(memcmp(Gsel1, Gsel2, sizeof(Gsel1)) == 0,
+              "unchecked fwd Gsel bits");
+        CHECK(memcmp(Usel1, Usel2, sizeof(Usel1)) == 0,
+              "unchecked fwd Usel bits");
+        CHECK(memcmp(Ys1, Ys2, sizeof(Ys1)) == 0,
+              "unchecked fwd Ysel bits");
+        CHECK(memcmp(Gs1, Gs2, sizeof(Gs1)) == 0,
+              "unchecked fwd Gs bits");
+        CHECK(memcmp(Us1, Us2, sizeof(Us1)) == 0,
+              "unchecked fwd Us bits");
+    }
+    // bwd一致 (fwd産ids/weights/cacheをそのまま渡す)。
+    {
+        float dY[2] = {0.7f, -0.3f};
+        float dX1[2] = {0, 0}, dX2[2] = {0, 0};
+        float dg1[6] = {0}, dg2[6] = {0};
+        float gg1[6] = {0}, gg2[6] = {0};
+        float gu1[6] = {0}, gu2[6] = {0};
+        float gd1[6] = {0}, gd2[6] = {0};
+        float sg1[2] = {0}, sg2[2] = {0};
+        float su1[2] = {0}, su2[2] = {0};
+        float sd1[2] = {0}, sd2[2] = {0};
+        float dl1[3] = {0}, dl2[3] = {0};
+        int br1 = jt_moe_bwd(dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s,
+                             ids1, w1, Gsel1, Usel1, Ys1, Gs1, Us1, dX1,
+                             dg1, gg1, gu1, gd1, sg1, su1, sd1, dl1, 2, 1,
+                             3, 2, 1);
+        int br2 = jt_moe_bwd_unchecked(dY, X, Wgate, Wg, Wu, Wd, Wg_s,
+                                       Wu_s, Wd_s, ids1, w1, Gsel1,
+                                       Usel1, Ys1, Gs1, Us1, dX2, dg2,
+                                       gg2, gu2, gd2, sg2, su2, sd2, dl2,
+                                       2, 1, 3, 2, 1);
+        CHECK(br1 == JT_OK && br2 == JT_OK, "unchecked bwd rc %d/%d",
+              br1, br2);
+        if (br1 == JT_OK && br2 == JT_OK) {
+            CHECK(memcmp(dX1, dX2, sizeof(dX1)) == 0,
+                  "unchecked bwd dX bits");
+            CHECK(memcmp(dg1, dg2, sizeof(dg1)) == 0,
+                  "unchecked bwd dWgate bits");
+            CHECK(memcmp(gg1, gg2, sizeof(gg1)) == 0,
+                  "unchecked bwd dWg bits");
+            CHECK(memcmp(gu1, gu2, sizeof(gu1)) == 0,
+                  "unchecked bwd dWu bits");
+            CHECK(memcmp(gd1, gd2, sizeof(gd1)) == 0,
+                  "unchecked bwd dWd bits");
+            CHECK(memcmp(sg1, sg2, sizeof(sg1)) == 0,
+                  "unchecked bwd dWg_s bits");
+            CHECK(memcmp(su1, su2, sizeof(su1)) == 0,
+                  "unchecked bwd dWu_s bits");
+            CHECK(memcmp(sd1, sd2, sizeof(sd1)) == 0,
+                  "unchecked bwd dWd_s bits");
+            CHECK(memcmp(dl1, dl2, sizeof(dl1)) == 0,
+                  "unchecked bwd dLogits bits");
+        }
+    }
+}
+
 int main(void) {
     test_fwd_known();
     test_grad();
     test_topk_mask();
     test_sticky_seq();
     test_invalid();
+    test_unchecked_match();
     if (g_fail != 0) {
         fprintf(stderr, "moe_layer: FAIL\n");
         return 1;

@@ -81,6 +81,23 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
                   float *restrict dWg, float *restrict dWu,
                   float *restrict dWd, int n, int h);
 
+// jt_swiglu_bwd の入力有限スキャンを省略する内部高速経路。
+// 通常APIと同一の計算核 (bit一致)。省略するのは入力バッファの
+// O(n)/O(h*n) 有限プリスキャンのみで、NULL/次元検査と計算途中の
+// isfiniteガード (acc等、O(出力)で安価) は残る。
+// [unchecked使用条件] 呼び出し側が当該区間で以下を保証する場合のみ:
+//   (1) 重み・入力バッファを事前に有限検証済みであること、
+//   (2) 当該区間で重みバッファが不変であること (更新は区間外)。
+// 活性化由来の非有限は計算途中ガード・loss合算点・更新前ガードで検出する。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用: NULL・次元不正・途中非有限)。
+int jt_swiglu_bwd_unchecked(const float *restrict dY,
+                            const float *restrict X,
+                            const float *restrict G, const float *restrict U,
+                            const float *restrict Wd, const float *restrict Wg,
+                            const float *restrict Wu, float *restrict dX,
+                            float *restrict dWg, float *restrict dWu,
+                            float *restrict dWd, int n, int h);
+
 // RMSNormの逆伝播 (最小実装)。
 // forward定義: r = 1/sqrt(mean(X^2)+eps), Y[i] = W[i]*X[i]*r。
 //   dW[i] = dY[i]*X[i]*r
@@ -105,6 +122,19 @@ int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
                   const float *restrict Wu, const float *restrict Wd,
                   float *restrict G, float *restrict U,
                   float *restrict Y, int n, int h);
+
+// jt_swiglu_fwd の入力有限スキャンを省略する内部高速経路。
+// 通常APIと同一の計算核 (bit一致)。省略するのは入力バッファの
+// O(n)/O(h*n) 有限プリスキャンのみで、NULL/次元検査と計算途中の
+// isfiniteガード (g/u/acc等、O(出力)で安価) は残る。
+// [unchecked使用条件] jt_swiglu_bwd_uncheckedに同じ (事前検証済み＋区間内不変)。
+// 活性化由来の非有限は計算途中ガード・loss合算点・更新前ガードで検出する。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用: NULL・次元不正・途中非有限)。
+int jt_swiglu_fwd_unchecked(const float *restrict X,
+                            const float *restrict Wg,
+                            const float *restrict Wu, const float *restrict Wd,
+                            float *restrict G, float *restrict U,
+                            float *restrict Y, int n, int h);
 
 // RMSNormの順伝播 (jt_rmsnorm_bwdと整合するforward核)。
 // 定義: r = 1/sqrt(mean(X^2)+eps), Y[i] = W[i]*X[i]*r (内部double累積)。

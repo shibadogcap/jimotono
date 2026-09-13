@@ -354,12 +354,16 @@ static double jt_bwd_sigmoid(double z) {
     return 1.0 / (1.0 + exp(-z));
 }
 
-int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
-                  const float *restrict G, const float *restrict U,
-                  const float *restrict Wd, const float *restrict Wg,
-                  const float *restrict Wu, float *restrict dX,
-                  float *restrict dWg, float *restrict dWu,
-                  float *restrict dWd, int n, int h) {
+static int jt_swiglu_bwd_impl(const float *restrict dY,
+                                const float *restrict X,
+                                const float *restrict G,
+                                const float *restrict U,
+                                const float *restrict Wd,
+                                const float *restrict Wg,
+                                const float *restrict Wu, float *restrict dX,
+                                float *restrict dWg, float *restrict dWu,
+                                float *restrict dWd, int n, int h,
+                                int validate) {
     int rc = JT_ERR_INVAL;
     if (dY == NULL || X == NULL || G == NULL || U == NULL || Wd == NULL ||
         Wg == NULL || Wu == NULL || dX == NULL || dWg == NULL ||
@@ -371,15 +375,19 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
         errno = EINVAL;
         goto cleanup;
     }
-    if (!jt_bwd_all_finite(dY, (size_t)n) ||
-        !jt_bwd_all_finite(X, (size_t)n) ||
-        !jt_bwd_all_finite(G, (size_t)h) ||
-        !jt_bwd_all_finite(U, (size_t)h) ||
-        !jt_bwd_all_finite(Wd, (size_t)h * (size_t)n) ||
-        !jt_bwd_all_finite(Wg, (size_t)h * (size_t)n) ||
-        !jt_bwd_all_finite(Wu, (size_t)h * (size_t)n)) {
-        errno = EINVAL;
-        goto cleanup;
+    // 入力有限プリスキャン (O(n)+O(h*n)) はvalidate時のみ。uncheckedでは
+    // 呼び出し側の事前検証＋区間内不変に委ね、ここでは省略する。
+    if (validate) {
+        if (!jt_bwd_all_finite(dY, (size_t)n) ||
+            !jt_bwd_all_finite(X, (size_t)n) ||
+            !jt_bwd_all_finite(G, (size_t)h) ||
+            !jt_bwd_all_finite(U, (size_t)h) ||
+            !jt_bwd_all_finite(Wd, (size_t)h * (size_t)n) ||
+            !jt_bwd_all_finite(Wg, (size_t)h * (size_t)n) ||
+            !jt_bwd_all_finite(Wu, (size_t)h * (size_t)n)) {
+            errno = EINVAL;
+            goto cleanup;
+        }
     }
 
     {
@@ -389,6 +397,9 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
         static const int kMax = JT_BWD_MAX_WIDE;
         double dg[JT_BWD_MAX_WIDE];
         double du[JT_BWD_MAX_WIDE];
+        // s[i] = silu(G[i])*U[i] の保存域。下のdWループでsigmoid再計算を
+        // 省くための使い回し (同一入力→同一ビットのため数値は不変)。
+        double ss[JT_BWD_MAX_WIDE];
         if (h > kMax) {
             errno = EINVAL;
             goto cleanup;
@@ -407,6 +418,7 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
             }
             dg[i] = acc * ui * dsilu;
             du[i] = acc * silu;
+            ss[i] = silu * ui;
             (void)silu;
         }
         // DESIGN.MD §4.1: dXを先に計算して伝播させ、dWは後回し。
@@ -420,17 +432,15 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
             dX[j] = (float)acc;
         }
         // dWは後回し (上記dX転送とパイプライン化可能)。
-        // dWd[i,j] = s[i]*dY[j] (sはforward中間値の再計算)。
+        // dWd[i,j] = s[i]*dY[j] (sは上記ループで保存した中間値の使い回し。
+        // sigmoid再計算を省く。同一入力の再評価のためビット不変)。
         for (int i = 0; i < h; i++) {
             float *dwg = dWg + (size_t)i * (size_t)n;
             float *dwu = dWu + (size_t)i * (size_t)n;
             float *dwd = dWd + (size_t)i * (size_t)n;
             double gi_d = dg[i];
             double ui_d = du[i];
-            double gi = (double)G[i];
-            double ui = (double)U[i];
-            double sig = jt_bwd_sigmoid(gi);
-            double s = gi * sig * ui;
+            double s = ss[i];
             for (int j = 0; j < n; j++) {
                 double xj = (double)X[j];
                 dwg[j] = (float)(gi_d * xj);
@@ -443,6 +453,29 @@ int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
     rc = JT_OK;
 cleanup:
     return rc;
+}
+
+// 公開API (検証あり、従来通りfail-closed)。
+int jt_swiglu_bwd(const float *restrict dY, const float *restrict X,
+                  const float *restrict G, const float *restrict U,
+                  const float *restrict Wd, const float *restrict Wg,
+                  const float *restrict Wu, float *restrict dX,
+                  float *restrict dWg, float *restrict dWu,
+                  float *restrict dWd, int n, int h) {
+    return jt_swiglu_bwd_impl(dY, X, G, U, Wd, Wg, Wu, dX, dWg, dWu, dWd,
+                              n, h, 1);
+}
+
+// 内部高速経路 (入力有限スキャンなし。ヘッダの使用条件コメント参照)。
+int jt_swiglu_bwd_unchecked(const float *restrict dY,
+                            const float *restrict X,
+                            const float *restrict G, const float *restrict U,
+                            const float *restrict Wd, const float *restrict Wg,
+                            const float *restrict Wu, float *restrict dX,
+                            float *restrict dWg, float *restrict dWu,
+                            float *restrict dWd, int n, int h) {
+    return jt_swiglu_bwd_impl(dY, X, G, U, Wd, Wg, Wu, dX, dWg, dWu, dWd,
+                              n, h, 0);
 }
 
 int jt_rmsnorm_bwd(const float *restrict dY, const float *restrict X,
@@ -499,10 +532,11 @@ cleanup:
 }
 
 // SwiGLU順伝播 (bwd前提式と同一。double累積 + double sigmoid)。
-int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
-                  const float *restrict Wu, const float *restrict Wd,
-                  float *restrict G, float *restrict U,
-                  float *restrict Y, int n, int h) {
+static int jt_swiglu_fwd_impl(const float *restrict X,
+                              const float *restrict Wg,
+                              const float *restrict Wu, const float *restrict Wd,
+                              float *restrict G, float *restrict U,
+                              float *restrict Y, int n, int h, int validate) {
     int rc = JT_ERR_INVAL;
     if (X == NULL || Wg == NULL || Wu == NULL || Wd == NULL || G == NULL ||
         U == NULL || Y == NULL) {
@@ -513,12 +547,16 @@ int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
         errno = EINVAL;
         goto cleanup;
     }
-    if (!jt_bwd_all_finite(X, (size_t)n) ||
-        !jt_bwd_all_finite(Wg, (size_t)h * (size_t)n) ||
-        !jt_bwd_all_finite(Wu, (size_t)h * (size_t)n) ||
-        !jt_bwd_all_finite(Wd, (size_t)h * (size_t)n)) {
-        errno = EINVAL;
-        goto cleanup;
+    // 入力有限プリスキャン (O(n)+O(h*n)) はvalidate時のみ。uncheckedでは
+    // 呼び出し側の事前検証＋区間内不変に委ね、ここでは省略する。
+    if (validate) {
+        if (!jt_bwd_all_finite(X, (size_t)n) ||
+            !jt_bwd_all_finite(Wg, (size_t)h * (size_t)n) ||
+            !jt_bwd_all_finite(Wu, (size_t)h * (size_t)n) ||
+            !jt_bwd_all_finite(Wd, (size_t)h * (size_t)n)) {
+            errno = EINVAL;
+            goto cleanup;
+        }
     }
 
     {
@@ -586,6 +624,23 @@ int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
     rc = JT_OK;
 cleanup:
     return rc;
+}
+
+// 公開API (検証あり、従来通りfail-closed)。
+int jt_swiglu_fwd(const float *restrict X, const float *restrict Wg,
+                  const float *restrict Wu, const float *restrict Wd,
+                  float *restrict G, float *restrict U,
+                  float *restrict Y, int n, int h) {
+    return jt_swiglu_fwd_impl(X, Wg, Wu, Wd, G, U, Y, n, h, 1);
+}
+
+// 内部高速経路 (入力有限スキャンなし。ヘッダの使用条件コメント参照)。
+int jt_swiglu_fwd_unchecked(const float *restrict X,
+                            const float *restrict Wg,
+                            const float *restrict Wu, const float *restrict Wd,
+                            float *restrict G, float *restrict U,
+                            float *restrict Y, int n, int h) {
+    return jt_swiglu_fwd_impl(X, Wg, Wu, Wd, G, U, Y, n, h, 0);
 }
 
 // RMSNorm順伝播 (bwd前提式と同一。double累積)。

@@ -79,6 +79,31 @@ int jt_moe_fwd(const float *restrict X,
                float *restrict cache_Ysel,
                float *restrict cache_Gs, float *restrict cache_Us);
 
+// jt_moe_fwd の重み有限スキャンを省略する内部高速経路。
+// 通常APIと同一の計算核 (bit一致)。省略するのは重みバッファの
+// O(E*H*N) 有限プリスキャンと内側 jt_swiglu_fwd の重みスキャンのみで、
+// NULL/次元検査・logits/重み範囲検査 (O(k))・計算途中のisfiniteガード
+// (gate acc・yacc等、O(出力)で安価)・内側 routing_topk のNaN検査は残る。
+// [unchecked使用条件] 呼び出し側が当該区間で以下を保証する場合のみ:
+//   (1) 全重みバッファを区間冒頭で有限検証済みであること、
+//   (2) 当該区間で重みバッファが不変であること (更新は区間外)。
+// 活性化由来の非有限は計算途中ガード・loss合算点・更新前ガードで検出する
+// (train_longrunではステップ冒頭のP全走査＋loss/gradガードが該当)。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用: NULL・次元不正・途中非有限)。
+int jt_moe_fwd_unchecked(const float *restrict X,
+                         const float *restrict Wgate,
+                         const float *restrict Wg, const float *restrict Wu,
+                         const float *restrict Wd,
+                         const float *restrict Wg_s, const float *restrict Wu_s,
+                         const float *restrict Wd_s,
+                         float *restrict Y,
+                         int n, int h, int n_experts, int topk, int n_shared,
+                         size_t *restrict out_ids, float *restrict out_weights,
+                         float *restrict out_logits,
+                         float *restrict cache_Gsel, float *restrict cache_Usel,
+                         float *restrict cache_Ysel,
+                         float *restrict cache_Gs, float *restrict cache_Us);
+
 // MoE逆伝播 (1トークン分)。
 //   dY: [n] 上流勾配 (定数扱い)。X/W群はfwdと同一値。
 //   ids [k], weights [k]: fwdのout_ids/out_weightsと同一値。
@@ -111,6 +136,35 @@ int jt_moe_bwd(const float *restrict dY, const float *restrict X,
                float *restrict dWd_s,
                float *restrict dLogits,
                int n, int h, int n_experts, int topk, int n_shared);
+
+// jt_moe_bwd の重み・キャッシュ有限スキャンを省略する内部高速経路。
+// 通常APIと同一の計算核 (bit一致)。省略するのは重み・キャッシュ・活性化
+// バッファの O(E*H*N) 有限プリスキャンと内側 jt_swiglu_bwd の重みスキャン
+// のみで、NULL/次元検査・計算途中のisfiniteガード (dw_dp・dlog・dx_acc等、
+// O(出力)で安価) は残る。ids/weightsの範囲・重複・総和検査 (O(k^2)) も
+// 省略するため、ids/weightsは同一ステップ内fwd産の値をそのまま渡すこと。
+// [unchecked使用条件] jt_moe_fwd_uncheckedに同じ (事前検証済み＋区間内不変)。
+// 活性化由来の非有限は計算途中ガード・loss合算点・更新前ガードで検出する。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用: NULL・次元不正・途中非有限)。
+int jt_moe_bwd_unchecked(const float *restrict dY, const float *restrict X,
+                         const float *restrict Wgate,
+                         const float *restrict Wg, const float *restrict Wu,
+                         const float *restrict Wd,
+                         const float *restrict Wg_s, const float *restrict Wu_s,
+                         const float *restrict Wd_s,
+                         const size_t *restrict ids,
+                         const float *restrict weights,
+                         const float *restrict Gsel, const float *restrict Usel,
+                         const float *restrict Ysel,
+                         const float *restrict Gs, const float *restrict Us,
+                         float *restrict dX,
+                         float *restrict dWgate,
+                         float *restrict dWg, float *restrict dWu,
+                         float *restrict dWd,
+                         float *restrict dWg_s, float *restrict dWu_s,
+                         float *restrict dWd_s,
+                         float *restrict dLogits,
+                         int n, int h, int n_experts, int topk, int n_shared);
 
 // StickyMoE損失の系列合算ヘルパー。
 //   gates: [T][n] row-majorのgate分布 (routedのみ)。

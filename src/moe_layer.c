@@ -41,19 +41,25 @@ static int jt_moe_all_finite(const float *restrict x, size_t n) {
     return 1;
 }
 
-int jt_moe_fwd(const float *restrict X,
-               const float *restrict Wgate,
-               const float *restrict Wg, const float *restrict Wu,
-               const float *restrict Wd,
-               const float *restrict Wg_s, const float *restrict Wu_s,
-               const float *restrict Wd_s,
-               float *restrict Y,
-               int n, int h, int n_experts, int topk, int n_shared,
-               size_t *restrict out_ids, float *restrict out_weights,
-               float *restrict out_logits,
-               float *restrict cache_Gsel, float *restrict cache_Usel,
-               float *restrict cache_Ysel,
-               float *restrict cache_Gs, float *restrict cache_Us) {
+static int jt_moe_fwd_impl(const float *restrict X,
+                             const float *restrict Wgate,
+                             const float *restrict Wg,
+                             const float *restrict Wu,
+                             const float *restrict Wd,
+                             const float *restrict Wg_s,
+                             const float *restrict Wu_s,
+                             const float *restrict Wd_s,
+                             float *restrict Y,
+                             int n, int h, int n_experts, int topk,
+                             int n_shared,
+                             size_t *restrict out_ids,
+                             float *restrict out_weights,
+                             float *restrict out_logits,
+                             float *restrict cache_Gsel,
+                             float *restrict cache_Usel,
+                             float *restrict cache_Ysel,
+                             float *restrict cache_Gs,
+                             float *restrict cache_Us, int validate) {
     int rc = JT_ERR_INVAL;
     if (X == NULL || Wgate == NULL || Wg == NULL || Wu == NULL ||
         Wd == NULL || Y == NULL || out_ids == NULL ||
@@ -72,7 +78,9 @@ int jt_moe_fwd(const float *restrict X,
         }
     }
     // 入力の有限検査 (fail-closed: Y更新前に拒否)。
-    {
+    // O(E*H*N)の全重み走査はvalidate時のみ。uncheckedでは呼び出し側の
+    // ステップ冒頭検証＋区間内不変に委ね、ここでは省略する。
+    if (validate) {
         size_t e = (size_t)n_experts;
         size_t nn = (size_t)n;
         size_t hh = (size_t)h;
@@ -160,7 +168,13 @@ int jt_moe_fwd(const float *restrict X,
             float *Yp = (cache_Ysel != NULL)
                             ? (cache_Ysel + (size_t)p * (size_t)n)
                             : tmpY;
-            int frc = jt_swiglu_fwd(X, wgr, wur, wdr, Gp, Up, Yp, n, h);
+            // unchecked区間では内側の重みスキャンも省略 (外側の冒頭検証に一元化)。
+            // 同一計算核のためbit一致。routing_topkはO(E)で安価なため検証版のまま。
+            int frc = validate
+                          ? jt_swiglu_fwd(X, wgr, wur, wdr, Gp, Up, Yp, n,
+                                          h)
+                          : jt_swiglu_fwd_unchecked(X, wgr, wur, wdr, Gp, Up,
+                                                    Yp, n, h);
             if (frc != JT_OK) {
                 goto cleanup;  // errnoは下位で設定済み。Yは未更新。
             }
@@ -183,7 +197,11 @@ int jt_moe_fwd(const float *restrict X,
                             ? (cache_Us + (size_t)s * (size_t)h)
                             : tmpU;
             // Ysはyaccへ直接加算するためtmpYへ出力する (cache_Ysは持たない)。
-            int frc = jt_swiglu_fwd(X, wgr, wur, wdr, Gp, Up, tmpY, n, h);
+            int frc = validate
+                          ? jt_swiglu_fwd(X, wgr, wur, wdr, Gp, Up, tmpY, n,
+                                          h)
+                          : jt_swiglu_fwd_unchecked(X, wgr, wur, wdr, Gp, Up,
+                                                    tmpY, n, h);
             if (frc != JT_OK) {
                 goto cleanup;
             }
@@ -213,7 +231,47 @@ cleanup:
     return rc;
 }
 
-int jt_moe_bwd(const float *restrict dY, const float *restrict X,
+// 公開API (検証あり、従来通りfail-closed)。
+int jt_moe_fwd(const float *restrict X,
+               const float *restrict Wgate,
+               const float *restrict Wg, const float *restrict Wu,
+               const float *restrict Wd,
+               const float *restrict Wg_s, const float *restrict Wu_s,
+               const float *restrict Wd_s,
+               float *restrict Y,
+               int n, int h, int n_experts, int topk, int n_shared,
+               size_t *restrict out_ids, float *restrict out_weights,
+               float *restrict out_logits,
+               float *restrict cache_Gsel, float *restrict cache_Usel,
+               float *restrict cache_Ysel,
+               float *restrict cache_Gs, float *restrict cache_Us) {
+    return jt_moe_fwd_impl(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Y, n, h,
+                           n_experts, topk, n_shared, out_ids, out_weights,
+                           out_logits, cache_Gsel, cache_Usel, cache_Ysel,
+                           cache_Gs, cache_Us, 1);
+}
+
+// 内部高速経路 (重み有限スキャンなし。ヘッダの使用条件コメント参照)。
+int jt_moe_fwd_unchecked(const float *restrict X,
+                         const float *restrict Wgate,
+                         const float *restrict Wg, const float *restrict Wu,
+                         const float *restrict Wd,
+                         const float *restrict Wg_s, const float *restrict Wu_s,
+                         const float *restrict Wd_s,
+                         float *restrict Y,
+                         int n, int h, int n_experts, int topk, int n_shared,
+                         size_t *restrict out_ids, float *restrict out_weights,
+                         float *restrict out_logits,
+                         float *restrict cache_Gsel, float *restrict cache_Usel,
+                         float *restrict cache_Ysel,
+                         float *restrict cache_Gs, float *restrict cache_Us) {
+    return jt_moe_fwd_impl(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Y, n, h,
+                           n_experts, topk, n_shared, out_ids, out_weights,
+                           out_logits, cache_Gsel, cache_Usel, cache_Ysel,
+                           cache_Gs, cache_Us, 0);
+}
+
+static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
                const float *restrict Wgate,
                const float *restrict Wg, const float *restrict Wu,
                const float *restrict Wd,
@@ -230,7 +288,8 @@ int jt_moe_bwd(const float *restrict dY, const float *restrict X,
                float *restrict dWg_s, float *restrict dWu_s,
                float *restrict dWd_s,
                float *restrict dLogits,
-               int n, int h, int n_experts, int topk, int n_shared) {
+               int n, int h, int n_experts, int topk, int n_shared,
+               int validate) {
     int rc = JT_ERR_INVAL;
     if (dY == NULL || X == NULL || Wgate == NULL || Wg == NULL ||
         Wu == NULL || Wd == NULL || ids == NULL || weights == NULL ||
@@ -252,7 +311,11 @@ int jt_moe_bwd(const float *restrict dY, const float *restrict X,
         }
     }
     // 有限検査 (出力更新前に全入力を検査)。
-    {
+    // O(E*H*N)の全重み・キャッシュ走査はvalidate時のみ。uncheckedでは
+    // 呼び出し側のステップ冒頭検証＋区間内不変に委ね、ここでは省略する。
+    // ids/weightsの範囲検査 (O(k^2)) も省略し、同一ステップ内fwd産の値を
+    // そのまま受け取る。計算途中のisfiniteガードは両経路で残る。
+    if (validate) {
         size_t e = (size_t)n_experts;
         size_t nn = (size_t)n;
         size_t hh = (size_t)h;
@@ -424,8 +487,13 @@ int jt_moe_bwd(const float *restrict dY, const float *restrict X,
             float *oWg = dWg + e * (size_t)h * (size_t)n;
             float *oWu = dWu + e * (size_t)h * (size_t)n;
             float *oWd = dWd + e * (size_t)h * (size_t)n;
-            int brc = jt_swiglu_bwd(dYe, X, Gp, Up, wdr, wgr, wur, dxe,
-                                    oWg, oWu, oWd, n, h);
+            // unchecked区間では内側の重みスキャンも省略 (外側の冒頭検証に一元化)。
+            int brc = validate ? jt_swiglu_bwd(dYe, X, Gp, Up, wdr, wgr,
+                                               wur, dxe, oWg, oWu, oWd, n,
+                                               h)
+                               : jt_swiglu_bwd_unchecked(dYe, X, Gp, Up, wdr,
+                                                         wgr, wur, dxe, oWg,
+                                                         oWu, oWd, n, h);
             if (brc != JT_OK) {
                 goto cleanup;  // errnoは下位で設定済み
             }
@@ -457,8 +525,11 @@ int jt_moe_bwd(const float *restrict dY, const float *restrict X,
             float *oWg = dWg_s + (size_t)s * (size_t)h * (size_t)n;
             float *oWu = dWu_s + (size_t)s * (size_t)h * (size_t)n;
             float *oWd = dWd_s + (size_t)s * (size_t)h * (size_t)n;
-            int brc = jt_swiglu_bwd(dY, X, Gp, Up, wdr, wgr, wur, dxe,
-                                    oWg, oWu, oWd, n, h);
+            int brc = validate ? jt_swiglu_bwd(dY, X, Gp, Up, wdr, wgr, wur,
+                                               dxe, oWg, oWu, oWd, n, h)
+                               : jt_swiglu_bwd_unchecked(dY, X, Gp, Up, wdr,
+                                                         wgr, wur, dxe, oWg,
+                                                         oWu, oWd, n, h);
             if (brc != JT_OK) {
                 goto cleanup;
             }
@@ -481,6 +552,57 @@ int jt_moe_bwd(const float *restrict dY, const float *restrict X,
     rc = JT_OK;
 cleanup:
     return rc;
+}
+
+// 公開API (検証あり、従来通りfail-closed)。
+int jt_moe_bwd(const float *restrict dY, const float *restrict X,
+               const float *restrict Wgate,
+               const float *restrict Wg, const float *restrict Wu,
+               const float *restrict Wd,
+               const float *restrict Wg_s, const float *restrict Wu_s,
+               const float *restrict Wd_s,
+               const size_t *restrict ids, const float *restrict weights,
+               const float *restrict Gsel, const float *restrict Usel,
+               const float *restrict Ysel,
+               const float *restrict Gs, const float *restrict Us,
+               float *restrict dX,
+               float *restrict dWgate,
+               float *restrict dWg, float *restrict dWu,
+               float *restrict dWd,
+               float *restrict dWg_s, float *restrict dWu_s,
+               float *restrict dWd_s,
+               float *restrict dLogits,
+               int n, int h, int n_experts, int topk, int n_shared) {
+    return jt_moe_bwd_impl(dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, ids,
+                           weights, Gsel, Usel, Ysel, Gs, Us, dX, dWgate,
+                           dWg, dWu, dWd, dWg_s, dWu_s, dWd_s, dLogits, n, h,
+                           n_experts, topk, n_shared, 1);
+}
+
+// 内部高速経路 (重み・キャッシュ有限スキャンなし。ヘッダの使用条件コメント参照)。
+int jt_moe_bwd_unchecked(const float *restrict dY, const float *restrict X,
+                         const float *restrict Wgate,
+                         const float *restrict Wg, const float *restrict Wu,
+                         const float *restrict Wd,
+                         const float *restrict Wg_s, const float *restrict Wu_s,
+                         const float *restrict Wd_s,
+                         const size_t *restrict ids,
+                         const float *restrict weights,
+                         const float *restrict Gsel, const float *restrict Usel,
+                         const float *restrict Ysel,
+                         const float *restrict Gs, const float *restrict Us,
+                         float *restrict dX,
+                         float *restrict dWgate,
+                         float *restrict dWg, float *restrict dWu,
+                         float *restrict dWd,
+                         float *restrict dWg_s, float *restrict dWu_s,
+                         float *restrict dWd_s,
+                         float *restrict dLogits,
+                         int n, int h, int n_experts, int topk, int n_shared) {
+    return jt_moe_bwd_impl(dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, ids,
+                           weights, Gsel, Usel, Ysel, Gs, Us, dX, dWgate,
+                           dWg, dWu, dWd, dWg_s, dWu_s, dWd_s, dLogits, n, h,
+                           n_experts, topk, n_shared, 0);
 }
 
 int jt_moe_sticky_seq_loss(const float *restrict gates, size_t T, size_t n,
