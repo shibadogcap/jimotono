@@ -171,7 +171,7 @@ static void ts_usage(const char *prog) {
             "[--layers L] [--val-every K] [--patience P] [--vocab V] "
             "[--max-stories N] [--max-val-pairs N]\n"
             "  defaults: data=data/tinystories_head16M.txt "
-            "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=1e-3 "
+            "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=3e-4 "
             "batch=64 d=64 layers=2 val-every=100 patience=100 vocab=258 "
             "max-stories=0(all) max-val-pairs=20000\n"
             "  --vocab: 258 (byte+special) or 50257 (structural only) \n"
@@ -669,7 +669,7 @@ int main(int argc, char **argv) {
     int use_pack_opt = 0;
     long max_steps = 500;
     double time_limit = 3600.0;
-    float lr = 1e-3f;
+    float lr = 3e-4f;  //既定: 1e-3は1645 stepで発散実績のため3e-4
     long batch = 64;
     int d = 64;
     int n_layers = 2;
