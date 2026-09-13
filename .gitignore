@@ -1,0 +1,12 @@
+build-*/
+artifacts/ckpt/*
+artifacts/quant/*
+artifacts/lut/*
+artifacts/kv/*
+artifacts/route/*
+!artifacts/ckpt/.gitkeep
+!artifacts/quant/.gitkeep
+!artifacts/lut/.gitkeep
+!artifacts/kv/.gitkeep
+!artifacts/route/.gitkeep
+.DS_Store

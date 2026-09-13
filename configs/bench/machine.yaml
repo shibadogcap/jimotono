@@ -1,0 +1,11 @@
+# JIMOTONO bench machine config (ROADMAP 5.1: 計測前提の記録用)
+# 使い方: ベンチ実行前にこのファイルをコピーし、実測値を埋めて results/bench/ に保存。
+machine: "macmini-i7-8700B"   # 例: N100 / i5-8th / RyzenAI360
+os: "macOS"
+cpu: "Intel i7-8700B"
+cores_pinned: "taskset/cpu affinityの記録"
+freq_locked: false
+build_commit: "<git hash>"
+build_type: "RelWithDebInfo"
+notes: "ブラウザ・エディタ有無、温度、外乱を記録"
+trials: 11   # 中央値+MAD用 (N回計測)
