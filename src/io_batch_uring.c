@@ -12,9 +12,8 @@
 // エラー時の取り消しは行わない)。
 //
 // liburing無効ビルド (JIMOTONO_USE_URING=OFF既定) および非Linuxでは
-// fallback stub (JT_ERR_INVAL + errno=ENOSYS) を返す。
-// TODO(NOSUP追従): MINOR-1で JT_ERR_NOSUP が新設され次第、本fallbackの
-// JT_ERR_INVAL+ENOSYS を JT_ERR_NOSUP に置き換える。common.hには手を出さない。
+// fallback stub (JT_ERR_NOSUP + errno=ENOSYS) を返す。
+// NOSUP追従済み (MINOR-1): JT_ERR_NOSUP新設に伴い JT_ERR_INVAL+ENOSYS から置換済み。
 
 #include "jimotono/io_batch.h"
 
@@ -250,8 +249,8 @@ cleanup:
 #else
 // ---- fallback stub (非Linux または HAVE_LIBURING未定義) ----
 // buffered同期版 jt_io_pread_batch を呼び出し側で使うこと。
-// TODO(NOSUP追従): MINOR-1で JT_ERR_NOSUP が新設され次第、本fallbackの
-// JT_ERR_INVAL+ENOSYS を JT_ERR_NOSUP に置き換える。common.hには手を出さない。
+// NOSUP追従済み (MINOR-1): 正常入力(n>0)は JT_ERR_NOSUP+errno=ENOSYS を返す。
+// n==0は JT_OK (fd/specs検証なし)。
 int jt_io_pread_batch_uring(int fd, const jt_io_spec_t *restrict specs, size_t n) {
     if (n == 0) {
         return JT_OK;
@@ -259,6 +258,6 @@ int jt_io_pread_batch_uring(int fd, const jt_io_spec_t *restrict specs, size_t n
     (void)fd;
     (void)specs;
     errno = ENOSYS;
-    return JT_ERR_INVAL;
+    return JT_ERR_NOSUP;
 }
 #endif
