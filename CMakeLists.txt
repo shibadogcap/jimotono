@@ -154,6 +154,11 @@ if(JIMOTONO_BUILD_BENCH)
   # train_longrun: 長時間学習ベンチ (実行バイナリのみ。ctestには追加しない)。
   add_executable(train_longrun bench/kernel/train_longrun.c)
   target_link_libraries(train_longrun PRIVATE jimotono_core)
+
+  # train_proxy100m: active約100M/総約1B級の実学習ループproxy (Phase F準備)。
+  # 実行バイナリのみ。ctestには追加しない (重負荷のため)。
+  add_executable(train_proxy100m bench/kernel/train_proxy100m.c)
+  target_link_libraries(train_proxy100m PRIVATE jimotono_core)
 endif()
 
 enable_testing()
