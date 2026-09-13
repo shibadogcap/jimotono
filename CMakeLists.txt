@@ -33,8 +33,13 @@ endif()
 # ---- core library ----
 add_library(jimotono_core
   src/arena.c
+  src/tmac.c
 )
 target_include_directories(jimotono_core PUBLIC include)
+# tmac.c uses round()/isfinite() from <math.h>; libm needed on Linux.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(jimotono_core PUBLIC m)
+endif()
 
 # ---- microbenchmarks (ROADMAP 5.2: harness + cases + metric) ----
 if(JIMOTONO_BUILD_BENCH)
@@ -52,6 +57,7 @@ endif()
 enable_testing()
 if(JIMOTONO_BUILD_BENCH)
   add_test(NAME arena COMMAND test_arena)
+  add_test(NAME tmac COMMAND bench_tmac)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
