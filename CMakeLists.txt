@@ -34,10 +34,11 @@ endif()
 add_library(jimotono_core
   src/arena.c
   src/tmac.c
+  src/gdn2.c
 )
 target_include_directories(jimotono_core PUBLIC include)
-# tmac.c uses round()/isfinite() from <math.h>; libm needed on Linux.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# tmac.c/gdn2.c use round()/isfinite()/exp() from <math.h>; libm on Unix.
+if(UNIX)
   target_link_libraries(jimotono_core PUBLIC m)
 endif()
 
@@ -58,6 +59,7 @@ enable_testing()
 if(JIMOTONO_BUILD_BENCH)
   add_test(NAME arena COMMAND test_arena)
   add_test(NAME tmac COMMAND bench_tmac)
+  add_test(NAME gdn2 COMMAND bench_gdn2)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
