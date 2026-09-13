@@ -628,11 +628,32 @@ static void test_rmsnorm_grad(void) {
           "rms eps=0");
 }
 
-// ---- checkpoint足場 ----
+// ---- checkpoint再計算 (モデル非依存コールバック) ----
 
-static int ckpt_fwd_stub(int layer, void *ctx) {
-    (void)layer;
-    (void)ctx;
+// 玩具層forward: x[layer+1] = 2*x[layer] + (layer+1)。境界x[0]保存→区間毎に
+// 再実行し、参照forwardとの一致で検証する (2層2区間)。
+typedef struct {
+    float x[4];
+    int calls;
+    int segs[4];
+    int layers[4];
+    int fail_on;  // >=0の層でJT_ERR_INVALを返す (負値は失敗なし)
+} ckpt_ctx_t;
+
+static int ckpt_layer_fn(int seg_idx, int layer, void *ctx) {
+    ckpt_ctx_t *c = (ckpt_ctx_t *)ctx;
+    if (c == NULL || layer < 0 || layer >= 3) {
+        return JT_ERR_INVAL;
+    }
+    if (c->fail_on == layer) {
+        return JT_ERR_INVAL;
+    }
+    c->x[layer + 1] = 2.0f * c->x[layer] + (float)(layer + 1);
+    if (c->calls >= 0 && c->calls < 4) {
+        c->segs[c->calls] = seg_idx;
+        c->layers[c->calls] = layer;
+    }
+    c->calls++;
     return JT_OK;
 }
 
@@ -685,14 +706,52 @@ static void test_checkpoint(void) {
               "ckpt find5=%d", idx);
         CHECK(jt_ckpt_find_segment(&p, 16, &idx) == JT_ERR_INVAL,
               "ckpt find OOB");
-        errno = 0;
-        CHECK(jt_ckpt_recompute_range(&p, 1, ckpt_fwd_stub, NULL) ==
-                      JT_ERR_NOSUP &&
-                  errno == ENOSYS,
-              "ckpt recompute stub");
-        CHECK(jt_ckpt_recompute_range(&p, 9, ckpt_fwd_stub, NULL) ==
-                  JT_ERR_INVAL,
-              "ckpt recompute bad seg");
+        // 2層2区間で境界保存→再計算→一致 (MAJOR-2実実装テスト)。
+        {
+            int b2[3] = {0, 1, 2};
+            jt_ckpt_plan_t p2 = {2, 2, b2};
+            ckpt_ctx_t c;
+            memset(&c, 0, sizeof(c));
+            c.fail_on = -1;
+            c.x[0] = 1.0f;  // 境界保存値
+            // 参照forward: x1=2*1+1=3, x2=2*3+2=8。
+            CHECK(jt_ckpt_recompute_range(&p2, 0, ckpt_layer_fn, &c) ==
+                      JT_OK,
+                  "ckpt recomp seg0");
+            CHECK(c.calls == 1 && c.segs[0] == 0 && c.layers[0] == 0,
+                  "ckpt seg0 trace calls=%d seg=%d layer=%d", c.calls,
+                  c.segs[0], c.layers[0]);
+            CHECK(fabsf(c.x[1] - 3.0f) < 1e-6f, "ckpt x1=%f", c.x[1]);
+            CHECK(jt_ckpt_recompute_range(&p2, 1, ckpt_layer_fn, &c) ==
+                      JT_OK,
+                  "ckpt recomp seg1");
+            CHECK(c.calls == 2 && c.segs[1] == 1 && c.layers[1] == 1,
+                  "ckpt seg1 trace calls=%d seg=%d layer=%d", c.calls,
+                  c.segs[1], c.layers[1]);
+            CHECK(fabsf(c.x[2] - 8.0f) < 1e-6f, "ckpt x2=%f", c.x[2]);
+        }
+        // 不正入力 + コールバック失敗伝播。
+        {
+            int b2[3] = {0, 1, 2};
+            jt_ckpt_plan_t p2 = {2, 2, b2};
+            ckpt_ctx_t c;
+            memset(&c, 0, sizeof(c));
+            c.fail_on = -1;
+            c.x[0] = 1.0f;
+            CHECK(jt_ckpt_recompute_range(&p2, 9, ckpt_layer_fn, &c) ==
+                      JT_ERR_INVAL,
+                  "ckpt recompute bad seg");
+            CHECK(jt_ckpt_recompute_range(&p2, 0, NULL, &c) ==
+                      JT_ERR_INVAL,
+                  "ckpt recompute NULL fn");
+            CHECK(jt_ckpt_recompute_range(NULL, 0, ckpt_layer_fn, &c) ==
+                      JT_ERR_INVAL,
+                  "ckpt recompute NULL plan");
+            c.fail_on = 1;
+            CHECK(jt_ckpt_recompute_range(&p2, 1, ckpt_layer_fn, &c) ==
+                      JT_ERR_INVAL,
+                  "ckpt recompute cb fail");
+        }
         jt_ckpt_plan_t bad = {16, 4, (int[5]){0, 4, 4, 12, 16}};
         CHECK(jt_ckpt_plan_init(&bad) == JT_ERR_INVAL, "ckpt plan nonmono");
     }

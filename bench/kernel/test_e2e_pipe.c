@@ -12,8 +12,8 @@
 //   backward: 線形ヘッド手計算 → jt_swiglu_bwd → jt_rmsnorm_bwd →
 //             jt_gdn2_decode_bwd (dW_gdnのみ更新に使用、他は勾配疎通確認)
 //   update  : jt_optim8_step (全パラメータを1本のflatベクトルで管理)
-//   ckpt    : 区間境界保存 (memcpy) + jt_ckpt_recompute_rangeスケルトン呼び出し
-//             (P2ではJT_ERR_NOSUPが正常系) + 先頭サンプルの手動再計算一致確認
+//   ckpt    : 区間境界保存 (memcpy) + jt_ckpt_recompute_range実再計算
+//             (jt_ckpt_layer_fn経由で保存境界からswiglu+headを再実行し一致確認)
 //   esmoe   : N step毎にWdスライスを4 expertとしてregister→evict→prefetch→
 //             load往復一致確認
 //
@@ -29,7 +29,8 @@
 //   L_CE・μL_bal合算を呼び出し側で行い (routing.hコメント準拠)、gate分布への
 //   勾配をMoE重みに流す必要がある。
 // - checkpointは現在2層2区間の形のみ。1B級では O(√n) 区間 (jt_ckpt_num_segments)
-//   の境界のみ保存し、中間活性はbackward時に再計算する (現stubを実forward結合)。
+//   の境界のみ保存し、中間活性はbackward時に再計算する (実forward結合済みのため
+//   層forward本体をjt_ckpt_layer_fnとして渡す形で拡張する)。
 // - esmoeは現在Wd一部のみ。1B級では全expert重みをSSD backing + 行単位読み
 //   (read_rows/Delta Prefetching) + io_uring/O_DIRECT非同期化で賄う。
 // - 精度: 学習時はHGQ-LUT流儀でLUT-Denseを通常テンソル演算で学習し、推論時に
@@ -94,9 +95,63 @@ static float esilu(float z) {
     return z / (1.0f + expf(-z));
 }
 
-static int eckpt_stub(int layer, void *ctx) {
-    (void)layer;
-    (void)ctx;
+typedef struct {
+    const float *Wg;
+    const float *Wu;
+    const float *Wd;
+    float saved[EP_N];
+    float y2[EP_N];
+    int calls;
+    int segs[4];
+    int layers[4];
+} eckpt_ctx_t;
+
+// 新API経由の再計算層: seg0/layer0は境界保存の検証のみ、seg1/layer1は保存境界
+// (y1) からswiglu+headを再実行しy2を出す。重みは呼び出し側所有 (ctx経由)。
+static int eckpt_layer(int seg_idx, int layer, void *vctx) {
+    eckpt_ctx_t *c = (eckpt_ctx_t *)vctx;
+    if (c == NULL) {
+        return JT_ERR_INVAL;
+    }
+    if (layer < 0 || layer >= EP_NLAYERS) {
+        return JT_ERR_INVAL;
+    }
+    if (c->calls >= 0 && c->calls < 4) {
+        c->segs[c->calls] = seg_idx;
+        c->layers[c->calls] = layer;
+    }
+    c->calls++;
+    if (layer == 0) {
+        for (int j = 0; j < EP_N; j++) {
+            if (!isfinite(c->saved[j])) {
+                return JT_ERR_INVAL;
+            }
+        }
+        return JT_OK;
+    }
+    if (c->Wg == NULL || c->Wu == NULL || c->Wd == NULL) {
+        return JT_ERR_INVAL;
+    }
+    {
+        float Gc2[EP_H], Uc2[EP_H];
+        for (int i = 0; i < EP_H; i++) {
+            double g = 0.0, u = 0.0;
+            for (int j = 0; j < EP_N; j++) {
+                g += (double)c->saved[j] * (double)c->Wg[i * EP_N + j];
+                u += (double)c->saved[j] * (double)c->Wu[i * EP_N + j];
+            }
+            Gc2[i] = (float)g;
+            Uc2[i] = (float)u;
+        }
+        for (int j = 0; j < EP_N; j++) {
+            double acc = 0.0;
+            for (int i = 0; i < EP_H; i++) {
+                acc += (double)(esilu(Gc2[i]) * Uc2[i]) *
+                       (double)c->Wd[i * EP_N + j];
+            }
+            c->y2[j] = (float)acc;
+        }
+    }
     return JT_OK;
 }
 
@@ -366,49 +421,46 @@ int main(void) {
             init_loss = total;
         }
 
-        // ---- checkpoint: 境界保存 + 再計算スケルトン + 手動再計算照合 ----
-        // 形のみ: 最終サンプルのlayer0出力相当を保存する代わりに、先頭
-        // サンプルy1を境界として保存し、区間再計算stubを呼ぶ。P2では
-        // JT_ERR_NOSUPが正常系 (実forward結合は1B級TODO)。
+        // ---- checkpoint: 境界保存 + 新API経由の再計算照合 ----
+        // 先頭サンプルy1を境界として保存し、jt_ckpt_recompute_range経由で
+        // seg1 (swiglu+head) を再実行してy2一致を確認する。seg0は境界検証のみ。
         if (y1_has0) {
-            memcpy(ckpt_saved, y1_saved0, sizeof(ckpt_saved));
-            // 手動再計算: 保存境界からswiglu+headを再実行しy2一致を確認。
-            const float *Wg = &P[EP_OFF_WG];
-            const float *Wu = &P[EP_OFF_WU];
-            const float *Wd = &P[EP_OFF_WD];
-            float Gc2[EP_H], Uc2[EP_H];
-            for (int i = 0; i < EP_H; i++) {
-                double g = 0.0, u = 0.0;
-                for (int j = 0; j < EP_N; j++) {
-                    g += (double)ckpt_saved[j] *
-                         (double)Wg[i * EP_N + j];
-                    u += (double)ckpt_saved[j] *
-                         (double)Wu[i * EP_N + j];
-                }
-                Gc2[i] = (float)g;
-                Uc2[i] = (float)u;
-            }
-            float y2b[EP_N];
-            for (int j = 0; j < EP_N; j++) {
-                double acc = 0.0;
-                for (int i = 0; i < EP_H; i++) {
-                    acc += (double)(esilu(Gc2[i]) * Uc2[i]) *
-                           (double)Wd[i * EP_N + j];
-                }
-                y2b[j] = (float)acc;
-            }
+            eckpt_ctx_t ectx;
             float worst = 0.0f;
-            for (int j = 0; j < EP_N; j++) {
-                float e = fabsf(y2b[j] - y2_ref[j]);
-                worst = (e > worst) ? e : worst;
-            }
-            CHECK(worst < 1e-5f, "ckpt recompute mismatch worst=%f s=%d",
-                  worst, step);
             int seg = step % n_seg;
-            errno = 0;
-            int crc = jt_ckpt_recompute_range(&plan, seg, eckpt_stub, NULL);
-            CHECK(crc == JT_ERR_NOSUP && errno == ENOSYS,
-                  "ckpt stub rc=%d errno=%d s=%d", crc, errno, step);
+            memset(&ectx, 0, sizeof(ectx));
+            memcpy(ckpt_saved, y1_saved0, sizeof(ckpt_saved));
+            memcpy(ectx.saved, ckpt_saved, sizeof(ectx.saved));
+            ectx.Wg = &P[EP_OFF_WG];
+            ectx.Wu = &P[EP_OFF_WU];
+            ectx.Wd = &P[EP_OFF_WD];
+            // 当該区間の再実行 (境界→再計算→一致)。
+            if (seg == 0) {
+                CHECK(jt_ckpt_recompute_range(&plan, 0, eckpt_layer,
+                                              &ectx) == JT_OK,
+                      "ckpt recomp seg0 rc s=%d", step);
+                CHECK(ectx.calls == 1 && ectx.layers[0] == 0,
+                      "ckpt seg0 trace s=%d", step);
+            } else {
+                CHECK(jt_ckpt_recompute_range(&plan, 1, eckpt_layer,
+                                              &ectx) == JT_OK,
+                      "ckpt recomp seg1 rc s=%d", step);
+                CHECK(ectx.calls == 1 && ectx.layers[0] == 1,
+                      "ckpt seg1 trace s=%d", step);
+                for (int j = 0; j < EP_N; j++) {
+                    float e = fabsf(ectx.y2[j] - y2_ref[j]);
+                    worst = (e > worst) ? e : worst;
+                }
+                CHECK(worst < 1e-5f,
+                      "ckpt recompute mismatch worst=%f s=%d", worst,
+                      step);
+            }
+            if (step == 0) {
+                // 不正区間はINVAL (正常系JT_OKと区別可能)。
+                CHECK(jt_ckpt_recompute_range(&plan, n_seg, eckpt_layer,
+                                              &ectx) == JT_ERR_INVAL,
+                      "ckpt bad seg s=%d", step);
+            }
             ckpt_calls++;
         }
 

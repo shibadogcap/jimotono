@@ -23,7 +23,8 @@
 // - export (jt_lut_export_desc): 推論時LUTコンパイル用のレイアウト記述子を
 //   出す。テーブル+スケールを同ページ配置 (DESIGN 5.1-5「LUTとスケールを重みと
 //   同じページに」) し、64B整列・4KiBページ内収納フラグを持つ。
-//   実バイナリ出力 (jt_lut_export_binary) はTODOで JT_ERR_NOSUP。
+//   実バイナリ出力 (jt_lut_export_binary) は実装済み (記述子レイアウト通りに
+//   テーブル+スケールを同ページ配置で書出し)。
 //
 // 規約: C11, restrict, errnoベース + goto cleanup (実装側)。
 // fail-closed: 非有限入力は JT_ERR_INVAL。行列はrow-major。

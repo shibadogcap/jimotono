@@ -6,10 +6,10 @@
 // backward時に再計算する。AGENTS.MD §4.1 / DESIGN.MD §4.2準拠。
 // 規約: C11, restrict, errnoベース (AGENTS.MD 7.1)。
 //
-// 本ヘッダはモデル非依存の純粋関数 (区間分割数・境界・メモリ見積り) から提供
-// し、単体テスト可能にする。実再計算コールバック (層forward本体) はモデル側
-// 実装のため、スケジューラ本体はAPIスケルトン (JT_ERR_NOSUP) とする。
-// オプティマイザ・ES-MoE本体は別wt担当のため含めない。
+// 本ヘッダはモデル非依存の純粋関数 (区間分割数・境界・メモリ見積り) と
+// 区間再計算スケジューラを提供し、単体テスト可能にする。実層forward本体は
+// 呼び出し側の jt_ckpt_layer_fn コールバックが担い、本体は重み・活性を所有
+// しない (モデル非依存)。オプティマイザ・ES-MoE本体は別wt担当のため含めない。
 
 #include <stddef.h>
 
@@ -69,12 +69,15 @@ int jt_ckpt_plan_init(const jt_ckpt_plan_t *restrict plan);
 int jt_ckpt_find_segment(const jt_ckpt_plan_t *restrict plan, int layer,
                          int *restrict out_seg_idx);
 
-// 区間再計算スタブ: forward再計算コールバックはモデル側のためP2では未実装。
-// 正常入力はJT_ERR_NOSUP+errno=ENOSYS、不正入力はJT_ERR_INVAL+errno=EINVAL
-// (gdn2 chunkスタブと同一契約、戻り値のみで区別可能)。
-typedef int (*jt_ckpt_fwd_fn)(int layer, void *ctx);
+// 区間再計算スケジューラ: モデル非依存のコールバック方式。呼び出し側が当該層
+// のforward再実行を行う layer_fn を供給し、本関数は区間
+// [bounds[seg_idx], bounds[seg_idx+1]) の各層を昇順に呼び出す (重み・活性の
+// 所有は呼び出し側)。コールバックがJT_OK以外を返したら即時打切りし当該コード
+// を返す (errnoは上書きしない)。ctx==NULL可 (コールバック側で解釈)。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno=EINVAL) / コールバックの失敗コード。
+typedef int (*jt_ckpt_layer_fn)(int seg_idx, int layer, void *ctx);
 int jt_ckpt_recompute_range(const jt_ckpt_plan_t *restrict plan, int seg_idx,
-                            jt_ckpt_fwd_fn fwd, void *ctx);
+                            jt_ckpt_layer_fn layer_fn, void *ctx);
 
 // bench足場: 見積り一括取得 (full/stored/peak/ratio)。
 typedef struct jt_ckpt_bench {

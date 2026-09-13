@@ -1,16 +1,13 @@
 // jt_checkpoint: 勾配チェックポインティング足場 (O(√n))。
 // C11, errnoベース + goto cleanup、クロスプラットフォーム。
-// 実再計算はモデル依存のためスタブ (ENOSYS)。純粋関数は完全実装。
+// 実再計算はモデル非依存コールバック (jt_ckpt_layer_fn) で実行。
+// スケジューラ自体は重み・活性を所有しない。
 
 #include "jimotono/checkpoint.h"
 
 #include <errno.h>
 #include <math.h>
 #include <stddef.h>
-
-#ifndef ENOSYS
-#define ENOSYS 38
-#endif
 
 int jt_ckpt_num_segments(int n_layers, int *restrict out_seg) {
     if (out_seg == NULL) {
@@ -192,9 +189,10 @@ cleanup:
 }
 
 int jt_ckpt_recompute_range(const jt_ckpt_plan_t *restrict plan, int seg_idx,
-                            jt_ckpt_fwd_fn fwd, void *ctx) {
-    (void)ctx;
-    if (plan == NULL || fwd == NULL) {
+                            jt_ckpt_layer_fn layer_fn, void *ctx) {
+    int start = 0;
+    int end = 0;
+    if (plan == NULL || layer_fn == NULL) {
         errno = EINVAL;
         return JT_ERR_INVAL;
     }
@@ -206,9 +204,17 @@ int jt_ckpt_recompute_range(const jt_ckpt_plan_t *restrict plan, int seg_idx,
         errno = EINVAL;
         return JT_ERR_INVAL;
     }
-    // P2足場: 実forwardコールバックの配線はモデル側。正常入力はENOSYS。
-    errno = ENOSYS;
-    return JT_ERR_NOSUP;
+    // モデル非依存の再実行ループ: 境界 [start, end) の各層を昇順に再実行。
+    // 活性・重みの保持は呼び出し側 (ctx) の責務。
+    start = plan->bounds[seg_idx];
+    end = plan->bounds[seg_idx + 1];
+    for (int layer = start; layer < end; layer++) {
+        int rc = layer_fn(seg_idx, layer, ctx);
+        if (rc != JT_OK) {
+            return rc;  // errnoはコールバック側の設定を尊重し上書きしない
+        }
+    }
+    return JT_OK;
 }
 
 int jt_ckpt_bench_estimate(int n_layers, int n_seg, size_t per_layer,
