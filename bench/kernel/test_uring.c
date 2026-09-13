@@ -1,6 +1,6 @@
 // bench: io_uring batch-read skeleton test (Phase 2足場)。
 // bench/kernel/test_io.c には手を出さず、本ファイルを新設。
-//   - fallback (Linux && !HAVE_LIBURING): n==0はJT_OK、n>0はJT_ERR_INVAL+ENOSYS。
+//   - fallback (Linux && !HAVE_LIBURING): n==0はJT_OK、n>0はJT_ERR_NOSUP+ENOSYS。
 //   - 有効時 (Linux && HAVE_LIBURING): 往復一致 + 引数不正 + EOF + 窓進行(>256)。
 //   - 非Linux: Linux-only APIのためSKIPしてexit 0 (ヘッダ宣言なしに対応)。
 // 成功時 exit 0、失敗時 exit 1 + stderr。
@@ -163,8 +163,8 @@ static void test_window(void) {
 }
 #else
 static void test_fallback_enosys(void) {
-    // liburing無効ビルドのfallback: n>0はJT_ERR_INVAL + errno=ENOSYS。
-    // TODO(NOSUP追従): MINOR-1でJT_ERR_NOSUP新設後に本期待値を置き換える。
+    // liburing無効ビルドのfallback: n>0はJT_ERR_NOSUP + errno=ENOSYS。
+    // NOSUP追従済み (MINOR-1)。
     FILE *f = tmpfile();
     CHECK(f != NULL, "tmpfile failed: %s", strerror(errno));
     if (f == NULL) {
@@ -180,7 +180,7 @@ static void test_fallback_enosys(void) {
     if (fd >= 0) {
         errno = 0;
         int rc = jt_io_pread_batch_uring(fd, &spec, 1);
-        CHECK(rc == JT_ERR_INVAL, "fallback rc=%d want INVAL", rc);
+        CHECK(rc == JT_ERR_NOSUP, "fallback rc=%d want NOSUP", rc);
         CHECK(errno == ENOSYS, "fallback errno=%d want ENOSYS(%d)", errno,
               ENOSYS);
     }
@@ -200,7 +200,7 @@ int main(void) {
 #ifdef HAVE_LIBURING
         printf("uring: OK (backend enabled)\n");
 #else
-        printf("uring: OK (fallback ENOSYS)\n");
+        printf("uring: OK (fallback NOSUP+ENOSYS)\n");
 #endif
         return 0;
     }

@@ -80,9 +80,8 @@ int jt_io_pread_batch(int fd, const jt_io_spec_t *restrict specs, size_t n);
 //   jt_io_pread_batch は同期fallbackとして残す。
 //   戻り値: JT_OK / JT_ERR_INVAL (引数不正, errno=EINVAL)
 //            JT_ERR_IO (read失敗・EOF前打ち切り。liburing有効時のみ)
-//            JT_ERR_INVAL + errno=ENOSYS (liburing無効時fallback)
-//   TODO(NOSUP追従): MINOR-1で JT_ERR_NOSUP が新設され次第、本fallbackの
-//   JT_ERR_INVAL+ENOSYS を JT_ERR_NOSUP に置き換える。common.hには手を出さない。
+//            JT_ERR_NOSUP + errno=ENOSYS (liburing無効時fallback)
+//   NOSUP追従済み (MINOR-1): JT_ERR_NOSUP新設に伴い置換済み。
 #ifdef __linux__
 int jt_io_pread_batch_uring(int fd, const jt_io_spec_t *restrict specs, size_t n);
 #endif
