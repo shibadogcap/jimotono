@@ -62,6 +62,7 @@
 #include "jimotono/common.h"
 #include "jimotono/bpe.h"
 #include "jimotono/w8a8.h"
+#include "jimotono/lowbit.h"
 #include "jimotono/data_pack.h"
 #include "jimotono/moe_layer.h"
 #include "jimotono/routing.h"
@@ -201,6 +202,7 @@ static void ts_usage(const char *prog) {
             "[--layers L] [--val-every K] [--patience P] [--vocab V] "
             "[--bpe-vocab PATH] [--max-stories N] [--max-val-pairs N] "
             "[--moe-batch] [--seq S] [--aux-weight W] [--no-sched] [--w8a8]\n"
+            "  [--lowbit-fq] [--lowbit-lut]\n"
             "  defaults: data=data/tinystories_head16M.txt "
             "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=3e-4 "
             "batch=64 d=64 layers=2 val-every=100 patience=100 vocab=258 "
@@ -211,7 +213,11 @@ static void ts_usage(const char *prog) {
             "  --patience 0 disables early stopping\n"
             "  --max-val-pairs 0 evaluates full val set\n"
             "  --moe-batch: Phase G batch dispatch (cap=1.5; T=seq*batch)\n"
-            "  --w8a8: Stage 3 W8A8 INT8 fwd GEMM (default fp32; bwd stays fp32)\n"            "  --seq S: tokens per sequence (1..512). T_step=seq*batch (<=1024)\n"
+            "  --w8a8: Stage 3 W8A8 INT8 fwd GEMM (default fp32; bwd stays fp32)\n"
+            "  --lowbit-fq: Stage 3b-2 fake-quant fwd (gate/up INT2, down INT4;\n"
+            "    default fp32; bwd stays fp32 = STE)\n"
+            "  --lowbit-lut: Stage 3b-2 true T-MAC LUT fwd (GEMM体制のみ;\n"
+            "    default fp32; bwd stays fp32 = STE)\n"            "  --seq S: tokens per sequence (1..512). T_step=seq*batch (<=1024)\n"
             "  --aux-weight W: load-balancing L_aux weight (0..0.1, default "
             "0.01; tunable 0.01-0.1)\n"
             "  --factorized-head: Stage 1 factorized output head "
@@ -2318,6 +2324,22 @@ int main(int argc, char **argv) {
                 errno = EINVAL;
                 goto cleanup;
             }
+        } else if (strcmp(argv[i], "--lowbit-fq") == 0) {
+            // Stage 3b-2: fake-quant fwd (既定OFF=fp32)。bwdはfp32のままSTE。
+            if (jt_lowbit_set_mode(1) != JT_OK) {
+                fprintf(stderr,
+                        "train_tinystories: --lowbit-fq enable failed\n");
+                errno = EINVAL;
+                goto cleanup;
+            }
+        } else if (strcmp(argv[i], "--lowbit-lut") == 0) {
+            // Stage 3b-2: 真LUT fwd (既定OFF=fp32)。bwdはfp32のままSTE。
+            if (jt_lowbit_set_mode(2) != JT_OK) {
+                fprintf(stderr,
+                        "train_tinystories: --lowbit-lut enable failed\n");
+                errno = EINVAL;
+                goto cleanup;
+            }
         } else if (strcmp(argv[i], "--seq") == 0 && i + 1 < argc) {
             g_ts_seq = atol(argv[++i]);
         } else if (strcmp(argv[i], "--aux-weight") == 0 && i + 1 < argc) {
@@ -2709,12 +2731,13 @@ int main(int argc, char **argv) {
     printf("train_ts: layers=%d d=%d E=%d K=%d S=%d H=%d V=%d "
            "params=%zu lr=%.5f batch=%ld seq=%ld T=%ld patience=%ld "
            "moe_batch=%d cap=%.2f aux_w=%.4f head_fact=%d head_k=%d "
-           "head_init=%s head_lr_scale=%.2f w8a8=%d\n",
+           "head_init=%s head_lr_scale=%.2f w8a8=%d lowbit=%d\n",
            n_layers, d, TS_E, TS_K, TS_S, TS_H, vocab, m.lt.n_total, lr,
            batch, g_ts_seq, g_ts_seq * batch, patience, g_ts_moe_batch,
            (double)TS_CAP_FACTOR, (double)g_ts_aux_w, use_fact,
            use_fact ? head_k : 0, head_init_vm ? "vm" : "standard",
-           (double)head_lr_scale, jt_w8a8_is_enabled());
+           (double)head_lr_scale, jt_w8a8_is_enabled(),
+           jt_lowbit_get_mode());
     /* 常駐見積り (d=64維持。V=48588でemb/head各64*48588*4B≈12.4MB。許容内) */
     {
         size_t n = m.lt.n_total;
