@@ -255,10 +255,16 @@ static int g_moe_batch = 0;
 // drop なし時は単体ループと bit 一致。cap は呼出し毎の Tsub から算出するため
 // マルチスレッド時はシャード毎の cap になる (ゲート計測は threads=1 で行う)。
 // drop_accum (NULL 可) に本層の dropped 数を加算する。
+// Step 3: save_perm/save_off/save_drop (いずれもNULL可、3点セットで渡すこと)
+// に本シャードの perm/off/drop を写し、bwdでの同一perm再利用 (再ソート禁止)
+// に使う。NULL時は写さない (Step 2互換)。
 static void lr_fwd_layer_range_batch(const lr_ctx_t *restrict ctx, int layer,
                                      int a, int b,
                                      size_t *restrict drop_accum,
-                                     int *restrict rc_out) {
+                                     int *restrict rc_out,
+                                     size_t *restrict save_perm,
+                                     size_t *restrict save_off,
+                                     unsigned char *restrict save_drop) {
     int rc = JT_OK;
     const float *base = ctx->P + ctx->layer_off[(size_t)layer];
     const float *Wgate = base;
@@ -315,6 +321,19 @@ static void lr_fwd_layer_range_batch(const lr_ctx_t *restrict ctx, int layer,
             if (drop_accum != NULL) {
                 *drop_accum += dropped;
             }
+            // Step 3: 同一perm再利用のため写しを保存 (3点セット)。
+            if (save_perm != NULL && save_off != NULL &&
+                save_drop != NULL) {
+                for (size_t i = 0; i < kept; i++) {
+                    save_perm[i] = perm[i];
+                }
+                for (int e = 0; e <= LR_E; e++) {
+                    save_off[(size_t)e] = off[(size_t)e];
+                }
+                for (int i = 0; i < Tsub * LR_K; i++) {
+                    save_drop[i] = dropm[(size_t)i];
+                }
+            }
             // 残差合算 (単体経路と同一順序・同一検査)。
             for (int t = a; t < b && rc == JT_OK; t++) {
                 const float *xin =
@@ -344,12 +363,18 @@ static void lr_fwd_layer_range_batch(const lr_ctx_t *restrict ctx, int layer,
 
 // forward 1層分 [a,b) トークン。rc_outにJT_OK/ERR。
 // drop_accum (NULL可): バッチ経路時のみ本層の dropped 数を加算 (単体経路では不変)。
+// bperm_l/boff_l/bdrop_l: バッチ経路で同一perm再利用のための保存先
+// (3点セット。Tsub*K / E+1 / Tsub*K。NULL可、NULL時は保存しない)。
 static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
                                int a, int b,
                                size_t *restrict drop_accum,
-                               int *restrict rc_out) {
+                               int *restrict rc_out,
+                               size_t *restrict bperm_l,
+                               size_t *restrict boff_l,
+                               unsigned char *restrict bdrop_l) {
     if (g_moe_batch) {
-        lr_fwd_layer_range_batch(ctx, layer, a, b, drop_accum, rc_out);
+        lr_fwd_layer_range_batch(ctx, layer, a, b, drop_accum, rc_out,
+                                 bperm_l, boff_l, bdrop_l);
         return;
     }
     int rc = JT_OK;
@@ -416,12 +441,157 @@ static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
 // 依存がない (acts[l+1][t]は同ワーカーのacts[l][t]からのみ決まる) ため
 // 単一fork/joinに融合できる。各トークンの計算内容・順序は不変で
 // ビット一致。ワーカーあたり作業量は約6倍 (12Tで約200KB→約1.2MB)。
+// bperm_all/boff_all/bdrop_all: バッチ時の層別perm保存域
+// ([L*TOKS*K]/[L*(E+1)]/[L*TOKS*K]。NULL可)。
 static void lr_fwd_all_range(const lr_ctx_t *restrict ctx, int a, int b,
                              size_t *restrict drop_accum,
-                             int *restrict rc_out) {
+                             int *restrict rc_out,
+                             size_t *restrict bperm_all,
+                             size_t *restrict boff_all,
+                             unsigned char *restrict bdrop_all) {
     int rc = JT_OK;
     for (int l = 0; l < LR_LAYERS && rc == JT_OK; l++) {
-        lr_fwd_layer_range(ctx, l, a, b, drop_accum, &rc);
+        size_t *bp = (bperm_all != NULL)
+                         ? (bperm_all +
+                            (size_t)l * (size_t)LR_TOKS * (size_t)LR_K)
+                         : NULL;
+        size_t *bo = (boff_all != NULL)
+                         ? (boff_all + (size_t)l * ((size_t)LR_E + 1))
+                         : NULL;
+        unsigned char *bd =
+            (bdrop_all != NULL)
+                ? (bdrop_all +
+                   (size_t)l * (size_t)LR_TOKS * (size_t)LR_K)
+                : NULL;
+        lr_fwd_layer_range(ctx, l, a, b, drop_accum, &rc, bp, bo, bd);
+    }
+    if (rc_out != NULL) {
+        *rc_out = rc;
+    }
+}
+
+// Phase G Step 3: backward [a,b) のバッチ版 (同一perm再利用)。
+// fwdで保存した perm/off/drop (bperm_all/boff_all/bdrop_all、層別に
+// [L*TOKS*K]/[L*(E+1)]/[L*TOKS*K]) を読み出すのみで再ソートしない。
+// dW/dXはexpert単位GEMM (素朴参照実装)。順序固定:
+//   dXはexpert_id昇順scatter、gateはtoken_pos昇順、dWのM_e縮約はm昇順。
+// dtmp (P_LAYER) をdcur/dx_tmp作業域に転用する
+// (2*Tsub*N <= 262144 < P_LAYER=839680 のため収まる)。
+// Gout層スライスへ直接上書きする (呼出し前に0埋め済みのため加算不要)。
+// dLogitsは学習に不要のためNULL。
+static void lr_bwd_range_batch(const lr_ctx_t *restrict ctx, int a, int b,
+                               float *restrict Gout, float *restrict dtmp,
+                               const size_t *restrict bperm_all,
+                               const size_t *restrict boff_all,
+                               const unsigned char *restrict bdrop_all,
+                               int *restrict rc_out) {
+    int rc = JT_OK;
+    int Tsub = b - a;
+    const float *Wo = ctx->P + ctx->head_off;
+    float *GWo = Gout + ctx->head_off;
+    float *Gbo = Gout + ctx->head_off + (size_t)LR_N;
+    const float *alast =
+        ctx->acts + (size_t)LR_LAYERS * (size_t)LR_TOKS * (size_t)LR_N;
+    float *dcur = NULL;
+    float *dx_tmp = NULL;
+    if (Tsub <= 0) {
+        if (rc_out != NULL) {
+            *rc_out = JT_OK;
+        }
+        return;
+    }
+    if (bperm_all == NULL || boff_all == NULL || bdrop_all == NULL ||
+        Gout == NULL || dtmp == NULL) {
+        rc = JT_ERR_INVAL;
+        errno = EINVAL;
+        if (rc_out != NULL) {
+            *rc_out = rc;
+        }
+        return;
+    }
+    if ((size_t)(2 * Tsub) > (size_t)LR_P_LAYER / (size_t)LR_N) {
+        rc = JT_ERR_INVAL;
+        errno = EINVAL;
+        if (rc_out != NULL) {
+            *rc_out = rc;
+        }
+        return;
+    }
+    dcur = dtmp;
+    dx_tmp = dtmp + (size_t)Tsub * (size_t)LR_N;
+    // head勾配 (token昇順。単体版と同一順序)。
+    for (int t = a; t < b && rc == JT_OK; t++) {
+        const float *al = alast + (size_t)t * (size_t)LR_N;
+        double pred = (double)ctx->P[ctx->head_off + (size_t)LR_N];
+        for (int j = 0; j < LR_N; j++) {
+            pred += (double)al[j] * (double)Wo[j];
+        }
+        {
+            float d =
+                (float)(2.0 * (pred - (double)ctx->Tdata[t]) / (double)LR_TOKS);
+            float *dc = dcur + (size_t)(t - a) * (size_t)LR_N;
+            for (int j = 0; j < LR_N; j++) {
+                GWo[j] += d * al[j];
+                dc[j] = d * Wo[j];
+            }
+            *Gbo += d;
+        }
+    }
+    // 層逆順にバッチbwd (同一perm再利用)。
+    for (int l = LR_LAYERS - 1; l >= 0 && rc == JT_OK; l--) {
+        const float *base = ctx->P + ctx->layer_off[(size_t)l];
+        const float *Wgate = base;
+        const float *Wg = Wgate + LR_P_WGATE;
+        const float *Wu = Wg + LR_P_ROUTED;
+        const float *Wd = Wu + LR_P_ROUTED;
+        const float *Wgs = Wd + LR_P_ROUTED;
+        const float *Wus = Wgs + LR_P_SHARED;
+        const float *Wds = Wus + LR_P_SHARED;
+        const float *Xb =
+            ctx->acts + ((size_t)l * (size_t)LR_TOKS + (size_t)a) * (size_t)LR_N;
+        size_t c0 = (size_t)l * (size_t)LR_TOKS + (size_t)a;
+        const size_t *ids = ctx->Cids + c0 * (size_t)LR_K;
+        const float *weights = ctx->Cw + c0 * (size_t)LR_K;
+        const float *Gsel =
+            ctx->CGsel + c0 * (size_t)LR_K * (size_t)LR_H;
+        const float *Usel =
+            ctx->CUsel + c0 * (size_t)LR_K * (size_t)LR_H;
+        const float *Ysel =
+            ctx->CYsel + c0 * (size_t)LR_K * (size_t)LR_N;
+        const float *Gs = (LR_S > 0 && ctx->CGs != NULL)
+                              ? (ctx->CGs + c0 * (size_t)LR_S * (size_t)LR_H)
+                              : NULL;
+        const float *Us = (LR_S > 0 && ctx->CUs != NULL)
+                              ? (ctx->CUs + c0 * (size_t)LR_S * (size_t)LR_H)
+                              : NULL;
+        const size_t *perm =
+            bperm_all + (size_t)l * (size_t)LR_TOKS * (size_t)LR_K;
+        const size_t *off =
+            boff_all + (size_t)l * ((size_t)LR_E + 1);
+        const unsigned char *dropm =
+            bdrop_all + (size_t)l * (size_t)LR_TOKS * (size_t)LR_K;
+        float *gbase = Gout + ctx->layer_off[(size_t)l];
+        float *gWgate = gbase;
+        float *gWg = gWgate + LR_P_WGATE;
+        float *gWu = gWg + LR_P_ROUTED;
+        float *gWd = gWu + LR_P_ROUTED;
+        float *gWgs = gWd + LR_P_ROUTED;
+        float *gWus = gWgs + LR_P_SHARED;
+        float *gWds = gWus + LR_P_SHARED;
+        int brc = jt_moe_bwd_batch_unchecked(
+            dcur, Xb, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, ids, weights, Gsel,
+            Usel, Ysel, Gs, Us, perm, off, dropm, dx_tmp, gWgate, gWg, gWu,
+            gWd, gWgs, gWus, gWds, NULL, Tsub, LR_N, LR_H, LR_E, LR_K,
+            LR_S);
+        if (brc != JT_OK) {
+            rc = brc;
+            break;
+        }
+        // 残差: dcur += dx_tmp (要素毎単一加算。単体版と同一)。
+        for (int i = 0; i < Tsub * LR_N; i++) {
+            double v = (double)dcur[i] + (double)dx_tmp[i];
+            dcur[i] = (float)v;
+        }
     }
     if (rc_out != NULL) {
         *rc_out = rc;
@@ -429,9 +599,21 @@ static void lr_fwd_all_range(const lr_ctx_t *restrict ctx, int a, int b,
 }
 
 // backward [a,b) トークン。勾配はGout[n_total]へ加算。dtmpは層最大3.3MB私用域。
+// bperm_all/boff_all/bdrop_all: バッチ時の層別perm保存域 (NULL可)。
+// g_moe_batchかつ3点セットあり時はバッチbwd (同一perm再利用)、
+// そうでなければ単体ループ版。
 static void lr_bwd_range(const lr_ctx_t *restrict ctx, size_t n_total,
                          int a, int b, float *restrict Gout,
-                         float *restrict dtmp, int *restrict rc_out) {
+                         float *restrict dtmp, int *restrict rc_out,
+                         const size_t *restrict bperm_all,
+                         const size_t *restrict boff_all,
+                         const unsigned char *restrict bdrop_all) {
+    if (g_moe_batch && bperm_all != NULL && boff_all != NULL &&
+        bdrop_all != NULL) {
+        lr_bwd_range_batch(ctx, a, b, Gout, dtmp, bperm_all, boff_all,
+                           bdrop_all, rc_out);
+        return;
+    }
     int rc = JT_OK;
     (void)n_total;
     const float *Wo = ctx->P + ctx->head_off;
@@ -640,11 +822,16 @@ typedef struct lr_thr_arg {
     float *dtmp;  // bwd用 (fwd時はNULL)。
     size_t dropped;  // Phase G Step 1: ワーカー内のバッチdrop総数。
     int rc;
+    // Phase G Step 3: ワーカー私用のperm保存域 (NULL可)。
+    size_t *bperm_all;         // [L*TOKS*K]
+    size_t *boff_all;          // [L*(E+1)]
+    unsigned char *bdrop_all;  // [L*TOKS*K]
 } lr_thr_arg_t;
 
 // D2粗粒化用: 1ステップ分の fused forward全層 + backward を同一ワーカーで
 // 処理 (単一fork/join/step)。Gpartゼロ埋めもワーカー側で並列化し、
 // 主スレッドの直列memsetを除去する。トークン分割は従来と同一のため等価。
+// Step 3: fwdでpermを保存し、bwdで同一permを再利用する (再ソート禁止)。
 static void *lr_thr_step(void *v) {
     lr_thr_arg_t *arg = (lr_thr_arg_t *)v;
     int rc = JT_OK;
@@ -652,10 +839,12 @@ static void *lr_thr_step(void *v) {
     if (arg->Gout != NULL && arg->n_total > 0) {
         memset(arg->Gout, 0, arg->n_total * sizeof(float));
     }
-    lr_fwd_all_range(arg->ctx, arg->a, arg->b, &dropped, &rc);
+    lr_fwd_all_range(arg->ctx, arg->a, arg->b, &dropped, &rc,
+                     arg->bperm_all, arg->boff_all, arg->bdrop_all);
     if (rc == JT_OK) {
         lr_bwd_range(arg->ctx, arg->n_total, arg->a, arg->b, arg->Gout,
-                     arg->dtmp, &rc);
+                     arg->dtmp, &rc, arg->bperm_all, arg->boff_all,
+                     arg->bdrop_all);
     }
     arg->dropped = dropped;
     arg->rc = rc;
@@ -679,6 +868,13 @@ int main(int argc, char **argv) {
     float *Vacts = NULL; // val forward作業域 [(LAYERS+1)][VAL_TOKS][N]
     float *Gpart = NULL;   // [nthr][n_total] スレッド別勾配部分和
     float *dtmps = NULL;   // [nthr][P_LAYER] スレッド別bwd私用域
+    // Phase G Step 3: 層別perm保存域 (bwd同一perm再利用用)。
+    size_t *Bperm0 = NULL;         // [L*TOKS*K] 単一スレッド用
+    size_t *Boff0 = NULL;          // [L*(E+1)] 単一スレッド用
+    unsigned char *Bdrop0 = NULL;  // [L*TOKS*K] 単一スレッド用
+    size_t *BpermP = NULL;         // [nthr][L*TOKS*K] ワーカー別
+    size_t *BoffP = NULL;          // [nthr][L*(E+1)] ワーカー別
+    unsigned char *BdropP = NULL;  // [nthr][L*TOKS*K] ワーカー別
     // fwd中間値キャッシュ (bwd再計算除去用。[L][TOKS] 単位)。
     size_t *Cids = NULL;   // [L][TOKS][K]
     float *Cw = NULL;      // [L][TOKS][K]
@@ -854,11 +1050,29 @@ int main(int argc, char **argv) {
         dtmps =
             (float *)malloc((size_t)nthr * LR_P_LAYER * sizeof(float));
     }
+    // Phase G Step 3: perm保存域 (moe-batch時のみ。bwd再利用用)。
+    if (g_moe_batch) {
+        size_t nperm = (size_t)LR_LAYERS * (size_t)LR_TOKS * (size_t)LR_K;
+        size_t noff = (size_t)LR_LAYERS * ((size_t)LR_E + 1);
+        Bperm0 = (size_t *)malloc(nperm * sizeof(size_t));
+        Boff0 = (size_t *)malloc(noff * sizeof(size_t));
+        Bdrop0 = (unsigned char *)malloc(nperm * sizeof(unsigned char));
+        if (nthr > 1) {
+            BpermP = (size_t *)malloc((size_t)nthr * nperm * sizeof(size_t));
+            BoffP = (size_t *)malloc((size_t)nthr * noff * sizeof(size_t));
+            BdropP = (unsigned char *)malloc((size_t)nthr * nperm *
+                                             sizeof(unsigned char));
+        }
+    }
     if (P == NULL || G == NULL || X == NULL || T == NULL || acts == NULL ||
         dtmp == NULL || Xv == NULL || Tv == NULL || Vacts == NULL ||
         Cids == NULL || Cw == NULL || CGsel == NULL || CUsel == NULL ||
         CYsel == NULL || (LR_S > 0 && (CGs == NULL || CUs == NULL)) ||
-        (nthr > 1 && (Gpart == NULL || dtmps == NULL))) {
+        (nthr > 1 && (Gpart == NULL || dtmps == NULL)) ||
+        (g_moe_batch &&
+         (Bperm0 == NULL || Boff0 == NULL || Bdrop0 == NULL ||
+          (nthr > 1 &&
+           (BpermP == NULL || BoffP == NULL || BdropP == NULL))))) {
         fprintf(stderr, "train_longrun: OOM\n");
         errno = ENOMEM;
         goto cleanup;
@@ -1030,6 +1244,20 @@ int main(int argc, char **argv) {
                     args[w].dtmp = dtmps + (size_t)w * LR_P_LAYER;
                     args[w].dropped = 0;
                     args[w].rc = JT_OK;
+                    // Step 3: ワーカー別perm域 (moe-batch時のみ)。
+                    if (g_moe_batch) {
+                        size_t nperm =
+                            (size_t)LR_LAYERS * (size_t)LR_TOKS * (size_t)LR_K;
+                        size_t noff =
+                            (size_t)LR_LAYERS * ((size_t)LR_E + 1);
+                        args[w].bperm_all = BpermP + (size_t)w * nperm;
+                        args[w].boff_all = BoffP + (size_t)w * noff;
+                        args[w].bdrop_all = BdropP + (size_t)w * nperm;
+                    } else {
+                        args[w].bperm_all = NULL;
+                        args[w].boff_all = NULL;
+                        args[w].bdrop_all = NULL;
+                    }
                     if (pthread_create(&thrs[w], NULL, lr_thr_step,
                                        &args[w]) != 0) {
                         fprintf(stderr,
@@ -1077,7 +1305,10 @@ int main(int argc, char **argv) {
             {
                 int frc = JT_OK;
                 size_t dropped = 0;
-                lr_fwd_all_range(&wctx, 0, LR_TOKS, &dropped, &frc);
+                lr_fwd_all_range(&wctx, 0, LR_TOKS, &dropped, &frc,
+                                 g_moe_batch ? Bperm0 : NULL,
+                                 g_moe_batch ? Boff0 : NULL,
+                                 g_moe_batch ? Bdrop0 : NULL);
                 if (frc != JT_OK) {
                     fprintf(stderr,
                             "train_longrun: fwd failed step=%ld rc=%d\n",
@@ -1097,7 +1328,10 @@ int main(int argc, char **argv) {
                 {
                     int brc = JT_OK;
                     memset(G, 0, n_total * sizeof(float));
-                    lr_bwd_range(&wctx, n_total, 0, LR_TOKS, G, dtmp, &brc);
+                    lr_bwd_range(&wctx, n_total, 0, LR_TOKS, G, dtmp, &brc,
+                                 g_moe_batch ? Bperm0 : NULL,
+                                 g_moe_batch ? Boff0 : NULL,
+                                 g_moe_batch ? Bdrop0 : NULL);
                     if (brc != JT_OK) {
                         fprintf(stderr,
                                 "train_longrun: bwd failed step=%ld rc=%d\n",
@@ -1357,6 +1591,12 @@ cleanup:
     free(Vacts);
     free(Gpart);
     free(dtmps);
+    free(Bperm0);
+    free(Boff0);
+    free(Bdrop0);
+    free(BpermP);
+    free(BoffP);
+    free(BdropP);
     free(Cids);
     free(Cw);
     free(CGsel);

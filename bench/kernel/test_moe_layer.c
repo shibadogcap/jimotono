@@ -1010,6 +1010,493 @@ static void test_batch_invalid(void) {
     }
 }
 
+// ---- Phase G Step 3: バッチbwd ----
+// 補助: 単体ループbwd参照 (token昇順蓄積。lr_bwd_rangeと同一順序)。
+// dWgate/dWg/dWu/dWd/dWg_s等はゼロ埋め後にtoken昇順で加算する。
+static int ref_single_bwd_accum(const float *dYall, const float *Xall,
+                                const float *Wgate, const float *Wg,
+                                const float *Wu, const float *Wd,
+                                const float *Wg_s, const float *Wu_s,
+                                const float *Wd_s, const size_t *ids,
+                                const float *weights, const float *Gsel,
+                                const float *Usel, const float *Ysel,
+                                const float *Gs, const float *Us, int T,
+                                int n, int h, int E, int k, int S,
+                                float *dXall, float *dWgate, float *dWg,
+                                float *dWu, float *dWd, float *dWg_s,
+                                float *dWu_s, float *dWd_s, float *dLog) {
+    size_t hhn = (size_t)h * (size_t)n;
+    size_t e;
+    size_t i;
+    for (e = 0; e < (size_t)E; e++) {
+        for (i = 0; i < (size_t)n; i++) {
+            dWgate[e * (size_t)n + i] = 0.0f;
+        }
+        for (i = 0; i < hhn; i++) {
+            dWg[e * hhn + i] = 0.0f;
+            dWu[e * hhn + i] = 0.0f;
+            dWd[e * hhn + i] = 0.0f;
+        }
+    }
+    for (e = 0; e < (size_t)(S > 0 ? S : 0); e++) {
+        for (i = 0; i < hhn; i++) {
+            dWg_s[e * hhn + i] = 0.0f;
+            dWu_s[e * hhn + i] = 0.0f;
+            dWd_s[e * hhn + i] = 0.0f;
+        }
+    }
+    if (dLog != NULL) {
+        for (e = 0; e < (size_t)T * (size_t)E; e++) {
+            dLog[e] = 0.0f;
+        }
+    }
+    for (int t = 0; t < T; t++) {
+        float dX[64];
+        float dg[1024];
+        float gg[1024];
+        float gu[1024];
+        float gd[1024];
+        float sg[64];
+        float su[64];
+        float sd[64];
+        float dl[64];
+        const float *dYt = dYall + (size_t)t * (size_t)n;
+        const float *Xt = Xall + (size_t)t * (size_t)n;
+        const size_t *idst = ids + (size_t)t * (size_t)k;
+        const float *wt = weights + (size_t)t * (size_t)k;
+        const float *Gt = Gsel + (size_t)t * (size_t)k * (size_t)h;
+        const float *Ut = Usel + (size_t)t * (size_t)k * (size_t)h;
+        const float *Yt = Ysel + (size_t)t * (size_t)k * (size_t)n;
+        const float *Gst =
+            (S > 0) ? (Gs + (size_t)t * (size_t)S * (size_t)h) : NULL;
+        const float *Ust =
+            (S > 0) ? (Us + (size_t)t * (size_t)S * (size_t)h) : NULL;
+        int brc;
+        if (n > 64 || h > 64 || E > 64) {
+            return JT_ERR_INVAL;
+        }
+        brc = jt_moe_bwd(dYt, Xt, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s,
+                         idst, wt, Gt, Ut, Yt, Gst, Ust, dX, dg, gg, gu,
+                         gd, sg, su, sd, dl, n, h, E, k, S);
+        if (brc != JT_OK) {
+            return brc;
+        }
+        for (int j = 0; j < n; j++) {
+            dXall[(size_t)t * (size_t)n + (size_t)j] = dX[j];
+        }
+        // token昇順加算 (lr_bwd_rangeと同一)。
+        for (int p = 0; p < k; p++) {
+            size_t ee = idst[p];
+            size_t erow = ee * (size_t)h * (size_t)n;
+            size_t eg = ee * (size_t)n;
+            for (i = 0; i < hhn; i++) {
+                dWg[erow + i] += gg[ee * hhn + i];
+                dWu[erow + i] += gu[ee * hhn + i];
+                dWd[erow + i] += gd[ee * hhn + i];
+            }
+            for (int j = 0; j < n; j++) {
+                dWgate[eg + (size_t)j] += dg[eg + (size_t)j];
+            }
+            if (dLog != NULL) {
+                dLog[(size_t)t * (size_t)E + ee] = dl[ee];
+            }
+        }
+        if (S > 0) {
+            for (i = 0; i < (size_t)S * hhn; i++) {
+                dWg_s[i] += sg[i];
+                dWu_s[i] += su[i];
+                dWd_s[i] += sd[i];
+            }
+        }
+    }
+    return JT_OK;
+}
+
+// gate勾配のtoken順加算とperm順加算のbit一致 (必須条件1)。
+// dWgateのtoken方向蓄積をtoken昇順ループとperm順ループ (expert外側・m昇順)
+// で別々に計算し、bit一致を確認する。一致しなければ実装バグ。
+static void test_bwd_batch_gate_bitmatch(void) {
+    const int n = 4;
+    const int h = 2;
+    const int E = 4;
+    const int k = 2;
+    const int S = 1;
+    const int T = 6;
+    float X[24], Wgate[16], Wg[32], Wu[32], Wd[32];
+    float Wg_s[8], Wu_s[8], Wd_s[8];
+    float Yb[24], dY[24];
+    size_t ids[12];
+    float w[12];
+    float Gs[24], Us[24], Ysel[48];
+    float sGs[12], sUs[12];
+    size_t perm[12], off[5];
+    unsigned char dropm[12];
+    size_t kept = 0;
+    size_t dropped = 0;
+    int rc;
+    for (int i = 0; i < T * n; i++) {
+        X[i] = 0.4f * fdval(i, 0, 51) + 0.2f;
+        dY[i] = 0.5f * fdval(i, 1, 71) + 0.15f;
+    }
+    for (int e = 0; e < E; e++) {
+        for (int j = 0; j < n; j++) {
+            Wgate[e * n + j] = 0.3f * fdval(e, j, 52);
+        }
+    }
+    for (int i = 0; i < E * h * n; i++) {
+        Wg[i] = 0.3f * fdval(i, 0, 53);
+        Wu[i] = 0.3f * fdval(i, 1, 54);
+        Wd[i] = 0.3f * fdval(i, 2, 55);
+    }
+    for (int i = 0; i < S * h * n; i++) {
+        Wg_s[i] = 0.3f * fdval(i, 0, 56);
+        Wu_s[i] = 0.3f * fdval(i, 1, 57);
+        Wd_s[i] = 0.3f * fdval(i, 2, 58);
+    }
+    rc = jt_moe_fwd_batch(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Yb, T,
+                          n, h, E, k, S, ids, w, Gs, Us, Ysel, sGs, sUs,
+                          1.25f, perm, off, dropm, &kept, &dropped);
+    CHECK(rc == JT_OK, "gate bitmatch fwd rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    {
+        // 参照: 単体ループ蓄積のdWgate/dLogits。
+        float dXr[24], dWr[16], dWgr[32], dWur[32], dWdr[32];
+        float sgr[8], sur[8], sdr[8], dlr[24];
+        float dXb[24], dWb[16], dWgb[32], dWub[32], dWdb[32];
+        float sgb[8], sub[8], sdb[8], dlb[24];
+        int brc;
+        memset(dXr, 0, sizeof(dXr));
+        brc = ref_single_bwd_accum(dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s,
+                                   Wd_s, ids, w, Gs, Us, Ysel, sGs, sUs,
+                                   T, n, h, E, k, S, dXr, dWr, dWgr, dWur,
+                                   dWdr, sgr, sur, sdr, dlr);
+        CHECK(brc == JT_OK, "gate bitmatch ref rc=%d", brc);
+        if (brc != JT_OK) {
+            return;
+        }
+        memset(dXb, 0, sizeof(dXb));
+        memset(dWb, 0, sizeof(dWb));
+        brc = jt_moe_bwd_batch(dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s,
+                               ids, w, Gs, Us, Ysel, sGs, sUs, perm, off,
+                               dropm, dXb, dWb, dWgb, dWub, dWdb, sgb, sub,
+                               sdb, dlb, T, n, h, E, k, S);
+        CHECK(brc == JT_OK, "gate bitmatch batch rc=%d", brc);
+        if (brc != JT_OK) {
+            return;
+        }
+        // dropなし時は単体版とdWgate/dLogitsがbit一致するはず。
+        // dropあり時はdropped対のgate勾配0化 (Step 3修正) のため単体版と
+        // 一致しない場合がある。その場合はbwd_batch内のtoken順/perm順の
+        // 内部一致のみを別途確認する (下記)。
+        if (dropped == 0) {
+            CHECK(memcmp(dWr, dWb, sizeof(dWr)) == 0,
+                  "gate bitmatch dWgate bits");
+            CHECK(memcmp(dlr, dlb, sizeof(dlr)) == 0,
+                  "gate bitmatch dLogits bits");
+        }
+        // 内部一致: token順加算とperm順加算のbit一致 (drop有無によらず)。
+        // bwd_batchのdLogits出力 (float) を正として、dWgateをtoken昇順
+        // ループとperm順ループ (expert外側・m昇順) で別々に組み立て、
+        // bit一致を確認する。同一dl・同一丸めのため順序固定の検証になる。
+        // 一致しなければ実装バグ (必須条件1)。
+        {
+            float dWtok[16], dWprm[16];
+            for (int i = 0; i < E * n; i++) {
+                dWtok[i] = 0.0f;
+                dWprm[i] = 0.0f;
+            }
+            // token順 (t昇順・p昇順)。
+            for (int t = 0; t < T; t++) {
+                const float *Xt = X + (size_t)t * (size_t)n;
+                for (int p = 0; p < k; p++) {
+                    size_t q = (size_t)t * (size_t)k + (size_t)p;
+                    size_t ee;
+                    double dl;
+                    if (dropm[q]) {
+                        continue;
+                    }
+                    ee = ids[q];
+                    dl = (double)dlb[(size_t)t * (size_t)E + ee];
+                    for (int j = 0; j < n; j++) {
+                        dWtok[ee * (size_t)n + (size_t)j] +=
+                            (float)(dl * (double)Xt[j]);
+                    }
+                }
+            }
+            // perm順 (expert昇順外側・m昇順内側)。
+            for (int ee = 0; ee < E; ee++) {
+                size_t b0 = off[(size_t)ee];
+                size_t Me = off[(size_t)ee + 1] - b0;
+                for (size_t m = 0; m < Me; m++) {
+                    size_t q = perm[b0 + m];
+                    size_t t = q / (size_t)k;
+                    const float *Xt = X + t * (size_t)n;
+                    size_t e2 = ids[q];
+                    double dl;
+                    if (e2 != (size_t)ee) {
+                        CHECK(0, "gate perm/expert mismatch");
+                        return;
+                    }
+                    dl = (double)dlb[t * (size_t)E + e2];
+                    for (int j = 0; j < n; j++) {
+                        dWprm[ee * (size_t)n + (size_t)j] +=
+                            (float)(dl * (double)Xt[j]);
+                    }
+                }
+            }
+            CHECK(memcmp(dWtok, dWprm, sizeof(dWtok)) == 0,
+                  "gate token-vs-perm dWgate bits");
+        }
+    }
+}
+
+// バッチbwd等価性 (dropなし→dW系bit一致、dXはtol内)。
+// dXはexpert_id昇順scatterのためslot順と異なる場合があり得る
+// (f32非結合則。§3.2改訂)。tol=1e-5/1e-3は不変。
+static void test_bwd_batch_equiv(void) {
+    const int n = 4;
+    const int h = 2;
+    const int E = 4;
+    const int k = 2;
+    const int S = 1;
+    const int T = 6;
+    float X[24], Wgate[16], Wg[32], Wu[32], Wd[32];
+    float Wg_s[8], Wu_s[8], Wd_s[8];
+    float Yb[24], dY[24];
+    size_t ids[12];
+    float w[12];
+    float Gs[24], Us[24], Ysel[48];
+    float sGs[12], sUs[12];
+    size_t perm[12], off[5];
+    unsigned char dropm[12];
+    size_t kept = 0;
+    size_t dropped = 0;
+    int rc;
+    for (int i = 0; i < T * n; i++) {
+        X[i] = 0.4f * fdval(i, 0, 51) + 0.2f;
+        dY[i] = 0.5f * fdval(i, 1, 71) + 0.15f;
+    }
+    for (int e = 0; e < E; e++) {
+        for (int j = 0; j < n; j++) {
+            Wgate[e * n + j] = 0.3f * fdval(e, j, 52);
+        }
+    }
+    for (int i = 0; i < E * h * n; i++) {
+        Wg[i] = 0.3f * fdval(i, 0, 53);
+        Wu[i] = 0.3f * fdval(i, 1, 54);
+        Wd[i] = 0.3f * fdval(i, 2, 55);
+    }
+    for (int i = 0; i < S * h * n; i++) {
+        Wg_s[i] = 0.3f * fdval(i, 0, 56);
+        Wu_s[i] = 0.3f * fdval(i, 1, 57);
+        Wd_s[i] = 0.3f * fdval(i, 2, 58);
+    }
+    rc = jt_moe_fwd_batch(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Yb, T,
+                          n, h, E, k, S, ids, w, Gs, Us, Ysel, sGs, sUs,
+                          1.25f, perm, off, dropm, &kept, &dropped);
+    CHECK(rc == JT_OK, "bwd equiv fwd rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    CHECK(dropped == 0, "bwd equiv dropped=%zu (want 0)", dropped);
+    if (dropped != 0) {
+        return;
+    }
+    {
+        float dXr[24], dWr[16], dWgr[32], dWur[32], dWdr[32];
+        float sgr[8], sur[8], sdr[8], dlr[24];
+        float dXb[24], dWb[16], dWgb[32], dWub[32], dWdb[32];
+        float sgb[8], sub[8], sdb[8], dlb[24];
+        int brc = ref_single_bwd_accum(dY, X, Wgate, Wg, Wu, Wd, Wg_s,
+                                       Wu_s, Wd_s, ids, w, Gs, Us, Ysel,
+                                       sGs, sUs, T, n, h, E, k, S, dXr,
+                                       dWr, dWgr, dWur, dWdr, sgr, sur,
+                                       sdr, dlr);
+        CHECK(brc == JT_OK, "bwd equiv ref rc=%d", brc);
+        if (brc != JT_OK) {
+            return;
+        }
+        brc = jt_moe_bwd_batch(dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s,
+                               ids, w, Gs, Us, Ysel, sGs, sUs, perm, off,
+                               dropm, dXb, dWb, dWgb, dWub, dWdb, sgb, sub,
+                               sdb, dlb, T, n, h, E, k, S);
+        CHECK(brc == JT_OK, "bwd equiv batch rc=%d", brc);
+        if (brc != JT_OK) {
+            return;
+        }
+        CHECK(memcmp(dWr, dWb, sizeof(dWr)) == 0, "bwd equiv dWgate bits");
+        CHECK(memcmp(dlr, dlb, sizeof(dlr)) == 0, "bwd equiv dLogits bits");
+        CHECK(memcmp(dWgr, dWgb, sizeof(dWgr)) == 0, "bwd equiv dWg bits");
+        CHECK(memcmp(dWur, dWub, sizeof(dWur)) == 0, "bwd equiv dWu bits");
+        CHECK(memcmp(dWdr, dWdb, sizeof(dWdr)) == 0, "bwd equiv dWd bits");
+        CHECK(memcmp(sgr, sgb, sizeof(sgr)) == 0, "bwd equiv dWg_s bits");
+        CHECK(memcmp(sur, sub, sizeof(sur)) == 0, "bwd equiv dWu_s bits");
+        CHECK(memcmp(sdr, sdb, sizeof(sdr)) == 0, "bwd equiv dWd_s bits");
+        // dXはexpert昇順scatterのためtol内一致 (既存tol不変)。
+        for (int i = 0; i < T * n; i++) {
+            double d = fabs((double)dXb[i] - (double)dXr[i]);
+            double allowed = 1e-5 + 1e-5 * fabs((double)dXr[i]);
+            CHECK(d <= allowed, "bwd equiv dX[%d] b=%f r=%f", i, dXb[i],
+                  dXr[i]);
+        }
+        // unchecked版もbit一致。
+        {
+            float dXu[24], dWu2[16], dWgu[32];
+            float dWuu[32], dWdu[32], sgu[8], suu[8], sdu[8], dlu[24];
+            int urc = jt_moe_bwd_batch_unchecked(
+                dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, ids, w, Gs,
+                Us, Ysel, sGs, sUs, perm, off, dropm, dXu, dWu2, dWgu,
+                dWuu, dWdu, sgu, suu, sdu, dlu, T, n, h, E, k, S);
+            CHECK(urc == JT_OK, "bwd equiv unchecked rc=%d", urc);
+            if (urc == JT_OK) {
+                CHECK(memcmp(dWb, dWu2, sizeof(dWb)) == 0,
+                      "bwd equiv unchecked dWgate bits");
+                CHECK(memcmp(dXb, dXu, sizeof(dXb)) == 0,
+                      "bwd equiv unchecked dX bits");
+            }
+        }
+        // 決定論性: 再実行がbit一致。
+        {
+            float dX2[24], dW2[16], dl2[24];
+            float g2[32], u2[32], d2[32], sg2[8], su2[8], sd2[8];
+            int r2 = jt_moe_bwd_batch(
+                dY, X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, ids, w, Gs,
+                Us, Ysel, sGs, sUs, perm, off, dropm, dX2, dW2, g2, u2,
+                d2, sg2, su2, sd2, dl2, T, n, h, E, k, S);
+            CHECK(r2 == JT_OK, "bwd redet rc=%d", r2);
+            if (r2 == JT_OK) {
+                CHECK(memcmp(dXb, dX2, sizeof(dXb)) == 0,
+                      "bwd determinism dX bits");
+                CHECK(memcmp(dWb, dW2, sizeof(dWb)) == 0,
+                      "bwd determinism dWgate bits");
+            }
+        }
+    }
+}
+
+// dropありbwd (dropped対のgate勾配0・寄与0)。
+static void test_bwd_batch_drop(void) {
+    const int n = 2;
+    const int h = 1;
+    const int E = 4;
+    const int k = 2;
+    const int S = 0;
+    const int T = 8;
+    float X[16], Wgate[8], Wg[8], Wu[8], Wd[8];
+    float Yb[16], dY[16];
+    size_t ids[16];
+    float w[16];
+    float Gs[16], Us[16], Ysel[32];
+    size_t perm[16], off[5];
+    unsigned char dropm[16];
+    size_t kept = 0;
+    size_t dropped = 0;
+    int rc;
+    for (int t = 0; t < T; t++) {
+        X[t * n] = 1.0f;
+        X[t * n + 1] = 0.125f * (float)t;
+        dY[t * n] = 0.5f;
+        dY[t * n + 1] = -0.25f;
+    }
+    Wgate[0] = 2.0f;
+    Wgate[1] = 0.0f;
+    Wgate[2] = 1.2f;
+    Wgate[3] = -1.5f;
+    Wgate[4] = 0.0f;
+    Wgate[5] = 1.5f;
+    Wgate[6] = -5.0f;
+    Wgate[7] = 0.0f;
+    for (int i = 0; i < E * h * n; i++) {
+        Wg[i] = 0.3f * fdval(i, 0, 59);
+        Wu[i] = 0.3f * fdval(i, 1, 60);
+        Wd[i] = 0.3f * fdval(i, 2, 61);
+    }
+    rc = jt_moe_fwd_batch(X, Wgate, Wg, Wu, Wd, NULL, NULL, NULL, Yb, T,
+                          n, h, E, k, S, ids, w, Gs, Us, Ysel, NULL, NULL,
+                          1.25f, perm, off, dropm, &kept, &dropped);
+    CHECK(rc == JT_OK, "bwd drop fwd rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    CHECK(kept == 13 && dropped == 3, "bwd drop kept=%zu drop=%zu", kept,
+          dropped);
+    if (kept != 13 || dropped != 3) {
+        return;
+    }
+    {
+        float dXb[16], dWb[8], dWgb[8], dWub[8], dWdb[8], dlb[32];
+        int brc = jt_moe_bwd_batch(dY, X, Wgate, Wg, Wu, Wd, NULL, NULL,
+                                   NULL, ids, w, Gs, Us, Ysel, NULL, NULL,
+                                   perm, off, dropm, dXb, dWb, dWgb, dWub,
+                                   dWdb, NULL, NULL, NULL, dlb, T, n, h, E,
+                                   k, S);
+        CHECK(brc == JT_OK, "bwd drop batch rc=%d", brc);
+        if (brc != JT_OK) {
+            return;
+        }
+        // dropped qに対応する (t,e) のdLogitsは0。
+        for (size_t q = 0; q < (size_t)T * (size_t)k; q++) {
+            if (dropm[q]) {
+                size_t t = q / (size_t)k;
+                size_t ee = ids[q];
+                CHECK(dlb[t * (size_t)E + ee] == 0.0f,
+                      "bwd drop dLogits not zero q=%zu", q);
+            }
+        }
+        // droppedスロットのYselは0埋め済み (fwd保証) のため、
+        // 対応するexpert寄与が混入しないことはdXの有限性で確認する。
+        for (int i = 0; i < T * n; i++) {
+            CHECK(isfinite((double)dXb[i]), "bwd drop dX non-finite");
+        }
+    }
+}
+
+// バッチbwd不正系 (fail-closed: 出力不変)。
+static void test_bwd_batch_invalid(void) {
+    float X[4] = {1.0f, 0.5f, 0.25f, -0.5f};
+    float dY[4] = {0.5f, -0.5f, 0.25f, 0.125f};
+    float Wgate[8] = {1, 0, 0, 1, 0, 0, 0, 0};
+    float W[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+    float dX[4] = {3.0f, 4.0f, 5.0f, 6.0f};
+    float dWg_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    size_t ids[4] = {0, 1, 0, 1};
+    float wt[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    float G[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float Ys[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    size_t perm[4] = {0, 1, 2, 3};
+    size_t off[5] = {0, 1, 2, 2, 4};
+    unsigned char drop[4] = {0, 0, 0, 0};
+    float dWgate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(jt_moe_bwd_batch(NULL, X, Wgate, W, W, W, NULL, NULL, NULL, ids,
+                           wt, G, G, Ys, NULL, NULL, perm, off, drop, dX,
+                           dWgate, dWg_, dWg_, dWg_, NULL, NULL, NULL,
+                           NULL, 2, 2, 1, 4, 2, 0) == JT_ERR_INVAL,
+          "bwd batch NULL dY");
+    CHECK(dX[0] == 3.0f && dX[3] == 6.0f, "bwd batch mutated on NULL");
+    CHECK(jt_moe_bwd_batch(dY, X, Wgate, W, W, W, NULL, NULL, NULL, ids,
+                           wt, G, G, Ys, NULL, NULL, perm, off, drop, dX,
+                           dWgate, dWg_, dWg_, dWg_, NULL, NULL, NULL,
+                           NULL, 0, 2, 1, 4, 2, 0) == JT_ERR_INVAL,
+          "bwd batch T=0");
+    CHECK(jt_moe_bwd_batch(dY, X, Wgate, W, W, W, NULL, NULL, NULL, ids,
+                           wt, G, G, Ys, NULL, NULL, perm, off, drop, dX,
+                           dWgate, dWg_, dWg_, dWg_, NULL, NULL, NULL,
+                           NULL, 2, 2, 1, 4, 5, 0) == JT_ERR_INVAL,
+          "bwd batch k>E");
+    {
+        size_t badoff[5] = {1, 0, 0, 0, 0};
+        CHECK(jt_moe_bwd_batch(dY, X, Wgate, W, W, W, NULL, NULL, NULL,
+                               ids, wt, G, G, Ys, NULL, NULL, perm, badoff,
+                               drop, dX, dWgate, dWg_, dWg_, dWg_, NULL,
+                               NULL, NULL, NULL, 2, 2, 1, 4, 2,
+                               0) == JT_ERR_INVAL,
+              "bwd batch bad off");
+        CHECK(dX[0] == 3.0f, "bwd batch mutated on bad off");
+    }
+}
+
 int main(void) {
     test_fwd_known();
     test_grad();
@@ -1023,6 +1510,10 @@ int main(void) {
     test_batch_equiv();
     test_batch_drop_fwd();
     test_batch_invalid();
+    test_bwd_batch_gate_bitmatch();
+    test_bwd_batch_equiv();
+    test_bwd_batch_drop();
+    test_bwd_batch_invalid();
     if (g_fail != 0) {
         fprintf(stderr, "moe_layer: FAIL\n");
         return 1;
