@@ -860,7 +860,7 @@ static void test_batch_equiv(void) {
     }
 }
 
-// drop あり forward (部分 drop の寄与 0・renormalize なし)。
+// drop あり forward (部分 drop の寄与 0・kept は renormalize あり=G2改訂)。
 // n=2,h=1,E=4,k=2,S=0,T=8。X[t]=[1,0.125t]、Wgate で t0-3→[0,1]、t4-7→[0,2]
 // (logit ギャップ ≥0.075 で AVX2/スカラー共通に安定)。
 // cap=ceil(1.25*16/4)=5。e0 は 8 割当てで t5-7 を drop (dropped=3)。
@@ -931,14 +931,44 @@ static void test_batch_drop_fwd(void) {
     }
     CHECK(memcmp(ids_s, ids_b, sizeof(ids_s)) == 0,
           "batch drop ids bits");
-    CHECK(memcmp(w_s, w_b, sizeof(w_s)) == 0,
-          "batch drop weights bits (no renormalize)");
-    // kept トークン (t0-4) は単体版と bit 一致。
+    // G2改訂: kept 重みは renormalize されるため w_s との memcmp はしない。
+    // dropなしトークン (t0-4) の w は不変、dropあり (t5-7) の kept は w/S。
+    for (int t = 0; t < T; t++) {
+        double s = 0.0;
+        for (int p = 0; p < k; p++) {
+            size_t q = (size_t)t * (size_t)k + (size_t)p;
+            if (!dropm[q]) {
+                s += (double)w_s[q];
+            }
+        }
+        for (int p = 0; p < k; p++) {
+            size_t q = (size_t)t * (size_t)k + (size_t)p;
+            double want;
+            double got = (double)w_b[q];
+            double dd;
+            if (dropm[q]) {
+                continue; /* dropped の out_weights は未使用のため不問 */
+            }
+            want = (s > 0.0) ? ((double)w_s[q] / s) : (double)w_s[q];
+            dd = fabs(got - want);
+            CHECK(dd <= 1e-6 + 1e-6 * fabs(want),
+                  "batch drop renormalize t=%d p=%d got=%f want=%f", t,
+                  p, got, want);
+        }
+    }
+    // kept トークン (t0-4) は単体版と bit 一致 (renormalize なしのため)。
     CHECK(memcmp(Ys, Yb, (size_t)5 * (size_t)n * sizeof(float)) == 0,
           "batch drop kept rows bits");
-    // 部分 drop トークン (t5-7): dropped 側寄与 0・renormalize なし。
-    // 期待値 = kept 側の w*Ysel (単体版 cache 値で再結合)。
+    // 部分 drop トークン (t5-7): dropped 側寄与 0・kept は renormalize。
+    // 期待値 = kept 側の (w/S)*Ysel (単体版 cache 値で再結合)。
     for (int t = 5; t < T; t++) {
+        double s = 0.0;
+        for (int p = 0; p < k; p++) {
+            size_t q = (size_t)t * (size_t)k + (size_t)p;
+            if (!dropm[q]) {
+                s += (double)w_s[q];
+            }
+        }
         for (int j = 0; j < n; j++) {
             double want = 0.0;
             for (int p = 0; p < k; p++) {
@@ -946,7 +976,7 @@ static void test_batch_drop_fwd(void) {
                 if (dropm[q]) {
                     continue;
                 }
-                want += (double)w_s[q] *
+                want += ((double)w_s[q] / s) *
                         (double)Ysel_s[q * (size_t)n + (size_t)j];
             }
             double got = (double)Yb[(size_t)t * (size_t)n + (size_t)j];

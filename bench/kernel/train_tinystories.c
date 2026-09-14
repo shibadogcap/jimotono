@@ -80,6 +80,11 @@
 #define TS_DELIM "<|endoftext|>"
 #define TS_DELIM_LEN 13
 
+// Phase G G2改訂: --moe-batch でバッチ経路 (T=1 per-token batch API) を使用。
+// 既定0=単体ループ。同一データ順・同一初期化で single vs batch を比較する。
+static int g_ts_moe_batch = 0;
+#define TS_CAP_FACTOR 1.5f
+
 // ---- 決定論的ハッシュ乱数 (train_names/train_proxy100mと同流儀) ----
 static uint64_t ts_hash64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
@@ -184,7 +189,8 @@ static void ts_usage(const char *prog) {
             "usage: %s [--data txt] [--pack jtdp] [--write-pack out.jtdp] "
             "[--steps N] [--time SECS] [--lr LR] [--batch B] [--d DIM] "
             "[--layers L] [--val-every K] [--patience P] [--vocab V] "
-            "[--bpe-vocab PATH] [--max-stories N] [--max-val-pairs N]\n"
+            "[--bpe-vocab PATH] [--max-stories N] [--max-val-pairs N] "
+            "[--moe-batch]\n"
             "  defaults: data=data/tinystories_head16M.txt "
             "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=3e-4 "
             "batch=64 d=64 layers=2 val-every=100 patience=100 vocab=258 "
@@ -193,7 +199,8 @@ static void ts_usage(const char *prog) {
             "  --vocab: 258 (byte+special) or 48588 (llm-jp v2.2 Unigram, "
             "requires --bpe-vocab)\n"
             "  --patience 0 disables early stopping\n"
-            "  --max-val-pairs 0 evaluates full val set\n",
+            "  --max-val-pairs 0 evaluates full val set\n"
+            "  --moe-batch: Phase G batch dispatch (T=1 per-token, cap=1.5)\n",
             prog);
 }
 
@@ -401,6 +408,228 @@ static int ts_bwd_one(ts_model_t *restrict m, int x,
                             ids, w, Gsel, Usel, Ysel, Gs, Us, dX, tWgate,
                             tWg, tWu, tWd, tWgs, tWus, tWds, NULL, d, TS_H,
                             TS_E, TS_K, TS_S);
+        if (rc != JT_OK) {
+            return rc;
+        }
+        for (z = 0; z < m->lt.layer_stride; z++) {
+            gbase[z] += tW[z];
+        }
+        for (j = 0; j < d; j++) {
+            dh[j] += dX[j];
+        }
+    }
+    for (j = 0; j < d; j++) {
+        Gemb[(size_t)x * (size_t)d + (size_t)j] += dh[j];
+    }
+    return JT_OK;
+}
+
+// ---- Phase G G2改訂: バッチ経路 (T=1 per-token batch API) ----
+// 単体版と同一レイアウトの cache を使い、MoE層のみ jt_moe_fwd_batch /
+// jt_moe_bwd_batch (T=1, cap=1.5) に置換する。T=1・E=8・k=2では
+// cap=ceil(1.5*2/8)=1、各ペアは distinct expert のため drop は通常0
+// (H1分離：drop 0なら残差はH2)。renormalizeはライブラリ側で実施。
+// perm/off/drop は層別に呼び出し側確保域へ写す (bwdで同一perm再利用、再ソート禁止)。
+// fail-closed: 検証失敗時は acts/Y 更新前に拒否 (Y不変は下位APIが保証)。
+static int ts_fwd_one_batch(const ts_model_t *restrict m, int x,
+                            float *restrict acts, size_t *restrict cids,
+                            float *restrict cw, float *restrict cgsel,
+                            float *restrict cusel, float *restrict cysel,
+                            float *restrict cgs, float *restrict cus,
+                            size_t *restrict bperm, size_t *restrict boff,
+                            unsigned char *restrict bdrop,
+                            size_t *restrict out_dropped,
+                            float *restrict logits, float *restrict probs,
+                            float *restrict loss_out, int y) {
+    int L = m->lt.n_layers;
+    int d = m->lt.d;
+    int V = m->lt.v;
+    const float *P = m->P;
+    const float *emb = P + m->lt.off_emb;
+    const float *Wo = P + m->lt.off_head_wo;
+    const float *bo = P + m->lt.off_head_bo;
+    float M[256];
+    size_t dropped_total = 0;
+    int l = 0;
+    int j = 0;
+    int v = 0;
+    if (d > 256 || x < 0 || x >= V) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    for (j = 0; j < d; j++) {
+        acts[j] = emb[(size_t)x * (size_t)d + (size_t)j];
+    }
+    for (l = 0; l < L; l++) {
+        const float *base =
+            P + m->lt.off_emb + (size_t)V * (size_t)d +
+            (size_t)l * m->lt.layer_stride;
+        const float *Wgate = base + m->lt.off_wgate;
+        const float *Wg = base + m->lt.off_wg;
+        const float *Wu = base + m->lt.off_wu;
+        const float *Wd = base + m->lt.off_wd;
+        const float *Wgs = base + m->lt.off_wgs;
+        const float *Wus = base + m->lt.off_wus;
+        const float *Wds = base + m->lt.off_wds;
+        const float *xin = acts + (size_t)l * (size_t)d;
+        size_t *ids = cids + (size_t)l * (size_t)TS_K;
+        float *w = cw + (size_t)l * (size_t)TS_K;
+        float *Gsel = cgsel + (size_t)l * (size_t)TS_K * (size_t)TS_H;
+        float *Usel = cusel + (size_t)l * (size_t)TS_K * (size_t)TS_H;
+        float *Ysel = cysel + (size_t)l * (size_t)TS_K * (size_t)d;
+        float *Gs = cgs + (size_t)l * (size_t)TS_S * (size_t)TS_H;
+        float *Us = cus + (size_t)l * (size_t)TS_S * (size_t)TS_H;
+        size_t perm_tmp[TS_K];
+        size_t off_tmp[TS_E + 1];
+        unsigned char drop_tmp[TS_K];
+        size_t kept = 0;
+        size_t dropped = 0;
+        int rc = jt_moe_fwd_batch(xin, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds,
+                                  M, 1, d, TS_H, TS_E, TS_K, TS_S, ids, w,
+                                  Gsel, Usel, Ysel, Gs, Us, TS_CAP_FACTOR,
+                                  perm_tmp, off_tmp, drop_tmp, &kept,
+                                  &dropped);
+        if (rc != JT_OK) {
+            return rc;
+        }
+        dropped_total += dropped;
+        if (bperm != NULL) {
+            size_t *bp = bperm + (size_t)l * (size_t)TS_K;
+            for (size_t i = 0; i < kept && i < (size_t)TS_K; i++) {
+                bp[i] = perm_tmp[i];
+            }
+            for (size_t i = kept; i < (size_t)TS_K; i++) {
+                bp[i] = 0;
+            }
+        }
+        if (boff != NULL) {
+            size_t *bop = boff + (size_t)l * ((size_t)TS_E + 1);
+            for (int e = 0; e <= TS_E; e++) {
+                bop[(size_t)e] = off_tmp[(size_t)e];
+            }
+        }
+        if (bdrop != NULL) {
+            unsigned char *bd = bdrop + (size_t)l * (size_t)TS_K;
+            for (int p = 0; p < TS_K; p++) {
+                bd[(size_t)p] = drop_tmp[(size_t)p];
+            }
+        }
+        for (j = 0; j < d; j++) {
+            double t = (double)xin[j] + (double)M[j];
+            if (!isfinite(t)) {
+                errno = EINVAL;
+                return JT_ERR_INVAL;
+            }
+            (acts + (size_t)(l + 1) * (size_t)d)[j] = (float)t;
+        }
+    }
+    {
+        const float *hl = acts + (size_t)L * (size_t)d;
+        for (v = 0; v < V; v++) {
+            double acc = (double)bo[v];
+            for (j = 0; j < d; j++) {
+                acc += (double)Wo[(size_t)v * (size_t)d + (size_t)j] *
+                       (double)hl[j];
+            }
+            if (!isfinite(acc)) {
+                errno = EINVAL;
+                return JT_ERR_INVAL;
+            }
+            logits[v] = (float)acc;
+        }
+    }
+    if (out_dropped != NULL) {
+        *out_dropped = dropped_total;
+    }
+    return ts_ce_fwd(logits, V, y, loss_out, probs);
+}
+
+static int ts_bwd_one_batch(ts_model_t *restrict m, int x,
+                            const float *restrict acts,
+                            const size_t *restrict cids,
+                            const float *restrict cw,
+                            const float *restrict cgsel,
+                            const float *restrict cusel,
+                            const float *restrict cysel,
+                            const float *restrict cgs,
+                            const float *restrict cus,
+                            const size_t *restrict bperm,
+                            const size_t *restrict boff,
+                            const unsigned char *restrict bdrop,
+                            const float *restrict probs, float *restrict dlog,
+                            float *restrict dh, float *restrict dX,
+                            float *restrict tW, int y, float dlog_scale) {
+    int L = m->lt.n_layers;
+    int d = m->lt.d;
+    int V = m->lt.v;
+    float *G = m->G;
+    const float *P = m->P;
+    float *Gemb = G + m->lt.off_emb;
+    float *GWo = G + m->lt.off_head_wo;
+    float *Gbo = G + m->lt.off_head_bo;
+    const float *Wo = P + m->lt.off_head_wo;
+    int l = 0;
+    int j = 0;
+    int v = 0;
+    if (bperm == NULL || boff == NULL || bdrop == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (ts_ce_bwd(probs, V, y, dlog_scale, dlog) != JT_OK) {
+        return JT_ERR_INVAL;
+    }
+    {
+        const float *hl = acts + (size_t)L * (size_t)d;
+        for (j = 0; j < d; j++) {
+            dh[j] = 0.0f;
+        }
+        for (v = 0; v < V; v++) {
+            float g = dlog[v];
+            Gbo[v] += g;
+            for (j = 0; j < d; j++) {
+                GWo[(size_t)v * (size_t)d + (size_t)j] += g * hl[j];
+                dh[j] += g * Wo[(size_t)v * (size_t)d + (size_t)j];
+            }
+        }
+    }
+    for (l = L - 1; l >= 0; l--) {
+        const float *base =
+            P + m->lt.off_emb + (size_t)V * (size_t)d +
+            (size_t)l * m->lt.layer_stride;
+        float *gbase = G + m->lt.off_emb +
+                       (size_t)V * (size_t)d +
+                       (size_t)l * m->lt.layer_stride;
+        const float *Wgate = base + m->lt.off_wgate;
+        const float *Wg = base + m->lt.off_wg;
+        const float *Wu = base + m->lt.off_wu;
+        const float *Wd = base + m->lt.off_wd;
+        const float *Wgs = base + m->lt.off_wgs;
+        const float *Wus = base + m->lt.off_wus;
+        const float *Wds = base + m->lt.off_wds;
+        const float *xin = acts + (size_t)l * (size_t)d;
+        const size_t *ids = cids + (size_t)l * (size_t)TS_K;
+        const float *w = cw + (size_t)l * (size_t)TS_K;
+        const float *Gsel = cgsel + (size_t)l * (size_t)TS_K * (size_t)TS_H;
+        const float *Usel = cusel + (size_t)l * (size_t)TS_K * (size_t)TS_H;
+        const float *Ysel = cysel + (size_t)l * (size_t)TS_K * (size_t)d;
+        const float *Gs = cgs + (size_t)l * (size_t)TS_S * (size_t)TS_H;
+        const float *Us = cus + (size_t)l * (size_t)TS_S * (size_t)TS_H;
+        const size_t *perm = bperm + (size_t)l * (size_t)TS_K;
+        const size_t *off = boff + (size_t)l * ((size_t)TS_E + 1);
+        const unsigned char *dropm = bdrop + (size_t)l * (size_t)TS_K;
+        float *tWgate = tW + m->lt.off_wgate;
+        float *tWg = tW + m->lt.off_wg;
+        float *tWu = tW + m->lt.off_wu;
+        float *tWd = tW + m->lt.off_wd;
+        float *tWgs = tW + m->lt.off_wgs;
+        float *tWus = tW + m->lt.off_wus;
+        float *tWds = tW + m->lt.off_wds;
+        size_t z = 0;
+        int rc = jt_moe_bwd_batch(dh, xin, Wgate, Wg, Wu, Wd, Wgs, Wus,
+                                  Wds, ids, w, Gsel, Usel, Ysel, Gs, Us,
+                                  perm, off, dropm, dX, tWgate, tWg, tWu,
+                                  tWd, tWgs, tWus, tWds, NULL, 1, d, TS_H,
+                                  TS_E, TS_K, TS_S);
         if (rc != JT_OK) {
             return rc;
         }
@@ -908,6 +1137,9 @@ int main(int argc, char **argv) {
     float *dh = NULL;
     float *dX = NULL;
     float *tW = NULL;
+    size_t *bperm = NULL;
+    size_t *boff = NULL;
+    unsigned char *bdrop = NULL;
     double t0 = 0.0;
     long step = 0;
     long steps_done = 0;
@@ -924,6 +1156,8 @@ int main(int argc, char **argv) {
     const char *stop_reason = "-";
     int i = 0;
 
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     memset(&m, 0, sizeof(m));
     prev_vals[0] = prev_vals[1] = prev_vals[2] = 0.0;
 
@@ -963,6 +1197,8 @@ int main(int argc, char **argv) {
             max_stories = atol(argv[++i]);
         } else if (strcmp(argv[i], "--max-val-pairs") == 0 && i + 1 < argc) {
             max_val_pairs = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--moe-batch") == 0) {
+            g_ts_moe_batch = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             ts_usage(argv[0]);
@@ -1214,9 +1450,9 @@ int main(int argc, char **argv) {
         m.opt_inited = 1;
     }
     printf("train_ts: layers=%d d=%d E=%d K=%d S=%d H=%d V=%d "
-           "params=%zu lr=%.5f batch=%ld patience=%ld\n",
+           "params=%zu lr=%.5f batch=%ld patience=%ld moe_batch=%d cap=%.2f\n",
            n_layers, d, TS_E, TS_K, TS_S, TS_H, vocab, m.lt.n_total, lr,
-           batch, patience);
+           batch, patience, g_ts_moe_batch, (double)TS_CAP_FACTOR);
     /* 常駐見積り (d=64維持。V=48588でemb/head各64*48588*4B≈12.4MB。許容内) */
     {
         size_t n = m.lt.n_total;
@@ -1254,10 +1490,19 @@ int main(int argc, char **argv) {
     dh = (float *)malloc((size_t)d * sizeof(float));
     dX = (float *)malloc((size_t)d * sizeof(float));
     tW = (float *)malloc(m.lt.layer_stride * sizeof(float));
+    if (g_ts_moe_batch) {
+        bperm = (size_t *)malloc((size_t)n_layers * (size_t)TS_K *
+                                 sizeof(size_t));
+        boff = (size_t *)malloc((size_t)n_layers * ((size_t)TS_E + 1) *
+                                sizeof(size_t));
+        bdrop = (unsigned char *)malloc((size_t)n_layers * (size_t)TS_K *
+                                        sizeof(unsigned char));
+    }
     if (acts == NULL || cids == NULL || cw == NULL || cgsel == NULL ||
         cusel == NULL || cysel == NULL || cgs == NULL || cus == NULL ||
         logits == NULL || probs == NULL || dlog == NULL || dh == NULL ||
-        dX == NULL || tW == NULL) {
+        dX == NULL || tW == NULL ||
+        (g_ts_moe_batch && (bperm == NULL || boff == NULL || bdrop == NULL))) {
         fprintf(stderr, "train_tinystories: OOM\n");
         errno = ENOMEM;
         goto cleanup;
@@ -1300,12 +1545,15 @@ int main(int argc, char **argv) {
     }
 
     /* ---- 学習ループ (合計勾配更新・fail-closed、train_namesと同流儀) ---- */
+    /* G2用に毎ステップ train_ce/gnorm/drop を stderr へ1行記録する (単体・batch共通)。 */
     t0 = ts_now_sec();
     for (step = 0; step < max_steps; step++) {
         double sum = 0.0;
         long b = 0;
         float scale = 1.0f;
         size_t p = 0;
+        size_t step_dropped = 0;
+        double gnorm = 0.0;
         if (ts_now_sec() - t0 > time_limit) {
             printf("train_ts: time limit (%.0fs), stop at step=%ld\n",
                    time_limit, step);
@@ -1318,18 +1566,42 @@ int main(int argc, char **argv) {
                 0x123456789abcdefULL;
             long idx = (long)(ts_hash64(key) % (uint64_t)n_train_pairs);
             float loss = 0.0f;
-            int rc = ts_fwd_one(&m, tx[idx], acts, cids, cw, cgsel, cusel,
+            int rc;
+            if (g_ts_moe_batch) {
+                size_t bd = 0;
+                rc = ts_fwd_one_batch(&m, tx[idx], acts, cids, cw, cgsel,
+                                      cusel, cysel, cgs, cus, bperm, boff,
+                                      bdrop, &bd, logits, probs, &loss,
+                                      ty[idx]);
+                if (rc != JT_OK) {
+                    fprintf(stderr,
+                            "train_tinystories: fwd failed at step=%ld\n",
+                            step);
+                    goto cleanup;
+                }
+                step_dropped += bd;
+            } else {
+                rc = ts_fwd_one(&m, tx[idx], acts, cids, cw, cgsel, cusel,
                                 cysel, cgs, cus, logits, probs, &loss,
                                 ty[idx]);
-            if (rc != JT_OK) {
-                fprintf(stderr, "train_tinystories: fwd failed at step=%ld\n",
-                        step);
-                goto cleanup;
+                if (rc != JT_OK) {
+                    fprintf(stderr,
+                            "train_tinystories: fwd failed at step=%ld\n",
+                            step);
+                    goto cleanup;
+                }
             }
             sum += (double)loss;
-            rc = ts_bwd_one(&m, tx[idx], acts, cids, cw, cgsel, cusel,
-                            cysel, cgs, cus, probs, dlog, dh, dX, tW,
-                            ty[idx], scale);
+            if (g_ts_moe_batch) {
+                rc = ts_bwd_one_batch(&m, tx[idx], acts, cids, cw, cgsel,
+                                      cusel, cysel, cgs, cus, bperm, boff,
+                                      bdrop, probs, dlog, dh, dX, tW,
+                                      ty[idx], scale);
+            } else {
+                rc = ts_bwd_one(&m, tx[idx], acts, cids, cw, cgsel, cusel,
+                                cysel, cgs, cus, probs, dlog, dh, dX, tW,
+                                ty[idx], scale);
+            }
             if (rc != JT_OK) {
                 fprintf(stderr, "train_tinystories: bwd failed at step=%ld\n",
                         step);
@@ -1337,15 +1609,32 @@ int main(int argc, char **argv) {
             }
         }
         last_train_ce = sum / (double)batch;
-        for (p = 0; p < m.lt.n_total; p++) {
-            double g = (double)m.G[p];
-            if (!isfinite(g)) {
-                fprintf(stderr,
-                        "train_tinystories: non-finite grad at step=%ld\n",
-                        step);
-                errno = EINVAL;
-                goto cleanup;
+        {
+            double ss = 0.0;
+            for (p = 0; p < m.lt.n_total; p++) {
+                double g = (double)m.G[p];
+                if (!isfinite(g)) {
+                    fprintf(stderr,
+                            "train_tinystories: non-finite grad at step=%ld\n",
+                            step);
+                    errno = EINVAL;
+                    goto cleanup;
+                }
+                ss += g * g;
             }
+            gnorm = sqrt(ss);
+        }
+        {
+            size_t denom =
+                (size_t)batch * (size_t)n_layers * (size_t)TS_K;
+            double dr = (denom > 0)
+                            ? (100.0 * (double)step_dropped / (double)denom)
+                            : 0.0;
+            fprintf(stderr,
+                    "train_ts_step: step=%ld train_ce=%.6f gnorm=%.6f "
+                    "dropped=%zu/%zu (%.4f%%) moe_batch=%d\n",
+                    step + 1, last_train_ce, gnorm, step_dropped, denom, dr,
+                    g_ts_moe_batch);
         }
         if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
             fprintf(stderr, "train_tinystories: optim failed at step=%ld\n",
@@ -1444,5 +1733,8 @@ cleanup:
     free(dh);
     free(dX);
     free(tW);
+    free(bperm);
+    free(boff);
+    free(bdrop);
     return rc_all;
 }

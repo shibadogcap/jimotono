@@ -971,6 +971,42 @@ static int jt_moe_fwd_batch_impl(
             goto cleanup;  // errnoは下位で設定済み
         }
     }
+    // G2改訂: dropペアの重みを残りで再正規化 (in-place, keptのみ)。
+    // トークン毎に S=sum(kept w)。droppedあり・S>0なら kept w/=S。
+    // S==0 (当該トークン全drop) は寄与0のまま。bwdは renormalize 後重みで
+    // ヤコビアンを計算する (分母S経由の2次項は straight-through で無視)。
+    // out_ids/out_weights/cache はスクラッチ扱い (Yの不変のみ保証)。
+    for (int t = 0; t < T; t++) {
+        double s = 0.0;
+        int nd = 0;
+        for (int p = 0; p < topk; p++) {
+            size_t q = (size_t)t * (size_t)topk + (size_t)p;
+            if (drop[q]) {
+                nd++;
+            } else {
+                s += (double)out_weights[q];
+            }
+        }
+        if (nd > 0 && s > 0.0) {
+            if (!isfinite(s)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            for (int p = 0; p < topk; p++) {
+                size_t q = (size_t)t * (size_t)topk + (size_t)p;
+                double rw;
+                if (drop[q]) {
+                    continue;
+                }
+                rw = (double)out_weights[q] / s;
+                if (!isfinite(rw) || rw < 0.0) {
+                    errno = EINVAL;
+                    goto cleanup;
+                }
+                out_weights[q] = (float)rw;
+            }
+        }
+    }
     // Phase G Step 2: expert 単位バッチ fwd (素朴 GEMM 参照実装)。
     // expert 連続バッファ Xe [M_e][n] に gather し、M 方向に既存
     // jt_swiglu_fwd 核を拡張して expert-outer/M-inner 順 (§2.1) で計算する。
@@ -1084,7 +1120,7 @@ static int jt_moe_fwd_batch_impl(
             float w;
             const float *Yp;
             if (drop[q]) {
-                continue;  // renormalize しない (§1.2 仕様)
+                continue;  // G2改訂: renormalize 済み (§1.2)。dropped寄与0
             }
             w = out_weights[q];
             Yp = (cache_Ysel != NULL) ? (cache_Ysel + q * (size_t)n)

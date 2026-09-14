@@ -314,7 +314,7 @@ static void lr_fwd_layer_range_batch(const lr_ctx_t *restrict ctx, int layer,
         int frc = jt_moe_fwd_batch_unchecked(
             Xb, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, Mb, Tsub, LR_N, LR_H,
             LR_E, LR_K, LR_S, ids, weights, Gsel, Usel, Ysel, Gs, Us,
-            1.25f, perm, off, dropm, &kept, &dropped);
+            1.5f, perm, off, dropm, &kept, &dropped);
         if (frc != JT_OK) {
             rc = frc;
         } else {
@@ -902,6 +902,8 @@ int main(int argc, char **argv) {
     long csw_prev_v = 0L;  // D2: 前ステップのru_nvcsw (自発的)
     long csw_prev_iv = 0L; // D2: 前ステップのru_nivcsw (非自発的)
 
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     memset(&opt, 0, sizeof(opt));
     memset(&es, 0, sizeof(es));
     memset(layer_off, 0, sizeof(layer_off));
