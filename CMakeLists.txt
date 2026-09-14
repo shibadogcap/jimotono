@@ -58,9 +58,14 @@ add_library(jimotono_core
 #   （スカラーフォールバック。同一ソースがビルド可能）。
 # - N100/i5-8th baselineはいずれもAVX2対応のため既定バイナリは動作する。
 # - FMAは付けない（-mfmaなし。mul/add分離のbit同一を保つため）。
+# S0b-1: train_bwd.c を追加 (内蔵の jt_bwd_avx2_* が有効化される。
+# reductionドット4箇所のみ合算順序が変わりtol内一致(相対~1e-16)、他は
+# bit同一。FMAなし・AVX-512なしは維持。F2のbwd頭打ちの一因だった
+# jt_swiglu_bwdスカラー律速 (moe_bwdの約7割) への最小限対処)。
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   set_source_files_properties(src/moe_gemm.c PROPERTIES COMPILE_OPTIONS "-mavx2")
   set_source_files_properties(src/moe_layer.c PROPERTIES COMPILE_OPTIONS "-mavx2")
+  set_source_files_properties(src/train_bwd.c PROPERTIES COMPILE_OPTIONS "-mavx2")
 endif()
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -121,6 +126,10 @@ if(JIMOTONO_BUILD_BENCH)
 
   add_executable(bench_smoke bench/kernel/bench_smoke.c)
   target_link_libraries(bench_smoke PRIVATE jimotono_bench_common)
+
+  # S0b-4: STREAM Triad相当の実効帯域マイクロベンチ (短時間・正しさのみassert)。
+  add_executable(bw_stream bench/kernel/bw_stream.c)
+  target_link_libraries(bw_stream PRIVATE jimotono_bench_common)
 
   add_executable(test_uring bench/kernel/test_uring.c)
   target_link_libraries(test_uring PRIVATE jimotono_core)
@@ -208,6 +217,8 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME moe_layer COMMAND test_moe_layer)
   add_test(NAME data_pack COMMAND test_data_pack)
   add_test(NAME bpe COMMAND test_bpe)
+  # S0b-4: 正しさのみassert。帯域値は参考出力 (速度での合否判定なし)。
+  add_test(NAME bw_stream COMMAND bw_stream)
 endif()
 
 # Cross-compile hints (CMake + Zig per AGENTS.MD 6):
