@@ -662,6 +662,354 @@ static void test_unchecked_match(void) {
     }
 }
 
+// ---- Phase G Step 1: batch sort + fwd_batch ----
+// 既知値 (T=4,k=2,E=3,cap_factor=1.0 → cap=ceil(8/3)=3。全fit)。
+static void test_batch_sort_known(void) {
+    size_t ids[8] = {2, 0, 1, 2, 0, 1, 2, 1};
+    size_t perm[8] = {99, 99, 99, 99, 99, 99, 99, 99};
+    size_t perm2[8] = {98, 98, 98, 98, 98, 98, 98, 98};
+    size_t off[4] = {99, 99, 99, 99};
+    unsigned char drop[8] = {9, 9, 9, 9, 9, 9, 9, 9};
+    size_t kept = 999;
+    size_t dropped = 999;
+    size_t want_perm[8] = {1, 4, 2, 5, 7, 0, 3, 6};
+    size_t want_off[4] = {0, 2, 5, 8};
+    int rc = jt_moe_batch_sort(ids, 4, 2, 3, 1.0f, perm, off, drop,
+                               &kept, &dropped);
+    CHECK(rc == JT_OK, "batch sort known rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    CHECK(memcmp(perm, want_perm, sizeof(perm)) == 0,
+          "batch sort known perm");
+    CHECK(memcmp(off, want_off, sizeof(off)) == 0,
+          "batch sort known off");
+    CHECK(kept == 8 && dropped == 0, "batch sort known kept=%zu drop=%zu",
+          kept, dropped);
+    for (int q = 0; q < 8; q++) {
+        CHECK(drop[q] == 0, "batch sort known drop[%d]=%u", q,
+              drop[q]);
+    }
+    // 決定論性：同一入力の再実行が完全一致。
+    CHECK(jt_moe_batch_sort(ids, 4, 2, 3, 1.0f, perm2, off, drop, NULL,
+                            NULL) == JT_OK,
+          "batch sort redet rc");
+    CHECK(memcmp(perm, perm2, sizeof(perm)) == 0,
+          "batch sort determinism");
+}
+
+// 超過 drop (T=4,k=2,E=2,cap_factor=1.0 → cap=4。e0に5割当てで1 drop)。
+static void test_batch_sort_drop(void) {
+    size_t ids[8] = {0, 0, 0, 0, 0, 1, 1, 1};
+    size_t perm[8] = {99, 99, 99, 99, 99, 99, 99, 99};
+    size_t off[3] = {99, 99, 99};
+    unsigned char drop[8] = {9, 9, 9, 9, 9, 9, 9, 9};
+    size_t kept = 999;
+    size_t dropped = 999;
+    size_t want_perm[7] = {0, 1, 2, 3, 5, 6, 7};
+    size_t want_off[3] = {0, 4, 7};
+    unsigned char want_drop[8] = {0, 0, 0, 0, 1, 0, 0, 0};
+    int rc = jt_moe_batch_sort(ids, 4, 2, 2, 1.0f, perm, off, drop,
+                               &kept, &dropped);
+    CHECK(rc == JT_OK, "batch sort drop rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    CHECK(kept == 7 && dropped == 1, "batch sort drop kept=%zu drop=%zu",
+          kept, dropped);
+    CHECK(memcmp(off, want_off, sizeof(want_off)) == 0,
+          "batch sort drop off");
+    CHECK(memcmp(drop, want_drop, sizeof(want_drop)) == 0,
+          "batch sort drop mask");
+    CHECK(memcmp(perm, want_perm, sizeof(want_perm)) == 0,
+          "batch sort drop perm");
+    CHECK(off[2] == kept, "batch sort drop off[E]!=kept");
+}
+
+// sort 不正系 (fail-closed: 出力不変)。
+static void test_batch_sort_invalid(void) {
+    size_t ids[2] = {0, 1};
+    size_t perm[2] = {7, 7};
+    size_t off[3] = {7, 7, 7};
+    unsigned char drop[2] = {7, 7};
+    size_t bad[2] = {0, 9};
+    CHECK(jt_moe_batch_sort(NULL, 1, 1, 2, 1.25f, perm, off, drop, NULL,
+                            NULL) == JT_ERR_INVAL,
+          "batch sort NULL ids");
+    CHECK(jt_moe_batch_sort(ids, 0, 1, 2, 1.25f, perm, off, drop, NULL,
+                            NULL) == JT_ERR_INVAL,
+          "batch sort T=0");
+    CHECK(jt_moe_batch_sort(ids, 1, 3, 2, 1.25f, perm, off, drop, NULL,
+                            NULL) == JT_ERR_INVAL,
+          "batch sort k>E");
+    CHECK(jt_moe_batch_sort(ids, 1, 1, 2, 2.0f, perm, off, drop, NULL,
+                            NULL) == JT_ERR_INVAL,
+          "batch sort cap>1.5");
+    CHECK(jt_moe_batch_sort(ids, 1, 1, 2, 0.5f, perm, off, drop, NULL,
+                            NULL) == JT_ERR_INVAL,
+          "batch sort cap<1.0");
+    CHECK(jt_moe_batch_sort(bad, 1, 2, 2, 1.25f, perm, off, drop, NULL,
+                            NULL) == JT_ERR_INVAL,
+          "batch sort ids>=E");
+    CHECK(perm[0] == 7 && perm[1] == 7 && off[0] == 7 && drop[0] == 7,
+          "batch sort mutated on error");
+}
+
+// batch vs 単体ループの等価性 (drop なし → bit 一致)。
+static void test_batch_equiv(void) {
+    const int n = 4;
+    const int h = 2;
+    const int E = 4;
+    const int k = 2;
+    const int S = 1;
+    const int T = 6;
+    float X[24], Wgate[16], Wg[32], Wu[32], Wd[32];
+    float Wg_s[8], Wu_s[8], Wd_s[8];
+    float Ys[24], Yb[24];
+    size_t ids_s[12], ids_b[12];
+    float w_s[12], w_b[12];
+    float Gs_s[24], Gs_b[24], Us_s[24], Us_b[24];
+    float Ysel_s[48], Ysel_b[48];
+    float sGs_s[12], sGs_b[12], sUs_s[12], sUs_b[12];
+    size_t perm[12], off[5];
+    unsigned char dropm[12];
+    size_t kept = 999;
+    size_t dropped = 999;
+    int rc;
+    for (int i = 0; i < T * n; i++) {
+        X[i] = 0.4f * fdval(i, 0, 51) + 0.2f;
+    }
+    for (int e = 0; e < E; e++) {
+        for (int j = 0; j < n; j++) {
+            // オフセットなし (バランスルーティングで drop なしにする。
+            // 摂動を与えないため選択安定化のオフセットは不要)。
+            Wgate[e * n + j] = 0.3f * fdval(e, j, 52);
+        }
+    }
+    for (int i = 0; i < E * h * n; i++) {
+        Wg[i] = 0.3f * fdval(i, 0, 53);
+        Wu[i] = 0.3f * fdval(i, 1, 54);
+        Wd[i] = 0.3f * fdval(i, 2, 55);
+    }
+    for (int i = 0; i < S * h * n; i++) {
+        Wg_s[i] = 0.3f * fdval(i, 0, 56);
+        Wu_s[i] = 0.3f * fdval(i, 1, 57);
+        Wd_s[i] = 0.3f * fdval(i, 2, 58);
+    }
+    memset(Ys, 0, sizeof(Ys));
+    // 単体ループ参照。
+    for (int t = 0; t < T; t++) {
+        rc = jt_moe_fwd(X + t * n, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s,
+                        Ys + t * n, n, h, E, k, S, ids_s + t * k,
+                        w_s + t * k, NULL, Gs_s + t * k * h,
+                        Us_s + t * k * h, Ysel_s + t * k * n,
+                        sGs_s + t * S * h, sUs_s + t * S * h);
+        CHECK(rc == JT_OK, "batch equiv single rc t=%d", t);
+        if (rc != JT_OK) {
+            return;
+        }
+    }
+    memset(Yb, 0, sizeof(Yb));
+    rc = jt_moe_fwd_batch(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Yb, T,
+                          n, h, E, k, S, ids_b, w_b, Gs_b, Us_b, Ysel_b,
+                          sGs_b, sUs_b, 1.25f, perm, off, dropm, &kept,
+                          &dropped);
+    CHECK(rc == JT_OK, "batch equiv batch rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    CHECK(dropped == 0, "batch equiv dropped=%zu (want 0)", dropped);
+    CHECK(kept == (size_t)T * (size_t)k, "batch equiv kept=%zu", kept);
+    if (dropped != 0) {
+        return;
+    }
+    CHECK(memcmp(Ys, Yb, sizeof(Ys)) == 0, "batch equiv Y bits");
+    CHECK(memcmp(ids_s, ids_b, sizeof(ids_s)) == 0,
+          "batch equiv ids bits");
+    CHECK(memcmp(w_s, w_b, sizeof(w_s)) == 0,
+          "batch equiv weights bits");
+    CHECK(memcmp(Gs_s, Gs_b, sizeof(Gs_s)) == 0,
+          "batch equiv Gsel bits");
+    CHECK(memcmp(Us_s, Us_b, sizeof(Us_s)) == 0,
+          "batch equiv Usel bits");
+    CHECK(memcmp(Ysel_s, Ysel_b, sizeof(Ysel_s)) == 0,
+          "batch equiv Ysel bits");
+    CHECK(memcmp(sGs_s, sGs_b, sizeof(sGs_s)) == 0,
+          "batch equiv Gs bits");
+    CHECK(memcmp(sUs_s, sUs_b, sizeof(sUs_s)) == 0,
+          "batch equiv Us bits");
+    CHECK(off[E] == kept, "batch equiv off[E]!=kept");
+    // unchecked 版も bit 一致。
+    {
+        float Yu[24];
+        size_t idsu[12];
+        float wu[12];
+        memset(Yu, 0, sizeof(Yu));
+        rc = jt_moe_fwd_batch_unchecked(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s,
+                                        Wd_s, Yu, T, n, h, E, k, S, idsu,
+                                        wu, NULL, NULL, NULL, NULL, NULL,
+                                        1.25f, NULL, NULL, NULL, NULL,
+                                        NULL);
+        CHECK(rc == JT_OK, "batch equiv unchecked rc=%d", rc);
+        if (rc == JT_OK) {
+            CHECK(memcmp(Ys, Yu, sizeof(Ys)) == 0,
+                  "batch equiv unchecked Y bits");
+            CHECK(memcmp(ids_s, idsu, sizeof(ids_s)) == 0,
+                  "batch equiv unchecked ids bits");
+        }
+    }
+}
+
+// drop あり forward (部分 drop の寄与 0・renormalize なし)。
+// n=2,h=1,E=4,k=2,S=0,T=8。X[t]=[1,0.125t]、Wgate で t0-3→[0,1]、t4-7→[0,2]
+// (logit ギャップ ≥0.075 で AVX2/スカラー共通に安定)。
+// cap=ceil(1.25*16/4)=5。e0 は 8 割当てで t5-7 を drop (dropped=3)。
+static void test_batch_drop_fwd(void) {
+    const int n = 2;
+    const int h = 1;
+    const int E = 4;
+    const int k = 2;
+    const int S = 0;
+    const int T = 8;
+    float X[16], Wgate[8], Wg[8], Wu[8], Wd[8];
+    float Ys[16], Yb[16];
+    size_t ids_s[16], ids_b[16];
+    float w_s[16], w_b[16];
+    float Gs_s[16], Gs_b[16], Us_s[16], Us_b[16];
+    float Ysel_s[32], Ysel_b[32];
+    size_t perm[16], off[5];
+    unsigned char dropm[16];
+    size_t kept = 999;
+    size_t dropped = 999;
+    int rc;
+    for (int t = 0; t < T; t++) {
+        X[t * n] = 1.0f;
+        X[t * n + 1] = 0.125f * (float)t;
+    }
+    Wgate[0] = 2.0f;
+    Wgate[1] = 0.0f;
+    Wgate[2] = 1.2f;
+    Wgate[3] = -1.5f;
+    Wgate[4] = 0.0f;
+    Wgate[5] = 1.5f;
+    Wgate[6] = -5.0f;
+    Wgate[7] = 0.0f;
+    for (int i = 0; i < E * h * n; i++) {
+        Wg[i] = 0.3f * fdval(i, 0, 59);
+        Wu[i] = 0.3f * fdval(i, 1, 60);
+        Wd[i] = 0.3f * fdval(i, 2, 61);
+    }
+    for (int t = 0; t < T; t++) {
+        rc = jt_moe_fwd(X + t * n, Wgate, Wg, Wu, Wd, NULL, NULL, NULL,
+                        Ys + t * n, n, h, E, k, S, ids_s + t * k,
+                        w_s + t * k, NULL, Gs_s + t * k * h,
+                        Us_s + t * k * h, Ysel_s + t * k * n, NULL,
+                        NULL);
+        CHECK(rc == JT_OK, "batch drop single rc t=%d", t);
+        if (rc != JT_OK) {
+            return;
+        }
+    }
+    CHECK(ids_s[0] == 0 && ids_s[1] == 1, "batch drop route t0 {%zu,%zu}",
+          ids_s[0], ids_s[1]);
+    CHECK(ids_s[8] == 0 && ids_s[9] == 2, "batch drop route t4 {%zu,%zu}",
+          ids_s[8], ids_s[9]);
+    memset(Yb, 0, sizeof(Yb));
+    memset(Ysel_b, 0xA5, sizeof(Ysel_b));
+    rc = jt_moe_fwd_batch(X, Wgate, Wg, Wu, Wd, NULL, NULL, NULL, Yb, T,
+                          n, h, E, k, S, ids_b, w_b, Gs_b, Us_b, Ysel_b,
+                          NULL, NULL, 1.25f, perm, off, dropm, &kept,
+                          &dropped);
+    CHECK(rc == JT_OK, "batch drop batch rc=%d", rc);
+    if (rc != JT_OK) {
+        return;
+    }
+    CHECK(kept == 13 && dropped == 3, "batch drop kept=%zu drop=%zu",
+          kept, dropped);
+    if (kept != 13 || dropped != 3) {
+        return;
+    }
+    CHECK(memcmp(ids_s, ids_b, sizeof(ids_s)) == 0,
+          "batch drop ids bits");
+    CHECK(memcmp(w_s, w_b, sizeof(w_s)) == 0,
+          "batch drop weights bits (no renormalize)");
+    // kept トークン (t0-4) は単体版と bit 一致。
+    CHECK(memcmp(Ys, Yb, (size_t)5 * (size_t)n * sizeof(float)) == 0,
+          "batch drop kept rows bits");
+    // 部分 drop トークン (t5-7): dropped 側寄与 0・renormalize なし。
+    // 期待値 = kept 側の w*Ysel (単体版 cache 値で再結合)。
+    for (int t = 5; t < T; t++) {
+        for (int j = 0; j < n; j++) {
+            double want = 0.0;
+            for (int p = 0; p < k; p++) {
+                size_t q = (size_t)t * (size_t)k + (size_t)p;
+                if (dropm[q]) {
+                    continue;
+                }
+                want += (double)w_s[q] *
+                        (double)Ysel_s[q * (size_t)n + (size_t)j];
+            }
+            double got = (double)Yb[(size_t)t * (size_t)n + (size_t)j];
+            double d = fabs(got - want);
+            CHECK(d <= 1e-6 + 1e-6 * fabs(want),
+                  "batch drop t=%d j=%d got=%f want=%f", t, j, got,
+                  want);
+        }
+    }
+    // dropped スロットの cache は 0 埋め (Step 3 申送りまでの不定値防止)。
+    for (size_t q = 0; q < (size_t)T * (size_t)k; q++) {
+        if (dropm[q]) {
+            for (int j = 0; j < n; j++) {
+                CHECK(Ysel_b[q * (size_t)n + (size_t)j] == 0.0f,
+                      "batch drop cache not zeroed q=%zu", q);
+            }
+        }
+    }
+    CHECK(off[E] == kept, "batch drop off[E]!=kept");
+}
+
+// batch 不正系 (fail-closed: Y 不変)。
+static void test_batch_invalid(void) {
+    float X[4] = {1.0f, 0.5f, 0.25f, -0.5f};
+    float Wgate[8] = {1, 0, 0, 1, 0, 0, 0, 0};
+    float W[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+    float Y[4] = {3.0f, 4.0f, 5.0f, 6.0f};
+    size_t ids[4] = {0, 0, 0, 0};
+    float w[4] = {0, 0, 0, 0};
+    CHECK(jt_moe_fwd_batch(NULL, Wgate, W, W, W, NULL, NULL, NULL, Y, 2,
+                           2, 1, 4, 1, 0, ids, w, NULL, NULL, NULL,
+                           NULL, NULL, 1.25f, NULL, NULL, NULL, NULL,
+                           NULL) == JT_ERR_INVAL,
+          "batch fwd NULL X");
+    CHECK(Y[0] == 3.0f && Y[3] == 6.0f, "batch fwd mutated on NULL");
+    CHECK(jt_moe_fwd_batch(X, Wgate, W, W, W, NULL, NULL, NULL, Y, 0, 2,
+                           1, 4, 1, 0, ids, w, NULL, NULL, NULL, NULL,
+                           NULL, 1.25f, NULL, NULL, NULL, NULL,
+                           NULL) == JT_ERR_INVAL,
+          "batch fwd T=0");
+    CHECK(jt_moe_fwd_batch(X, Wgate, W, W, W, NULL, NULL, NULL, Y, 2, 2,
+                           1, 4, 5, 0, ids, w, NULL, NULL, NULL, NULL,
+                           NULL, 1.25f, NULL, NULL, NULL, NULL,
+                           NULL) == JT_ERR_INVAL,
+          "batch fwd k>E");
+    CHECK(jt_moe_fwd_batch(X, Wgate, W, W, W, NULL, NULL, NULL, Y, 2, 2,
+                           1, 4, 1, 0, ids, w, NULL, NULL, NULL, NULL,
+                           NULL, 9.0f, NULL, NULL, NULL, NULL,
+                           NULL) == JT_ERR_INVAL,
+          "batch fwd bad cap");
+    CHECK(Y[0] == 3.0f && Y[3] == 6.0f, "batch fwd mutated on bad cap");
+    errno = 0;
+    {
+        float badX[4] = {1.0f, (float)NAN, 0.25f, -0.5f};
+        int brc = jt_moe_fwd_batch(badX, Wgate, W, W, W, NULL, NULL,
+                                   NULL, Y, 2, 2, 1, 4, 1, 0, ids, w,
+                                   NULL, NULL, NULL, NULL, NULL, 1.25f,
+                                   NULL, NULL, NULL, NULL, NULL);
+        CHECK(brc == JT_ERR_INVAL && errno == EINVAL, "batch fwd NaN");
+        CHECK(Y[0] == 3.0f && Y[3] == 6.0f, "batch fwd NaN mutated");
+    }
+}
+
 int main(void) {
     test_fwd_known();
     test_grad();
@@ -669,6 +1017,12 @@ int main(void) {
     test_sticky_seq();
     test_invalid();
     test_unchecked_match();
+    test_batch_sort_known();
+    test_batch_sort_drop();
+    test_batch_sort_invalid();
+    test_batch_equiv();
+    test_batch_drop_fwd();
+    test_batch_invalid();
     if (g_fail != 0) {
         fprintf(stderr, "moe_layer: FAIL\n");
         return 1;

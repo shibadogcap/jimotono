@@ -219,7 +219,9 @@ static int lr_ckpt_layer_fn(int seg_idx, int layer, void *vctx) {
 static void lr_usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [--steps N] [--time SECS] [--lr LR] [--threads T]\n"
-            "  defaults: steps=1073741824 time=6000 lr=1e-3 threads=online\n",
+            "            [--moe-batch]\n"
+            "  defaults: steps=1073741824 time=6000 lr=1e-3 threads=online\n"
+            "  --moe-batch: Phase G Step 1 batch dispatch (default off)\n",
             prog);
 }
 
@@ -244,9 +246,112 @@ typedef struct lr_ctx {
     float *restrict CUs;     // [L][TOKS][S*H] (S==0時はNULL)
 } lr_ctx_t;
 
+// Phase G Step 1: 1でバッチdispatch経路 (既定0=単体ループ)。
+static int g_moe_batch = 0;
+
+// Phase G Step 1: 1層分 [a,b) のバッチdispatch版。
+// gate→top-k確定後に perm/off/drop を作り、kept のみ既存GEMVで計算し
+// token 順に scatter-add (GEMM 化なし)。bwd は単体版のまま (Step 3 申送り)。
+// drop なし時は単体ループと bit 一致。cap は呼出し毎の Tsub から算出するため
+// マルチスレッド時はシャード毎の cap になる (ゲート計測は threads=1 で行う)。
+// drop_accum (NULL 可) に本層の dropped 数を加算する。
+static void lr_fwd_layer_range_batch(const lr_ctx_t *restrict ctx, int layer,
+                                     int a, int b,
+                                     size_t *restrict drop_accum,
+                                     int *restrict rc_out) {
+    int rc = JT_OK;
+    const float *base = ctx->P + ctx->layer_off[(size_t)layer];
+    const float *Wgate = base;
+    const float *Wg = Wgate + LR_P_WGATE;
+    const float *Wu = Wg + LR_P_ROUTED;
+    const float *Wd = Wu + LR_P_ROUTED;
+    const float *Wgs = Wd + LR_P_ROUTED;
+    const float *Wus = Wgs + LR_P_SHARED;
+    const float *Wds = Wus + LR_P_SHARED;
+    int Tsub = b - a;
+    // Tsub<=TOKS のため固定上限の自動配列 (スレッド私用スタック)。
+    size_t perm[(size_t)LR_TOKS * (size_t)LR_K];
+    size_t off[(size_t)LR_E + 1];
+    unsigned char dropm[(size_t)LR_TOKS * (size_t)LR_K];
+    if (Tsub <= 0) {
+        if (rc_out != NULL) {
+            *rc_out = JT_OK;
+        }
+        return;
+    }
+    {
+        const float *Xb =
+            ctx->acts +
+            ((size_t)layer * (size_t)LR_TOKS + (size_t)a) * (size_t)LR_N;
+        float *Mb = ctx->acts +
+                    ((size_t)(layer + 1) * (size_t)LR_TOKS + (size_t)a) *
+                        (size_t)LR_N;
+        size_t c0 = (size_t)layer * (size_t)LR_TOKS + (size_t)a;
+        size_t *ids = ctx->Cids + c0 * (size_t)LR_K;
+        float *weights = ctx->Cw + c0 * (size_t)LR_K;
+        float *Gsel =
+            ctx->CGsel + c0 * (size_t)LR_K * (size_t)LR_H;
+        float *Usel =
+            ctx->CUsel + c0 * (size_t)LR_K * (size_t)LR_H;
+        float *Ysel =
+            ctx->CYsel + c0 * (size_t)LR_K * (size_t)LR_N;
+        float *Gs = (LR_S > 0 && ctx->CGs != NULL)
+                        ? (ctx->CGs + c0 * (size_t)LR_S * (size_t)LR_H)
+                        : NULL;
+        float *Us = (LR_S > 0 && ctx->CUs != NULL)
+                        ? (ctx->CUs + c0 * (size_t)LR_S * (size_t)LR_H)
+                        : NULL;
+        size_t kept = 0;
+        size_t dropped = 0;
+        // unchecked: 単体経路と同一条件 (ステップ冒頭で重み一括検証済み＋
+        // ステップ内不変)。同一計算核のため drop なし時は bit 一致。
+        int frc = jt_moe_fwd_batch_unchecked(
+            Xb, Wgate, Wg, Wu, Wd, Wgs, Wus, Wds, Mb, Tsub, LR_N, LR_H,
+            LR_E, LR_K, LR_S, ids, weights, Gsel, Usel, Ysel, Gs, Us,
+            1.25f, perm, off, dropm, &kept, &dropped);
+        if (frc != JT_OK) {
+            rc = frc;
+        } else {
+            if (drop_accum != NULL) {
+                *drop_accum += dropped;
+            }
+            // 残差合算 (単体経路と同一順序・同一検査)。
+            for (int t = a; t < b && rc == JT_OK; t++) {
+                const float *xin =
+                    ctx->acts +
+                    ((size_t)layer * (size_t)LR_TOKS + (size_t)t) *
+                        (size_t)LR_N;
+                float *xout =
+                    ctx->acts +
+                    ((size_t)(layer + 1) * (size_t)LR_TOKS + (size_t)t) *
+                        (size_t)LR_N;
+                for (int j = 0; j < LR_N; j++) {
+                    double v =
+                        (double)xin[j] + (double)LR_RESID * (double)xout[j];
+                    if (!isfinite(v)) {
+                        rc = JT_ERR_INVAL;
+                        break;
+                    }
+                    xout[j] = (float)v;
+                }
+            }
+        }
+    }
+    if (rc_out != NULL) {
+        *rc_out = rc;
+    }
+}
+
 // forward 1層分 [a,b) トークン。rc_outにJT_OK/ERR。
+// drop_accum (NULL可): バッチ経路時のみ本層の dropped 数を加算 (単体経路では不変)。
 static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
-                               int a, int b, int *restrict rc_out) {
+                               int a, int b,
+                               size_t *restrict drop_accum,
+                               int *restrict rc_out) {
+    if (g_moe_batch) {
+        lr_fwd_layer_range_batch(ctx, layer, a, b, drop_accum, rc_out);
+        return;
+    }
     int rc = JT_OK;
     const float *base = ctx->P + ctx->layer_off[(size_t)layer];
     const float *Wgate = base;
@@ -312,10 +417,11 @@ static void lr_fwd_layer_range(const lr_ctx_t *restrict ctx, int layer,
 // 単一fork/joinに融合できる。各トークンの計算内容・順序は不変で
 // ビット一致。ワーカーあたり作業量は約6倍 (12Tで約200KB→約1.2MB)。
 static void lr_fwd_all_range(const lr_ctx_t *restrict ctx, int a, int b,
+                             size_t *restrict drop_accum,
                              int *restrict rc_out) {
     int rc = JT_OK;
     for (int l = 0; l < LR_LAYERS && rc == JT_OK; l++) {
-        lr_fwd_layer_range(ctx, l, a, b, &rc);
+        lr_fwd_layer_range(ctx, l, a, b, drop_accum, &rc);
     }
     if (rc_out != NULL) {
         *rc_out = rc;
@@ -532,6 +638,7 @@ typedef struct lr_thr_arg {
     int b;
     float *Gout;  // bwd用 (fwd時はNULL)。
     float *dtmp;  // bwd用 (fwd時はNULL)。
+    size_t dropped;  // Phase G Step 1: ワーカー内のバッチdrop総数。
     int rc;
 } lr_thr_arg_t;
 
@@ -541,14 +648,16 @@ typedef struct lr_thr_arg {
 static void *lr_thr_step(void *v) {
     lr_thr_arg_t *arg = (lr_thr_arg_t *)v;
     int rc = JT_OK;
+    size_t dropped = 0;
     if (arg->Gout != NULL && arg->n_total > 0) {
         memset(arg->Gout, 0, arg->n_total * sizeof(float));
     }
-    lr_fwd_all_range(arg->ctx, arg->a, arg->b, &rc);
+    lr_fwd_all_range(arg->ctx, arg->a, arg->b, &dropped, &rc);
     if (rc == JT_OK) {
         lr_bwd_range(arg->ctx, arg->n_total, arg->a, arg->b, arg->Gout,
                      arg->dtmp, &rc);
     }
+    arg->dropped = dropped;
     arg->rc = rc;
     return NULL;
 }
@@ -614,8 +723,12 @@ int main(int argc, char **argv) {
             lr = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             nthr_req = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--moe-batch") == 0) {
+            // Phase G Step 1: perm+off+drop のバッチdispatch経路
+            // (dispatch→既存GEMV→scatter-add。GEMM化なし)。
+            g_moe_batch = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
-                   strcmp(argv[i], "--help") == 0) {
+                    strcmp(argv[i], "--help") == 0) {
             lr_usage(argv[0]);
             return 0;
         } else {
@@ -915,6 +1028,7 @@ int main(int argc, char **argv) {
                     args[w].b = (int)b;
                     args[w].Gout = Gpart + (size_t)w * n_total;
                     args[w].dtmp = dtmps + (size_t)w * LR_P_LAYER;
+                    args[w].dropped = 0;
                     args[w].rc = JT_OK;
                     if (pthread_create(&thrs[w], NULL, lr_thr_step,
                                        &args[w]) != 0) {
@@ -936,6 +1050,20 @@ int main(int argc, char **argv) {
                             step, bad);
                     goto cleanup;
                 }
+                if (g_moe_batch) {
+                    size_t dtot = 0;
+                    for (long w = 0; w < nthr; w++) {
+                        dtot += args[w].dropped;
+                    }
+                    fprintf(stderr,
+                            "moe-batch: step=%ld dropped=%zu/%zu (%.4f%%)\n",
+                            step + 1, dtot,
+                            (size_t)LR_LAYERS * (size_t)LR_TOKS *
+                                (size_t)LR_K,
+                            100.0 * (double)dtot /
+                                (double)((size_t)LR_LAYERS *
+                                         (size_t)LR_TOKS * (size_t)LR_K));
+                }
                 // 順序付きreduction (決定的)。
                 memset(G, 0, n_total * sizeof(float));
                 for (long w = 0; w < nthr; w++) {
@@ -948,12 +1076,23 @@ int main(int argc, char **argv) {
 #endif
             {
                 int frc = JT_OK;
-                lr_fwd_all_range(&wctx, 0, LR_TOKS, &frc);
+                size_t dropped = 0;
+                lr_fwd_all_range(&wctx, 0, LR_TOKS, &dropped, &frc);
                 if (frc != JT_OK) {
                     fprintf(stderr,
                             "train_longrun: fwd failed step=%ld rc=%d\n",
                             step, frc);
                     goto cleanup;
+                }
+                if (g_moe_batch) {
+                    fprintf(stderr,
+                            "moe-batch: step=%ld dropped=%zu/%zu (%.4f%%)\n",
+                            step + 1, dropped,
+                            (size_t)LR_LAYERS * (size_t)LR_TOKS *
+                                (size_t)LR_K,
+                            100.0 * (double)dropped /
+                                (double)((size_t)LR_LAYERS *
+                                         (size_t)LR_TOKS * (size_t)LR_K));
                 }
                 {
                     int brc = JT_OK;
@@ -1162,7 +1301,7 @@ int main(int argc, char **argv) {
             csw_prev_v = csw_cur_v;
             csw_prev_iv = csw_cur_iv;
             fprintf(stderr,
-                    "step=%ld loss=%.6f val_loss=%.6f steps_sec=%.3f "
+                    "step=%ld loss=%.9f val_loss=%.9f steps_sec=%.3f "
                     "toks_sec=%.1f rss_mib=%.1f gnorm=%.4f elapsed=%.1fs "
                     "csw_v=%ld csw_iv=%ld\n",
                     step + 1, (double)loss, (double)val_loss, sps, tps,

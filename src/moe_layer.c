@@ -8,6 +8,8 @@
 
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "jimotono/routing.h"
@@ -710,10 +712,462 @@ int jt_moe_bwd_unchecked(const float *restrict dY, const float *restrict X,
                            n_experts, topk, n_shared, 0);
 }
 
+// ---- Phase G Step 1: ソート＋dispatch (計算は既存GEMVのまま) ----
+// counting sort (E<=4096)。安定・決定論的・単一スレッド構築。
+// AVX-512 不使用 (スカラーのみ)。
+int jt_moe_batch_sort(const size_t *restrict ids, int T, int k, int E,
+                      float cap_factor,
+                      size_t *restrict perm, size_t *restrict off,
+                      unsigned char *restrict drop,
+                      size_t *restrict out_kept, size_t *restrict out_dropped) {
+    size_t cnt[JT_MOE_MAX_EXPERTS];
+    size_t Tk = 0;
+    size_t cap = 0;
+    size_t kept_total = 0;
+    if (ids == NULL || perm == NULL || off == NULL || drop == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (T <= 0 || k <= 0 || E <= 0 || E > JT_MOE_MAX_EXPERTS || k > E ||
+        k > JT_MOE_MAX_TOPK) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (!(cap_factor >= 1.0f) || !(cap_factor <= 1.5f) ||
+        !isfinite((double)cap_factor)) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if ((size_t)k > SIZE_MAX / (size_t)T) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    Tk = (size_t)T * (size_t)k;
+    // ids 範囲検査 (出力更新前に完了。fail-closed)。
+    for (size_t q = 0; q < Tk; q++) {
+        if (ids[q] >= (size_t)E) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+    }
+    {
+        double capd =
+            ceil((double)cap_factor * (double)Tk / (double)E);
+        if (!isfinite(capd) || capd < 1.0) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        cap = (size_t)capd;
+        if (cap == 0) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+    }
+    for (int e = 0; e < E; e++) {
+        cnt[e] = 0;
+    }
+    for (size_t q = 0; q < Tk; q++) {
+        cnt[ids[q]]++;
+    }
+    // expert 境界 (kept のみ)。off[E] == kept 総数。
+    off[0] = 0;
+    for (int e = 0; e < E; e++) {
+        size_t kc = (cnt[e] < cap) ? cnt[e] : cap;
+        off[(size_t)e + 1] = off[(size_t)e] + kc;
+    }
+    kept_total = off[(size_t)E];
+    // 安定配置: (token, slot) 昇順走査で kept 枠へ。超過分は drop。
+    // cnt をカーソルに転用 (off は境界として保持)。
+    for (int e = 0; e < E; e++) {
+        cnt[e] = off[(size_t)e];
+    }
+    for (size_t q = 0; q < Tk; q++) {
+        size_t e = ids[q];
+        if (cnt[e] < off[e + 1]) {
+            perm[cnt[e]] = q;
+            cnt[e]++;
+            drop[q] = 0;
+        } else {
+            drop[q] = 1;
+        }
+    }
+    if (out_kept != NULL) {
+        *out_kept = kept_total;
+    }
+    if (out_dropped != NULL) {
+        *out_dropped = Tk - kept_total;
+    }
+    return JT_OK;
+}
+
+static int jt_moe_fwd_batch_impl(
+    const float *restrict X,
+    const float *restrict Wgate,
+    const float *restrict Wg, const float *restrict Wu,
+    const float *restrict Wd,
+    const float *restrict Wg_s, const float *restrict Wu_s,
+    const float *restrict Wd_s,
+    float *restrict Y,
+    int T, int n, int h, int n_experts, int topk, int n_shared,
+    size_t *restrict out_ids, float *restrict out_weights,
+    float *restrict cache_Gsel, float *restrict cache_Usel,
+    float *restrict cache_Ysel,
+    float *restrict cache_Gs, float *restrict cache_Us,
+    float cap_factor,
+    size_t *restrict out_perm, size_t *restrict out_off,
+    unsigned char *restrict out_drop,
+    size_t *restrict out_kept, size_t *restrict out_dropped,
+    int validate) {
+    int rc = JT_ERR_INVAL;
+    static const int kMaxE = JT_MOE_MAX_EXPERTS;
+    static const int kMaxW = JT_BWD_MAX_WIDE;
+    float logits[JT_MOE_MAX_EXPERTS];
+    float tmpG[JT_BWD_MAX_WIDE];
+    float tmpU[JT_BWD_MAX_WIDE];
+    float tmpY[JT_BWD_MAX_WIDE];
+    size_t Tk = 0;
+    size_t kept = 0;
+    size_t dropped = 0;
+    double *yacc = NULL;
+    size_t *perm = NULL;
+    size_t *off = NULL;
+    unsigned char *drop = NULL;
+    float *stage_Ysel = NULL;  // cache_Ysel==NULL 時のみ確保
+    if (X == NULL || Wgate == NULL || Wg == NULL || Wu == NULL ||
+        Wd == NULL || Y == NULL || out_ids == NULL ||
+        out_weights == NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (T <= 0) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (!jt_moe_valid_dims(n, h, n_experts, topk, n_shared)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (n_shared > 0) {
+        if (Wg_s == NULL || Wu_s == NULL || Wd_s == NULL) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+    }
+    if (!(cap_factor >= 1.0f) || !(cap_factor <= 1.5f) ||
+        !isfinite((double)cap_factor)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (n_experts > kMaxE || n > kMaxW || h > kMaxW) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if ((size_t)topk > SIZE_MAX / (size_t)T ||
+        (size_t)T > SIZE_MAX / (size_t)n) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    Tk = (size_t)T * (size_t)topk;
+    if (Tk > SIZE_MAX / (size_t)n) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    // 入力の有限検査 (fail-closed: Y更新前に拒否)。unchecked では省略し、
+    // 呼び出し側のステップ冒頭検証＋区間内不変に委ねる (単体版と同一条件)。
+    if (validate) {
+        size_t e = (size_t)n_experts;
+        size_t nn = (size_t)n;
+        size_t hh = (size_t)h;
+        size_t Tn = (size_t)T * nn;
+        if (!jt_moe_all_finite(X, Tn) ||
+            !jt_moe_all_finite(Wgate, e * nn) ||
+            !jt_moe_all_finite(Wg, e * hh * nn) ||
+            !jt_moe_all_finite(Wu, e * hh * nn) ||
+            !jt_moe_all_finite(Wd, e * hh * nn)) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        if (n_shared > 0) {
+            size_t ss = (size_t)n_shared;
+            if (!jt_moe_all_finite(Wg_s, ss * hh * nn) ||
+                !jt_moe_all_finite(Wu_s, ss * hh * nn) ||
+                !jt_moe_all_finite(Wd_s, ss * hh * nn)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+        }
+    }
+    // 作業域確保 (失敗時は ENOMEM。Y は未更新)。
+    yacc = (double *)calloc((size_t)T * (size_t)n, sizeof(double));
+    perm = (size_t *)malloc(Tk * sizeof(size_t));
+    off = (size_t *)malloc(((size_t)n_experts + 1) * sizeof(size_t));
+    drop = (unsigned char *)malloc(Tk * sizeof(unsigned char));
+    if (yacc == NULL || perm == NULL || off == NULL || drop == NULL) {
+        errno = ENOMEM;
+        goto cleanup;
+    }
+    if (cache_Ysel == NULL) {
+        stage_Ysel = (float *)malloc(Tk * (size_t)n * sizeof(float));
+        if (stage_Ysel == NULL) {
+            errno = ENOMEM;
+            goto cleanup;
+        }
+    }
+    // gate logits → 実top-k (トークン毎に単体版と同一核)。
+    for (int t = 0; t < T; t++) {
+        const float *Xt = X + (size_t)t * (size_t)n;
+        size_t *ids = out_ids + (size_t)t * (size_t)topk;
+        float *weights = out_weights + (size_t)t * (size_t)topk;
+        for (int e = 0; e < n_experts; e++) {
+            const float *wr = Wgate + (size_t)e * (size_t)n;
+#ifdef __AVX2__
+            double acc = jt_moe_avx2_dot(Xt, wr, n);
+#else
+            double acc = 0.0;
+            for (int j = 0; j < n; j++) {
+                acc += (double)Xt[j] * (double)wr[j];
+            }
+#endif
+            if (!isfinite(acc)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            logits[e] = (float)acc;
+            if (!isfinite((double)logits[e])) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+        }
+        {
+            int rrc = jt_routing_topk(logits, (size_t)n_experts,
+                                      (size_t)topk, ids, weights);
+            if (rrc != JT_OK) {
+                goto cleanup;  // errnoは下位で設定済み
+            }
+        }
+        for (int p = 0; p < topk; p++) {
+            if (ids[(size_t)p] >= (size_t)n_experts) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            float w = weights[(size_t)p];
+            if (!(w >= 0.0f) || !isfinite((double)w)) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+        }
+    }
+    // ソート＋capacity 上限＋超過 drop (範囲検査は内部で再確認)。
+    {
+        int src = jt_moe_batch_sort(out_ids, T, topk, n_experts,
+                                    cap_factor, perm, off, drop, &kept,
+                                    &dropped);
+        if (src != JT_OK) {
+            goto cleanup;  // errnoは下位で設定済み
+        }
+    }
+    // dispatch→既存GEMV (kept のみ perm 順に計算。結合は token 順に後で行い、
+    // 単体版トークンループと同一順序にする。GEMM 化なし)。
+    for (size_t i = 0; i < kept; i++) {
+        size_t q = perm[i];
+        size_t t = q / (size_t)topk;
+        size_t p = q % (size_t)topk;
+        size_t e = out_ids[q];
+        const float *Xt = X + t * (size_t)n;
+        const float *wgr = Wg + e * (size_t)h * (size_t)n;
+        const float *wur = Wu + e * (size_t)h * (size_t)n;
+        const float *wdr = Wd + e * (size_t)h * (size_t)n;
+        float *Gp = (cache_Gsel != NULL)
+                        ? (cache_Gsel + q * (size_t)h)
+                        : tmpG;
+        float *Up = (cache_Usel != NULL)
+                        ? (cache_Usel + q * (size_t)h)
+                        : tmpU;
+        float *Yp = (cache_Ysel != NULL)
+                        ? (cache_Ysel + q * (size_t)n)
+                        : (stage_Ysel + q * (size_t)n);
+        (void)p;
+        int frc = validate
+                      ? jt_swiglu_fwd(Xt, wgr, wur, wdr, Gp, Up, Yp, n,
+                                      h)
+                      : jt_swiglu_fwd_unchecked(Xt, wgr, wur, wdr, Gp, Up,
+                                                Yp, n, h);
+        if (frc != JT_OK) {
+            goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+        }
+    }
+    // dropped 対応 cache スロットの 0 埋め (不定値混入防止。
+    // bwd 側の drop マスク適用は Step 3 の範囲)。
+    for (size_t q = 0; q < Tk; q++) {
+        if (drop[q]) {
+            if (cache_Gsel != NULL) {
+                memset(cache_Gsel + q * (size_t)h, 0,
+                       (size_t)h * sizeof(float));
+            }
+            if (cache_Usel != NULL) {
+                memset(cache_Usel + q * (size_t)h, 0,
+                       (size_t)h * sizeof(float));
+            }
+            if (cache_Ysel != NULL) {
+                memset(cache_Ysel + q * (size_t)n, 0,
+                       (size_t)n * sizeof(float));
+            }
+        }
+    }
+    // combine (scatter-add。token 順・slot 順で単体版と同一順序のため、
+    // drop なし時は bit 一致)。共有 expert は容量制限対象外で同一に加算。
+    for (int t = 0; t < T; t++) {
+        double *ya = yacc + (size_t)t * (size_t)n;
+        const float *Xt = X + (size_t)t * (size_t)n;
+        for (int p = 0; p < topk; p++) {
+            size_t q = (size_t)t * (size_t)topk + (size_t)p;
+            float w;
+            const float *Yp;
+            if (drop[q]) {
+                continue;  // renormalize しない (§1.2 仕様)
+            }
+            w = out_weights[q];
+            Yp = (cache_Ysel != NULL) ? (cache_Ysel + q * (size_t)n)
+                                      : (stage_Ysel + q * (size_t)n);
+#ifdef __AVX2__
+            jt_moe_avx2_f64_add(ya, (double)w, Yp, n);
+#else
+            for (int j = 0; j < n; j++) {
+                ya[j] += (double)w * (double)Yp[j];
+            }
+#endif
+        }
+        for (int s = 0; s < n_shared; s++) {
+            const float *wgr =
+                Wg_s + (size_t)s * (size_t)h * (size_t)n;
+            const float *wur =
+                Wu_s + (size_t)s * (size_t)h * (size_t)n;
+            const float *wdr =
+                Wd_s + (size_t)s * (size_t)h * (size_t)n;
+            float *Gp = (cache_Gs != NULL)
+                            ? (cache_Gs +
+                               ((size_t)t * (size_t)n_shared + (size_t)s) *
+                                   (size_t)h)
+                            : tmpG;
+            float *Up = (cache_Us != NULL)
+                            ? (cache_Us +
+                               ((size_t)t * (size_t)n_shared + (size_t)s) *
+                                   (size_t)h)
+                            : tmpU;
+            int frc = validate
+                          ? jt_swiglu_fwd(Xt, wgr, wur, wdr, Gp, Up, tmpY,
+                                          n, h)
+                          : jt_swiglu_fwd_unchecked(Xt, wgr, wur, wdr, Gp,
+                                                    Up, tmpY, n, h);
+            if (frc != JT_OK) {
+                goto cleanup;
+            }
+#ifdef __AVX2__
+            jt_moe_avx2_f64_add(ya, 1.0, tmpY, n);
+#else
+            for (int j = 0; j < n; j++) {
+                ya[j] += (double)tmpY[j];
+            }
+#endif
+        }
+    }
+    for (size_t i = 0; i < (size_t)T * (size_t)n; i++) {
+        if (!isfinite(yacc[i])) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+    }
+    // 全成功後に一括 commit (fail-closed: 拒否時は Y 不変)。
+    for (int t = 0; t < T; t++) {
+        const double *ya = yacc + (size_t)t * (size_t)n;
+        float *Yt = Y + (size_t)t * (size_t)n;
+        for (int j = 0; j < n; j++) {
+            Yt[j] = (float)ya[j];
+        }
+    }
+    if (out_perm != NULL) {
+        for (size_t i = 0; i < kept; i++) {
+            out_perm[i] = perm[i];
+        }
+    }
+    if (out_off != NULL) {
+        for (int e = 0; e <= n_experts; e++) {
+            out_off[(size_t)e] = off[(size_t)e];
+        }
+    }
+    if (out_drop != NULL) {
+        for (size_t q = 0; q < Tk; q++) {
+            out_drop[q] = drop[q];
+        }
+    }
+    if (out_kept != NULL) {
+        *out_kept = kept;
+    }
+    if (out_dropped != NULL) {
+        *out_dropped = dropped;
+    }
+    rc = JT_OK;
+cleanup:
+    free(yacc);
+    free(perm);
+    free(off);
+    free(drop);
+    free(stage_Ysel);
+    return rc;
+}
+
+int jt_moe_fwd_batch(const float *restrict X,
+                     const float *restrict Wgate,
+                     const float *restrict Wg, const float *restrict Wu,
+                     const float *restrict Wd,
+                     const float *restrict Wg_s, const float *restrict Wu_s,
+                     const float *restrict Wd_s,
+                     float *restrict Y,
+                     int T, int n, int h, int n_experts, int topk,
+                     int n_shared,
+                     size_t *restrict out_ids, float *restrict out_weights,
+                     float *restrict cache_Gsel, float *restrict cache_Usel,
+                     float *restrict cache_Ysel,
+                     float *restrict cache_Gs, float *restrict cache_Us,
+                     float cap_factor,
+                     size_t *restrict out_perm, size_t *restrict out_off,
+                     unsigned char *restrict out_drop,
+                     size_t *restrict out_kept, size_t *restrict out_dropped) {
+    return jt_moe_fwd_batch_impl(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Y,
+                                 T, n, h, n_experts, topk, n_shared,
+                                 out_ids, out_weights, cache_Gsel,
+                                 cache_Usel, cache_Ysel, cache_Gs, cache_Us,
+                                 cap_factor, out_perm, out_off, out_drop,
+                                 out_kept, out_dropped, 1);
+}
+
+int jt_moe_fwd_batch_unchecked(
+    const float *restrict X,
+    const float *restrict Wgate,
+    const float *restrict Wg, const float *restrict Wu,
+    const float *restrict Wd,
+    const float *restrict Wg_s, const float *restrict Wu_s,
+    const float *restrict Wd_s,
+    float *restrict Y,
+    int T, int n, int h, int n_experts, int topk, int n_shared,
+    size_t *restrict out_ids, float *restrict out_weights,
+    float *restrict cache_Gsel, float *restrict cache_Usel,
+    float *restrict cache_Ysel,
+    float *restrict cache_Gs, float *restrict cache_Us, float cap_factor,
+    size_t *restrict out_perm, size_t *restrict out_off,
+    unsigned char *restrict out_drop,
+    size_t *restrict out_kept, size_t *restrict out_dropped) {
+    return jt_moe_fwd_batch_impl(X, Wgate, Wg, Wu, Wd, Wg_s, Wu_s, Wd_s, Y,
+                                 T, n, h, n_experts, topk, n_shared,
+                                 out_ids, out_weights, cache_Gsel,
+                                 cache_Usel, cache_Ysel, cache_Gs, cache_Us,
+                                 cap_factor, out_perm, out_off, out_drop,
+                                 out_kept, out_dropped, 0);
+}
+
 int jt_moe_sticky_seq_loss(const float *restrict gates, size_t T, size_t n,
                            float lambda, float alpha, size_t w,
-                           float *restrict out_loss) {
-    int rc = JT_ERR_INVAL;
+                           float *restrict out_loss) {    int rc = JT_ERR_INVAL;
     if (gates == NULL || out_loss == NULL) {
         errno = EINVAL;
         goto cleanup;
