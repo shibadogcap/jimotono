@@ -309,7 +309,7 @@ int jt_dp_write_file(const char *restrict path,
 
 // ---- reader ----
 
-// 後方定義の前方宣言（Windows実装から共用）。
+// 後方定義（Windows/POSIX共用）の前方宣言。Windows版jt_dp_openから使う。
 static int jt_dp_validate(const unsigned char *restrict base, size_t len,
                           jt_dp_rstate_t *restrict rs);
 
@@ -395,9 +395,10 @@ cleanup:
     return rc;
 }
 
-#else  // POSIX (Linux/macOS): mmap + malloc fallback
+#endif  // _WIN32 (Windows fread backendここまで)
 
-// 全検証の本体。base[0..len)を検査し、rstateを埋める。
+// 全検証の本体（Windows/POSIX共用。MSVC C2129回避のためガード外）。
+// base[0..len)を検査し、rstateを埋める。
 // 戻り値: JT_OK / JT_ERR_INVAL / JT_ERR_NOMEM。
 static int jt_dp_validate(const unsigned char *restrict base, size_t len,
                           jt_dp_rstate_t *restrict rs) {
@@ -505,6 +506,8 @@ static int jt_dp_validate(const unsigned char *restrict base, size_t len,
     rs->prefix = (const uint64_t *)(const void *)tab;
     return JT_OK;
 }
+
+#if !defined(_WIN32)  // POSIX (Linux/macOS): mmap + malloc fallback
 
 int jt_dp_open(const char *restrict path, jt_dp_reader_t *restrict out) {
     if (path == NULL || out == NULL) {
@@ -618,7 +621,7 @@ cleanup:
     return rc;
 }
 
-#endif  // _WIN32 / POSIX
+#endif  // !defined(_WIN32) POSIX jt_dp_open
 
 void jt_dp_close(jt_dp_reader_t *restrict r) {
     if (r == NULL || r->opaque == NULL) {
