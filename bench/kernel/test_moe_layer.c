@@ -1551,7 +1551,7 @@ static void test_bwd_batch_invalid(void) {
         size_t badoff[5] = {1, 0, 0, 0, 0};
         CHECK(jt_moe_bwd_batch(dY, X, Wgate, W, W, W, NULL, NULL, NULL,
                                ids, wt, G, G, Ys, NULL, NULL, perm, badoff,
-                               drop, dX, dWgate, dWg_, dWg_, dWg_, NULL,
+                               drop, dX, dWgate, dWg_, dWg_2, dWg_3, NULL,
                                NULL, NULL, NULL, 2, 2, 1, 4, 2,
                                0) == JT_ERR_INVAL,
               "bwd batch bad off");
