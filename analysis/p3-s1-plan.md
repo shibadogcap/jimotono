@@ -19,7 +19,7 @@ date: 2026-09-14
 - model1b accounting defines the target; engine kernels are dim-agnostic
   (JT_BWD_MAX_WIDE bounds apply — verify 1024/48588 fit before S1).
 
-## 5. factorized head (opt-in, §12 composite gate applies)
+## 5. factorized head (opt-in, §10 composite gate applies)
 - dense default; enable per Stage 4c gate.
 
 ## 6. lowbit (W8A8 main line, INT4/INT2副線)
@@ -46,7 +46,7 @@ date: 2026-09-14
 - [x] Stage 3b-2 INT4/INT2 + T-MAC (src/lowbit.c merged; G2 marginal recorded)
 - [ ] G1 fusion decode remeasure (after decode impl)
 
-## 12. S1 composite gate (factorized × lowbit)
+## 10. S1 composite gate (factorized × lowbit)
 - factorized単独: val diff ≤ 1% @2000 steps (design scale)
 - 低ビット単独: val diff ≤ 1% (TinyStories T=512。真LUT +0.98%で通過)
 - 複合 (factorized + 低ビット): val diff ≤ 1%
@@ -60,17 +60,17 @@ date: 2026-09-14
 - details: analysis/p3a-factorized-head-validation.md、
   analysis/p3b-tmac-gradient-check.md
 
-## 10. S1 stages (gated, no bulk implementation)
+## 11. S1 stages (gated, no bulk implementation)
 - Stage 4a: 1B model definition + data loader. gate: accounting matches §1,
   loader roundtrip bit-identical.
 - Stage 4b: engine 1B readiness (dims fit, 16GB budget assert). gate:
   forward/backward operate at scale dims + 100 steps loss monotonic
   decrease + memory within budget + ctest green.
-- Stage 4c: factorized head enable. gate: §12 composite (factorized part).
-- Stage 4d: lowbit enable. gate: §12 composite (lowbit part).
-- Stage 4e: full evaluation, 2000 steps. gate: §12 composite + §11 items.
+- Stage 4c: factorized head enable. gate: §10 composite (factorized part).
+- Stage 4d: lowbit enable. gate: §10 composite (lowbit part).
+- Stage 4e: full evaluation, 2000 steps. gate: §10 composite + §12 items.
 
-## 11. Go/No-Go (final)
+## 12. Go/No-Go (final)
 - Go conditions:
   1. 1B training completes within 16GB RAM
   2. factorized single ≤ 1%, composite ≤ 1%
