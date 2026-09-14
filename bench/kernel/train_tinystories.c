@@ -61,6 +61,7 @@
 
 #include "jimotono/common.h"
 #include "jimotono/bpe.h"
+#include "jimotono/w8a8.h"
 #include "jimotono/data_pack.h"
 #include "jimotono/moe_layer.h"
 #include "jimotono/routing.h"
@@ -199,7 +200,7 @@ static void ts_usage(const char *prog) {
             "[--steps N] [--time SECS] [--lr LR] [--batch B] [--d DIM] "
             "[--layers L] [--val-every K] [--patience P] [--vocab V] "
             "[--bpe-vocab PATH] [--max-stories N] [--max-val-pairs N] "
-            "[--moe-batch] [--seq S] [--aux-weight W] [--no-sched]\n"
+            "[--moe-batch] [--seq S] [--aux-weight W] [--no-sched] [--w8a8]\n"
             "  defaults: data=data/tinystories_head16M.txt "
             "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=3e-4 "
             "batch=64 d=64 layers=2 val-every=100 patience=100 vocab=258 "
@@ -210,7 +211,7 @@ static void ts_usage(const char *prog) {
             "  --patience 0 disables early stopping\n"
             "  --max-val-pairs 0 evaluates full val set\n"
             "  --moe-batch: Phase G batch dispatch (cap=1.5; T=seq*batch)\n"
-            "  --seq S: tokens per sequence (1..512). T_step=seq*batch (<=1024)\n"
+            "  --w8a8: Stage 3 W8A8 INT8 fwd GEMM (default fp32; bwd stays fp32)\n"            "  --seq S: tokens per sequence (1..512). T_step=seq*batch (<=1024)\n"
             "  --aux-weight W: load-balancing L_aux weight (0..0.1, default "
             "0.01; tunable 0.01-0.1)\n"
             "  --factorized-head: Stage 1 factorized output head "
@@ -2309,6 +2310,14 @@ int main(int argc, char **argv) {
             max_val_pairs = atol(argv[++i]);
         } else if (strcmp(argv[i], "--moe-batch") == 0) {
             g_ts_moe_batch = 1;
+        } else if (strcmp(argv[i], "--w8a8") == 0) {
+            // Stage 3: W8A8 INT8 fwd経路を有効化 (既定OFF=fp32)。
+            // bwdはfp32のまま (STE相当)。val計測の単体fwdはfp32のまま。
+            if (jt_w8a8_set_enabled(1) != JT_OK) {
+                fprintf(stderr, "train_tinystories: --w8a8 enable failed\n");
+                errno = EINVAL;
+                goto cleanup;
+            }
         } else if (strcmp(argv[i], "--seq") == 0 && i + 1 < argc) {
             g_ts_seq = atol(argv[++i]);
         } else if (strcmp(argv[i], "--aux-weight") == 0 && i + 1 < argc) {
@@ -2700,12 +2709,12 @@ int main(int argc, char **argv) {
     printf("train_ts: layers=%d d=%d E=%d K=%d S=%d H=%d V=%d "
            "params=%zu lr=%.5f batch=%ld seq=%ld T=%ld patience=%ld "
            "moe_batch=%d cap=%.2f aux_w=%.4f head_fact=%d head_k=%d "
-           "head_init=%s head_lr_scale=%.2f\n",
+           "head_init=%s head_lr_scale=%.2f w8a8=%d\n",
            n_layers, d, TS_E, TS_K, TS_S, TS_H, vocab, m.lt.n_total, lr,
            batch, g_ts_seq, g_ts_seq * batch, patience, g_ts_moe_batch,
            (double)TS_CAP_FACTOR, (double)g_ts_aux_w, use_fact,
            use_fact ? head_k : 0, head_init_vm ? "vm" : "standard",
-           (double)head_lr_scale);
+           (double)head_lr_scale, jt_w8a8_is_enabled());
     /* 常駐見積り (d=64維持。V=48588でemb/head各64*48588*4B≈12.4MB。許容内) */
     {
         size_t n = m.lt.n_total;
