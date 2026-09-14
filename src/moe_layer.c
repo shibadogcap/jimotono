@@ -15,6 +15,7 @@
 #include "jimotono/routing.h"
 #include "jimotono/train_bwd.h"
 #include "jimotono/moe_gemm.h"
+#include "jimotono/w8a8.h"
 
 // P2 SIMD (Phase D) AVX2 パス (train_bwd.c と同一方針)。
 // - 出力 dim 方向の elementwise/f64累積は演算順序同一・FMA 不使用で bit同一。
@@ -118,6 +119,123 @@ static int jt_moe_silu_tile(const float *restrict Ge, const float *restrict Ue,
         }
     }
     return JT_OK;
+}
+
+// ---- Stage 3 (W8A8): batch fwd専用のINT8 GEMMヘルパー ----
+// 既定OFF (fp32) 時は一切呼ばれない (呼出し側のw8a8_on分岐で分離)。
+// ON時のみ使用する真のW8A8経路。bwdはfp32のまま (STE相当: 量子化はfwdのみ)。
+// fail-closed: 検証失敗時はCを更新せずJT_ERR_INVAL (errno併用)。
+// AVX-512不使用 (w8a8.cのスカラー核のみ使用)。
+static int jt_moe_transpose_s8(const int8_t *restrict src,
+                               int8_t *restrict dst, int rows, int cols) {
+    if (src == NULL || dst == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (rows <= 0 || cols <= 0) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            dst[(size_t)c * (size_t)rows + (size_t)r] =
+                src[(size_t)r * (size_t)cols + (size_t)c];
+        }
+    }
+    return JT_OK;
+}
+
+// per-tensor両側: C[M][N] = A[M][K]·B[K][N] (Bは[K][N] row-major)。
+// down_proj ([h][n]そのまま) 用。
+static int jt_moe_gemm_w8a8_pt(const float *restrict A,
+                               const float *restrict Bkn,
+                               float *restrict C, int M, int N, int K) {
+    int rc = JT_ERR_INVAL;
+    int8_t *Aq = NULL;
+    int8_t *Bq = NULL;
+    float sA = 1.0f;
+    float sB = 1.0f;
+    if (A == NULL || Bkn == NULL || C == NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (M <= 0 || N <= 0 || K <= 0) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    Aq = (int8_t *)malloc((size_t)M * (size_t)K * sizeof(int8_t));
+    Bq = (int8_t *)malloc((size_t)K * (size_t)N * sizeof(int8_t));
+    if (Aq == NULL || Bq == NULL) {
+        errno = ENOMEM;
+        goto cleanup;
+    }
+    if (jt_w8a8_quant_per_tensor(A, (size_t)M * (size_t)K, Aq, &sA) !=
+        JT_OK) {
+        goto cleanup;
+    }
+    if (jt_w8a8_quant_per_tensor(Bkn, (size_t)K * (size_t)N, Bq, &sB) !=
+        JT_OK) {
+        goto cleanup;
+    }
+    if (jt_w8a8_gemm_per_tensor(Aq, Bq, sA, sB, C, M, N, K) != JT_OK) {
+        goto cleanup;
+    }
+    rc = JT_OK;
+cleanup:
+    free(Aq);
+    free(Bq);
+    return rc;
+}
+
+// A per-tensor + B per-channel: C[M][N] = A[M][K]·B[N][K]^T。
+// Browは[N][K] row-major (N=出力チャネルが行。gate/upのWg/Wu[h][n]形式)。
+// 行量子化→int8転置→列scale GEMM。
+static int jt_moe_gemm_w8a8_pc(const float *restrict A,
+                               const float *restrict Brow,
+                               float *restrict C, int M, int N, int K) {
+    int rc = JT_ERR_INVAL;
+    int8_t *Aq = NULL;
+    int8_t *BqT = NULL;
+    int8_t *Bq = NULL;
+    float *sBcol = NULL;
+    float sA = 1.0f;
+    if (A == NULL || Brow == NULL || C == NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (M <= 0 || N <= 0 || K <= 0) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    Aq = (int8_t *)malloc((size_t)M * (size_t)K * sizeof(int8_t));
+    BqT = (int8_t *)malloc((size_t)N * (size_t)K * sizeof(int8_t));
+    Bq = (int8_t *)malloc((size_t)K * (size_t)N * sizeof(int8_t));
+    sBcol = (float *)malloc((size_t)N * sizeof(float));
+    if (Aq == NULL || BqT == NULL || Bq == NULL || sBcol == NULL) {
+        errno = ENOMEM;
+        goto cleanup;
+    }
+    if (jt_w8a8_quant_per_tensor(A, (size_t)M * (size_t)K, Aq, &sA) !=
+        JT_OK) {
+        goto cleanup;
+    }
+    if (jt_w8a8_quant_per_channel(Brow, (size_t)N, (size_t)K, BqT, sBcol) !=
+        JT_OK) {
+        goto cleanup;
+    }
+    if (jt_moe_transpose_s8(BqT, Bq, N, K) != JT_OK) {
+        goto cleanup;
+    }
+    if (jt_w8a8_gemm_per_channel(Aq, Bq, sA, sBcol, C, M, N, K) != JT_OK) {
+        goto cleanup;
+    }
+    rc = JT_OK;
+cleanup:
+    free(Aq);
+    free(BqT);
+    free(Bq);
+    free(sBcol);
+    return rc;
 }
 
 static int jt_moe_valid_dims(int n, int h, int e, int k, int s) {
@@ -907,6 +1025,12 @@ static int jt_moe_fwd_batch_impl(
         errno = EINVAL;
         goto cleanup;
     }
+    // Stage 3 (W8A8): INT8経路のON/OFFを関数冒頭で1回だけ読む。
+    // OFF (既定) 時は従来のfp32 micro GEMMのみ通り、計算核・順序は不変
+    // (速度不変。分岐は外側ループ前の単一ロード＋予測可能分岐のみ)。
+    // ON時はexpert/共有のGEMMのみINT8化し、sort/renormalize/combine・
+    // gate logits・silu・bwdはfp32のまま (bwd不変=STE相当)。
+    int w8a8_on = jt_w8a8_is_enabled();
     // 入力の有限検査 (fail-closed: Y更新前に拒否)。unchecked では省略し、
     // 呼び出し側のステップ冒頭検証＋区間内不変に委ねる (単体版と同一条件)。
     if (validate) {
@@ -1130,21 +1254,34 @@ static int jt_moe_fwd_batch_impl(
             // 転置（exact）＋micro GEMM（f32蓄積）＋silu（同一式）。
             // M_e<12はテール経路のみ（核内で処理）。validateの内外で同一核
             // （外側の有限検査のみ差異。計算核はbit一致）。
-            trc = jt_transpose_f32(wgr, Wgt, h, n);
-            if (trc != JT_OK) {
-                goto cleanup;  // errnoは下位で設定済み。Yは未更新。
-            }
-            trc = jt_transpose_f32(wur, Wut, h, n);
-            if (trc != JT_OK) {
-                goto cleanup;
-            }
-            grc = jt_gemm_mat_f32(Xe, Wgt, Ge, Mei, h, n);
-            if (grc != JT_OK) {
-                goto cleanup;
-            }
-            grc = jt_gemm_mat_f32(Xe, Wut, Ue, Mei, h, n);
-            if (grc != JT_OK) {
-                goto cleanup;
+            // Stage 3 (W8A8): w8a8_on時のみINT8経路 (gate/up=per-channel、
+            // down=per-tensor)。OFF時は下記elseの従来核のみ (bit同一・速度不変)。
+            if (w8a8_on) {
+                grc = jt_moe_gemm_w8a8_pc(Xe, wgr, Ge, Mei, h, n);
+                if (grc != JT_OK) {
+                    goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+                }
+                grc = jt_moe_gemm_w8a8_pc(Xe, wur, Ue, Mei, h, n);
+                if (grc != JT_OK) {
+                    goto cleanup;
+                }
+            } else {
+                trc = jt_transpose_f32(wgr, Wgt, h, n);
+                if (trc != JT_OK) {
+                    goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+                }
+                trc = jt_transpose_f32(wur, Wut, h, n);
+                if (trc != JT_OK) {
+                    goto cleanup;
+                }
+                grc = jt_gemm_mat_f32(Xe, Wgt, Ge, Mei, h, n);
+                if (grc != JT_OK) {
+                    goto cleanup;
+                }
+                grc = jt_gemm_mat_f32(Xe, Wut, Ue, Mei, h, n);
+                if (grc != JT_OK) {
+                    goto cleanup;
+                }
             }
             {
                 int src = jt_moe_silu_tile(Ge, Ue, SeT, Me, h);
@@ -1152,7 +1289,11 @@ static int jt_moe_fwd_batch_impl(
                     goto cleanup;
                 }
             }
-            grc = jt_gemm_mat_f32(SeT, wdr, Ye, Mei, n, h);
+            if (w8a8_on) {
+                grc = jt_moe_gemm_w8a8_pt(SeT, wdr, Ye, Mei, n, h);
+            } else {
+                grc = jt_gemm_mat_f32(SeT, wdr, Ye, Mei, n, h);
+            }
             if (grc != JT_OK) {
                 goto cleanup;
             }
@@ -1235,22 +1376,34 @@ static int jt_moe_fwd_batch_impl(
             errno = EINVAL;
             goto cleanup;
         }
-        trc = jt_transpose_f32(wgr, Wgt, h, n);
-        if (trc != JT_OK) {
-            goto cleanup;
-        }
-        trc = jt_transpose_f32(wur, Wut, h, n);
-        if (trc != JT_OK) {
-            goto cleanup;
-        }
-        // T=512は12で割り切れない（512%12=8テール）。核内で処理する。
-        grc = jt_gemm_mat_f32(X, Wgt, GsT, T, h, n);
-        if (grc != JT_OK) {
-            goto cleanup;
-        }
-        grc = jt_gemm_mat_f32(X, Wut, UsT, T, h, n);
-        if (grc != JT_OK) {
-            goto cleanup;
+        // Stage 3 (W8A8): w8a8_on時のみINT8経路。OFF時は従来核のみ。
+        if (w8a8_on) {
+            grc = jt_moe_gemm_w8a8_pc(X, wgr, GsT, T, h, n);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
+            grc = jt_moe_gemm_w8a8_pc(X, wur, UsT, T, h, n);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
+        } else {
+            trc = jt_transpose_f32(wgr, Wgt, h, n);
+            if (trc != JT_OK) {
+                goto cleanup;
+            }
+            trc = jt_transpose_f32(wur, Wut, h, n);
+            if (trc != JT_OK) {
+                goto cleanup;
+            }
+            // T=512は12で割り切れない（512%12=8テール）。核内で処理する。
+            grc = jt_gemm_mat_f32(X, Wgt, GsT, T, h, n);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
+            grc = jt_gemm_mat_f32(X, Wut, UsT, T, h, n);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
         }
         // 先にcacheへ原本退避（GsT/UsT原本はbwdで必要）。
         if (cache_Gs != NULL) {
@@ -1284,7 +1437,11 @@ static int jt_moe_fwd_batch_impl(
             }
             GsT[i] = (float)v;
         }
-            grc = jt_gemm_mat_f32(GsT, wdr, YsT, T, n, h);
+            if (w8a8_on) {
+                grc = jt_moe_gemm_w8a8_pt(GsT, wdr, YsT, T, n, h);
+            } else {
+                grc = jt_gemm_mat_f32(GsT, wdr, YsT, T, n, h);
+            }
             if (grc != JT_OK) {
                 goto cleanup;
             }

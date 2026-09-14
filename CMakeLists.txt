@@ -49,6 +49,7 @@ add_library(jimotono_core
   src/model1b.c
   src/moe_layer.c
   src/moe_gemm.c
+  src/w8a8.c
   src/data_pack.c
   src/bpe.c
 )
@@ -153,6 +154,10 @@ if(JIMOTONO_BUILD_BENCH)
   target_link_libraries(test_cycle_bench PRIVATE jimotono_core jimotono_bench_common)
   add_executable(test_moe_layer bench/kernel/test_moe_layer.c)
   target_link_libraries(test_moe_layer PRIVATE jimotono_core)
+  # Stage 3 (W8A8): INT8量子化・逆量子化・int8 GEMMの単体検証 (ctest登録)。
+  # 既存tol不変 (本テスト内の許可用tolのみ使用。既存テストのtolに触れない)。
+  add_executable(test_w8a8 bench/kernel/test_w8a8.c)
+  target_link_libraries(test_w8a8 PRIVATE jimotono_core)
   # bench_schema.md の commit 記録用にビルド時ハッシュを埋め込む (取得不可時は空)。
   execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE JIMOTONO_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
@@ -215,6 +220,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME cycle COMMAND test_cycle_bench)
   add_test(NAME model1b COMMAND test_model1b)
   add_test(NAME moe_layer COMMAND test_moe_layer)
+  add_test(NAME w8a8 COMMAND test_w8a8)
   add_test(NAME data_pack COMMAND test_data_pack)
   add_test(NAME bpe COMMAND test_bpe)
   # S0b-4: 正しさのみassert。帯域値は参考出力 (速度での合否判定なし)。
