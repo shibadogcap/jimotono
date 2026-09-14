@@ -582,12 +582,13 @@ static void test_linux_extra(void) {
     }
 #ifdef HAVE_LIBURING
     {
-        unsigned char c[16] = {0};
-        jt_io_spec_t s = {0, sizeof(c), c};
+        // O_DIRECT fdのため整列済みbuf(4096B)を再利用する。
+        // 非整列16B読みはカーネルがEINVALにする（direct契約）。
+        jt_io_spec_t s = {0, 4096, buf};
         CHECK(jt_io_pread_batch_uring(fd, &s, 1) == JT_OK,
               "linux uring roundtrip");
-        for (size_t i = 0; i < sizeof(c); i++) {
-            if (c[i] != xp_cold_expect(i)) {
+        for (size_t i = 0; i < 16; i++) {
+            if (((unsigned char *)buf)[i] != xp_cold_expect(i)) {
                 CHECK(0, "linux uring mismatch at %zu", i);
                 break;
             }
