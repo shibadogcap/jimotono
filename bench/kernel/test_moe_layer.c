@@ -1521,6 +1521,8 @@ static void test_bwd_batch_invalid(void) {
     float W[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
     float dX[4] = {3.0f, 4.0f, 5.0f, 6.0f};
     float dWg_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float dWg_2[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float dWg_3[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     size_t ids[4] = {0, 1, 0, 1};
     float wt[4] = {0.5f, 0.5f, 0.5f, 0.5f};
     float G[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1531,18 +1533,18 @@ static void test_bwd_batch_invalid(void) {
     float dWgate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     CHECK(jt_moe_bwd_batch(NULL, X, Wgate, W, W, W, NULL, NULL, NULL, ids,
                            wt, G, G, Ys, NULL, NULL, perm, off, drop, dX,
-                           dWgate, dWg_, dWg_, dWg_, NULL, NULL, NULL,
+                           dWgate, dWg_, dWg_2, dWg_3, NULL, NULL, NULL,
                            NULL, 2, 2, 1, 4, 2, 0) == JT_ERR_INVAL,
           "bwd batch NULL dY");
     CHECK(dX[0] == 3.0f && dX[3] == 6.0f, "bwd batch mutated on NULL");
     CHECK(jt_moe_bwd_batch(dY, X, Wgate, W, W, W, NULL, NULL, NULL, ids,
                            wt, G, G, Ys, NULL, NULL, perm, off, drop, dX,
-                           dWgate, dWg_, dWg_, dWg_, NULL, NULL, NULL,
+                           dWgate, dWg_, dWg_2, dWg_3, NULL, NULL, NULL,
                            NULL, 0, 2, 1, 4, 2, 0) == JT_ERR_INVAL,
           "bwd batch T=0");
     CHECK(jt_moe_bwd_batch(dY, X, Wgate, W, W, W, NULL, NULL, NULL, ids,
                            wt, G, G, Ys, NULL, NULL, perm, off, drop, dX,
-                           dWgate, dWg_, dWg_, dWg_, NULL, NULL, NULL,
+                           dWgate, dWg_, dWg_2, dWg_3, NULL, NULL, NULL,
                            NULL, 2, 2, 1, 4, 5, 0) == JT_ERR_INVAL,
           "bwd batch k>E");
     {
