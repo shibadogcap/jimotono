@@ -4,6 +4,11 @@ name: ci
 # macOSのみで実ビルドされていた問題に対し、ubuntu / macOS / Windows での
 # cmake configure (Debug) -> build -> ctest を matrix 化する。
 # Linux は gcc と clang の2ジョブ (最低1つ必須の条件を満たしつつ両方検証)。
+# マトリクス拡張: 既存4ジョブ (linux-gcc / linux-clang / macos-clang / windows-msvc) を維持し、
+# ubuntu-24.04-arm / macos-14 / macos-13 / windows-11-arm を追加する。
+# 現行流儀を踏襲: name/os/cc(/cxx) 指定。Windows (MSVC) ジョブは cc/cxx を持たない。
+# 命令セット検証はCI不可: AVX2 / AVX-512 / NEON の実行時正しさ・速度はCIランナーでは検証できない
+# (ホストCPUが不定のため)。CIはコンパイル分岐のみ担保し、実行時dispatchはログ出力に留める。
 
 on:
   push:
@@ -31,6 +36,20 @@ jobs:
             cxx: clang++
           - os: windows-latest
             name: windows-msvc
+          - os: ubuntu-24.04-arm
+            name: linux-arm64-gcc
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            name: macos14-arm64-clang
+            cc: clang
+            cxx: clang++
+          - os: macos-13
+            name: macos13-x64-clang
+            cc: clang
+            cxx: clang++
+          - os: windows-11-arm
+            name: windows-arm64-msvc
 
     steps:
       - uses: actions/checkout@v4
