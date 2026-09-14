@@ -48,10 +48,20 @@ add_library(jimotono_core
   src/lut_aware.c
   src/model1b.c
   src/moe_layer.c
+  src/moe_gemm.c
   src/data_pack.c
   src/bpe.c
 )
 # POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
+# Phase G Step 4a: AVX2マイクロカーネルTUに -mavx2（FMAなし）。
+# - x86_64のみ。AVX-512は決して有効化しない。ARM64/Windowsでは何も付けない
+#   （スカラーフォールバック。同一ソースがビルド可能）。
+# - N100/i5-8th baselineはいずれもAVX2対応のため既定バイナリは動作する。
+# - FMAは付けない（-mfmaなし。mul/add分離のbit同一を保つため）。
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  set_source_files_properties(src/moe_gemm.c PROPERTIES COMPILE_OPTIONS "-mavx2")
+  set_source_files_properties(src/moe_layer.c PROPERTIES COMPILE_OPTIONS "-mavx2")
+endif()
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_compile_definitions(_GNU_SOURCE)

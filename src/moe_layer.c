@@ -14,6 +14,7 @@
 
 #include "jimotono/routing.h"
 #include "jimotono/train_bwd.h"
+#include "jimotono/moe_gemm.h"
 
 // P2 SIMD (Phase D) AVX2 パス (train_bwd.c と同一方針)。
 // - 出力 dim 方向の elementwise/f64累積は演算順序同一・FMA 不使用で bit同一。
@@ -84,6 +85,40 @@ static void jt_moe_avx2_f64_mulk_commit(float *restrict dst, double k,
 }
 
 #endif
+
+// Phase G Step 4a: SwiGLU siluタイル（double評価・要素wise）。
+// jt_swiglu_fwd（train_bwd.c）と同一式：sig=1/(1+exp(-g))、silu=g*sig、s=silu*u。
+// Ge/Ue（f32 micro出力）をdoubleに上げて評価しSe（f32）に格納する。
+// 要素独立のため順序依存なし。非有限時はEINVAL（呼出し側が公開出力を更新せず破棄）。
+static int jt_moe_silu_tile(const float *restrict Ge, const float *restrict Ue,
+                            float *restrict Se, size_t M, int h) {
+    if (Ge == NULL || Ue == NULL || Se == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (h <= 0) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    for (size_t m = 0; m < M; m++) {
+        const float *grow = Ge + m * (size_t)h;
+        const float *urow = Ue + m * (size_t)h;
+        float *srow = Se + m * (size_t)h;
+        for (int i = 0; i < h; i++) {
+            double gi = (double)grow[i];
+            double ui = (double)urow[i];
+            double sig = 1.0 / (1.0 + exp(-gi));
+            double silu = gi * sig;
+            double s = silu * ui;
+            if (!isfinite(s) || !isfinite(sig) || !isfinite(silu)) {
+                errno = EINVAL;
+                return JT_ERR_INVAL;
+            }
+            srow[i] = (float)s;
+        }
+    }
+    return JT_OK;
+}
 
 static int jt_moe_valid_dims(int n, int h, int e, int k, int s) {
     if (n <= 0 || h <= 0) {
@@ -822,9 +857,6 @@ static int jt_moe_fwd_batch_impl(
     static const int kMaxE = JT_MOE_MAX_EXPERTS;
     static const int kMaxW = JT_BWD_MAX_WIDE;
     float logits[JT_MOE_MAX_EXPERTS];
-    float tmpG[JT_BWD_MAX_WIDE];
-    float tmpU[JT_BWD_MAX_WIDE];
-    float tmpY[JT_BWD_MAX_WIDE];
     size_t Tk = 0;
     size_t kept = 0;
     size_t dropped = 0;
@@ -838,6 +870,15 @@ static int jt_moe_fwd_batch_impl(
     float *Ye = NULL;
     float *Ge = NULL;
     float *Ue = NULL;
+    // Phase G Step 4a: microkernel用スクラッチ（転置重み・silu中間・共有タイル）。
+    // Wgt/Wut [n][h]（gate/up転置。expert・共有で再利用）、SeT [maxMe][h]。
+    // GsT/UsT/YsT [T][h]/[T][h]/[T][n]（共有expertタイル。Sループで再利用）。
+    float *Wgt = NULL;
+    float *Wut = NULL;
+    float *SeT = NULL;
+    float *GsT = NULL;
+    float *UsT = NULL;
+    float *YsT = NULL;
     if (X == NULL || Wgate == NULL || Wg == NULL || Wu == NULL ||
         Wd == NULL || Y == NULL || out_ids == NULL ||
         out_weights == NULL) {
@@ -1007,12 +1048,15 @@ static int jt_moe_fwd_batch_impl(
             }
         }
     }
-    // Phase G Step 2: expert 単位バッチ fwd (素朴 GEMM 参照実装)。
-    // expert 連続バッファ Xe [M_e][n] に gather し、M 方向に既存
-    // jt_swiglu_fwd 核を拡張して expert-outer/M-inner 順 (§2.1) で計算する。
-    // ブロッキング・SIMD 新規最適化なし・AVX-512 不使用 (Step 4)。
-    // bwd は単体版のまま。各行の計算核と結合の token 順は Step 1 と同一のため
-    // drop なし時は単体ループと bit 一致 (AVX2 有無によらず同一核経由)。
+    // Phase G Step 4a: expert 単位バッチ fwd（AVX2マイクロカーネル）。
+    // expert 連続バッファ Xe [M_e][n] に gather し、同一カーネル
+    // jt_gemm_mat_f32（Mr=12×Nr=4・acc12・f32蓄積。f64加算は後段combineの既存
+    // f64加算）で Ge[M_e][h]=Xe·Wgt、Ue[M_e][h]=Xe·Wut、Ye[M_e][n]=Se·Wd を計算する。
+    // Wgt/Wutは Wg/Wu [h][n] のexact転置（[n][h]）。Wdは[h][n]のまま（転置不要）。
+    // siluはjt_swiglu_fwdと同一式（double）の要素wise。gate logits・top-k・sort・
+    // renormalize・combine順序はStep 3と同一のため perm/drop はbit一致（G1）。
+    // Ge/Ue/Yeはf32蓄積のためStep 3（f64ドット）とbit一致しない（G3は1e-6で評価）。
+    // bwdはStep 3 naiveのまま。AVX-512不使用。M_e=0は起動スキップ。
     {
         size_t maxMe = 0;
         for (int e = 0; e < n_experts; e++) {
@@ -1031,7 +1075,38 @@ static int jt_moe_fwd_batch_impl(
             Ye = (float *)malloc(maxMe * (size_t)n * sizeof(float));
             Ge = (float *)malloc(maxMe * (size_t)h * sizeof(float));
             Ue = (float *)malloc(maxMe * (size_t)h * sizeof(float));
-            if (Xe == NULL || Ye == NULL || Ge == NULL || Ue == NULL) {
+            SeT = (float *)malloc(maxMe * (size_t)h * sizeof(float));
+            if (Xe == NULL || Ye == NULL || Ge == NULL || Ue == NULL ||
+                SeT == NULL) {
+                errno = ENOMEM;
+                goto cleanup;
+            }
+        }
+        // 転置スクラッチ Wgt/Wut [n][h]（全expertで再利用）。
+        // 共有expertタイル（GsT/UsT/YsT）もここで確保する（S>0時のみ）。
+        if ((size_t)n > SIZE_MAX / (size_t)h) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        {
+            size_t nh = (size_t)n * (size_t)h;
+            Wgt = (float *)malloc(nh * sizeof(float));
+            Wut = (float *)malloc(nh * sizeof(float));
+            if (Wgt == NULL || Wut == NULL) {
+                errno = ENOMEM;
+                goto cleanup;
+            }
+        }
+        if (n_shared > 0) {
+            if ((size_t)T > SIZE_MAX / (size_t)n ||
+                (size_t)T > SIZE_MAX / (size_t)h) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            GsT = (float *)malloc((size_t)T * (size_t)h * sizeof(float));
+            UsT = (float *)malloc((size_t)T * (size_t)h * sizeof(float));
+            YsT = (float *)malloc((size_t)T * (size_t)n * sizeof(float));
+            if (GsT == NULL || UsT == NULL || YsT == NULL) {
                 errno = ENOMEM;
                 goto cleanup;
             }
@@ -1042,9 +1117,17 @@ static int jt_moe_fwd_batch_impl(
             const float *wgr;
             const float *wur;
             const float *wdr;
+            int Mei;
+            int trc;
+            int grc;
             if (Me == 0) {
                 continue;  // M_e=0 の expert は起動スキップ (§4.2)
             }
+            if (Me > (size_t)INT32_MAX) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            Mei = (int)Me;
             // gather: expert 連続配置 (perm 順。同一 expert 内は token 昇順で安定)。
             for (size_t m = 0; m < Me; m++) {
                 size_t q = perm[b0 + m];
@@ -1055,21 +1138,34 @@ static int jt_moe_fwd_batch_impl(
             wgr = Wg + (size_t)e * (size_t)h * (size_t)n;
             wur = Wu + (size_t)e * (size_t)h * (size_t)n;
             wdr = Wd + (size_t)e * (size_t)h * (size_t)n;
-            // M 方向に既存核を拡張 (各行は Step 1 の per-pair 呼出しと同一)。
-            for (size_t m = 0; m < Me; m++) {
-                int frc =
-                    validate
-                        ? jt_swiglu_fwd(Xe + m * (size_t)n, wgr, wur, wdr,
-                                        Ge + m * (size_t)h,
-                                        Ue + m * (size_t)h,
-                                        Ye + m * (size_t)n, n, h)
-                        : jt_swiglu_fwd_unchecked(
-                              Xe + m * (size_t)n, wgr, wur, wdr,
-                              Ge + m * (size_t)h, Ue + m * (size_t)h,
-                              Ye + m * (size_t)n, n, h);
-                if (frc != JT_OK) {
-                    goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+            // 転置（exact）＋micro GEMM（f32蓄積）＋silu（同一式）。
+            // M_e<12はテール経路のみ（核内で処理）。validateの内外で同一核
+            // （外側の有限検査のみ差異。計算核はbit一致）。
+            trc = jt_transpose_f32(wgr, Wgt, h, n);
+            if (trc != JT_OK) {
+                goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+            }
+            trc = jt_transpose_f32(wur, Wut, h, n);
+            if (trc != JT_OK) {
+                goto cleanup;
+            }
+            grc = jt_gemm_mat_f32(Xe, Wgt, Ge, Mei, h, n);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
+            grc = jt_gemm_mat_f32(Xe, Wut, Ue, Mei, h, n);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
+            {
+                int src = jt_moe_silu_tile(Ge, Ue, SeT, Me, h);
+                if (src != JT_OK) {
+                    goto cleanup;
                 }
+            }
+            grc = jt_gemm_mat_f32(SeT, wdr, Ye, Mei, n, h);
+            if (grc != JT_OK) {
+                goto cleanup;
             }
             // scatter: per-q cache 形式へ復元 (bwd は単体版のまま Step 3 申送り)。
             for (size_t m = 0; m < Me; m++) {
@@ -1110,11 +1206,11 @@ static int jt_moe_fwd_batch_impl(
             }
         }
     }
-    // combine (scatter-add。token 順・slot 順で単体版と同一順序のため、
-    // drop なし時は bit 一致)。共有 expert は容量制限対象外で同一に加算。
+    // combine（routed scatter-add。token順・slot順でStep 3と同一順序。
+    // perm/dropはmicro化の影響を受けないためbit一致（G1）。
+    // f64加算は既存の要素wise（bit同一）。Ge/Ue/Ye自体はf32のためG3は1e-6）。
     for (int t = 0; t < T; t++) {
         double *ya = yacc + (size_t)t * (size_t)n;
-        const float *Xt = X + (size_t)t * (size_t)n;
         for (int p = 0; p < topk; p++) {
             size_t q = (size_t)t * (size_t)topk + (size_t)p;
             float w;
@@ -1133,39 +1229,87 @@ static int jt_moe_fwd_batch_impl(
             }
 #endif
         }
-        for (int s = 0; s < n_shared; s++) {
-            const float *wgr =
-                Wg_s + (size_t)s * (size_t)h * (size_t)n;
-            const float *wur =
-                Wu_s + (size_t)s * (size_t)h * (size_t)n;
-            const float *wdr =
-                Wd_s + (size_t)s * (size_t)h * (size_t)n;
-            float *Gp = (cache_Gs != NULL)
-                            ? (cache_Gs +
-                               ((size_t)t * (size_t)n_shared + (size_t)s) *
-                                   (size_t)h)
-                            : tmpG;
-            float *Up = (cache_Us != NULL)
-                            ? (cache_Us +
-                               ((size_t)t * (size_t)n_shared + (size_t)s) *
-                                   (size_t)h)
-                            : tmpU;
-            int frc = validate
-                          ? jt_swiglu_fwd(Xt, wgr, wur, wdr, Gp, Up, tmpY,
-                                          n, h)
-                          : jt_swiglu_fwd_unchecked(Xt, wgr, wur, wdr, Gp,
-                                                    Up, tmpY, n, h);
-            if (frc != JT_OK) {
+    }
+    // 共有expert（常時オン・容量制限対象外。M=T=512の密GEMMを同一カーネルに乗せる）。
+    // X[T][n]は既に連続のためgather不要。s毎に転置＋micro＋silu＋microし、
+    // yaccへf64加算（既存要素wise、per-t順序は従来と同一のため加算順はbit同一。
+    // タイル値自体はf32のためG3は1e-6）。cache_Gs/Usへscatterする。
+    for (int s = 0; s < n_shared; s++) {
+        const float *wgr = Wg_s + (size_t)s * (size_t)h * (size_t)n;
+        const float *wur = Wu_s + (size_t)s * (size_t)h * (size_t)n;
+        const float *wdr = Wd_s + (size_t)s * (size_t)h * (size_t)n;
+        size_t Th = (size_t)T * (size_t)h;
+        size_t i;
+        int trc;
+        int grc;
+        if (T > INT32_MAX) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        trc = jt_transpose_f32(wgr, Wgt, h, n);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        trc = jt_transpose_f32(wur, Wut, h, n);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        // T=512は12で割り切れない（512%12=8テール）。核内で処理する。
+        grc = jt_gemm_mat_f32(X, Wgt, GsT, T, h, n);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(X, Wut, UsT, T, h, n);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        // 先にcacheへ原本退避（GsT/UsT原本はbwdで必要）。
+        if (cache_Gs != NULL) {
+            for (int t = 0; t < T; t++) {
+                memcpy(cache_Gs +
+                           ((size_t)t * (size_t)n_shared + (size_t)s) *
+                               (size_t)h,
+                       GsT + (size_t)t * (size_t)h,
+                       (size_t)h * sizeof(float));
+            }
+        }
+        if (cache_Us != NULL) {
+            for (int t = 0; t < T; t++) {
+                memcpy(cache_Us +
+                           ((size_t)t * (size_t)n_shared + (size_t)s) *
+                               (size_t)h,
+                       UsT + (size_t)t * (size_t)h,
+                       (size_t)h * sizeof(float));
+            }
+        }
+        // silu（同一式。GsT/UsT→GsTへ上書きしSeとして再利用）。
+        for (i = 0; i < Th; i++) {
+            double gi = (double)GsT[i];
+            double ui = (double)UsT[i];
+            double sig = 1.0 / (1.0 + exp(-gi));
+            double silu = gi * sig;
+            double v = silu * ui;
+            if (!isfinite(v)) {
+                errno = EINVAL;
                 goto cleanup;
             }
-#ifdef __AVX2__
-            jt_moe_avx2_f64_add(ya, 1.0, tmpY, n);
-#else
-            for (int j = 0; j < n; j++) {
-                ya[j] += (double)tmpY[j];
-            }
-#endif
+            GsT[i] = (float)v;
         }
+            grc = jt_gemm_mat_f32(GsT, wdr, YsT, T, n, h);
+            if (grc != JT_OK) {
+                goto cleanup;
+            }
+            for (int t = 0; t < T; t++) {
+                double *ya = yacc + (size_t)t * (size_t)n;
+                const float *Yp = YsT + (size_t)t * (size_t)n;
+#ifdef __AVX2__
+                jt_moe_avx2_f64_add(ya, 1.0, Yp, n);
+#else
+                for (int j = 0; j < n; j++) {
+                    ya[j] += (double)Yp[j];
+                }
+#endif
+            }
     }
     for (size_t i = 0; i < (size_t)T * (size_t)n; i++) {
         if (!isfinite(yacc[i])) {
@@ -1213,6 +1357,12 @@ cleanup:
     free(Ye);
     free(Ge);
     free(Ue);
+    free(Wgt);
+    free(Wut);
+    free(SeT);
+    free(GsT);
+    free(UsT);
+    free(YsT);
     return rc;
 }
 
@@ -1312,6 +1462,34 @@ static int jt_moe_bwd_batch_impl(
     double *dx_acc = NULL;
     double *dwdp = NULL;
     double *dlog_q = NULL;
+    // Phase G Step 4a bwd micro用スクラッチ（expertタイル [maxMe]＋共有タイル [T]）。
+    // gate系（dwdp/dlog/dWgate）はnaiveのまま。本節はSwiGLU部のdot/dX/dWのみ。
+    float *bXe = NULL;
+    float *bDYe = NULL;
+    float *bG = NULL;
+    float *bU = NULL;
+    float *bDot = NULL;
+    float *bDg = NULL;
+    float *bDu = NULL;
+    float *bSs = NULL;
+    float *bDgt = NULL;
+    float *bDut = NULL;
+    float *bSst = NULL;
+    float *bDxe = NULL;
+    float *bDxe2 = NULL;
+    float *bWdt = NULL;
+    float *sDg = NULL;
+    float *sDu = NULL;
+    float *sSs = NULL;
+    float *sDot = NULL;
+    float *sDxe = NULL;
+    float *sDxe2 = NULL;
+    float *sDgt = NULL;
+    float *sDut = NULL;
+    float *sSst = NULL;
+    float *sWdt = NULL;
+    float *sG = NULL;
+    float *sU = NULL;
     if (dY == NULL || X == NULL || Wgate == NULL || Wg == NULL ||
         Wu == NULL || Wd == NULL || ids == NULL || weights == NULL ||
         Gsel == NULL || Usel == NULL || Ysel == NULL || perm == NULL ||
@@ -1464,6 +1642,90 @@ static int jt_moe_bwd_batch_impl(
         errno = ENOMEM;
         goto cleanup;
     }
+    // Step 4a bwd micro用スクラッチ確保（公開出力には触れない）。
+    {
+        size_t maxMe = 0;
+        size_t m_n = 0;
+        size_t m_h = 0;
+        size_t h_me = 0;
+        size_t t_n = 0;
+        size_t t_h = 0;
+        size_t h_t = 0;
+        for (int e = 0; e < n_experts; e++) {
+            size_t Me = off[(size_t)e + 1] - off[(size_t)e];
+            if (Me > maxMe) {
+                maxMe = Me;
+            }
+        }
+        if (maxMe > SIZE_MAX / (size_t)n ||
+            maxMe > SIZE_MAX / (size_t)h) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        if ((size_t)n > SIZE_MAX / (size_t)h) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        if ((size_t)T > SIZE_MAX / (size_t)n ||
+            (size_t)T > SIZE_MAX / (size_t)h) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        m_n = maxMe * (size_t)n;
+        m_h = maxMe * (size_t)h;
+        h_me = (size_t)h * maxMe;
+        t_n = (size_t)T * (size_t)n;
+        t_h = (size_t)T * (size_t)h;
+        h_t = (size_t)h * (size_t)T;
+        if (maxMe > 0) {
+            bXe = (float *)malloc(m_n * sizeof(float));
+            bDYe = (float *)malloc(m_n * sizeof(float));
+            bG = (float *)malloc(m_h * sizeof(float));
+            bU = (float *)malloc(m_h * sizeof(float));
+            bDot = (float *)malloc(m_h * sizeof(float));
+            bDg = (float *)malloc(m_h * sizeof(float));
+            bDu = (float *)malloc(m_h * sizeof(float));
+            bSs = (float *)malloc(m_h * sizeof(float));
+            bDgt = (float *)malloc(h_me * sizeof(float));
+            bDut = (float *)malloc(h_me * sizeof(float));
+            bSst = (float *)malloc(h_me * sizeof(float));
+            bDxe = (float *)malloc(m_n * sizeof(float));
+            bDxe2 = (float *)malloc(m_n * sizeof(float));
+            if (bXe == NULL || bDYe == NULL || bG == NULL || bU == NULL ||
+                bDot == NULL || bDg == NULL || bDu == NULL || bSs == NULL ||
+                bDgt == NULL || bDut == NULL || bSst == NULL ||
+                bDxe == NULL || bDxe2 == NULL) {
+                errno = ENOMEM;
+                goto cleanup;
+            }
+        }
+        bWdt = (float *)malloc((size_t)n * (size_t)h * sizeof(float));
+        if (bWdt == NULL) {
+            errno = ENOMEM;
+            goto cleanup;
+        }
+        if (n_shared > 0) {
+            sDg = (float *)malloc(t_h * sizeof(float));
+            sDu = (float *)malloc(t_h * sizeof(float));
+            sSs = (float *)malloc(t_h * sizeof(float));
+            sDot = (float *)malloc(t_h * sizeof(float));
+            sDxe = (float *)malloc(t_n * sizeof(float));
+            sDxe2 = (float *)malloc(t_n * sizeof(float));
+            sDgt = (float *)malloc(h_t * sizeof(float));
+            sDut = (float *)malloc(h_t * sizeof(float));
+            sSst = (float *)malloc(h_t * sizeof(float));
+            sG = (float *)malloc(t_h * sizeof(float));
+            sU = (float *)malloc(t_h * sizeof(float));
+            sWdt = (float *)malloc((size_t)n * (size_t)h * sizeof(float));
+            if (sDg == NULL || sDu == NULL || sSs == NULL || sDot == NULL ||
+                sDxe == NULL || sDxe2 == NULL || sDgt == NULL ||
+                sDut == NULL || sSst == NULL || sG == NULL || sU == NULL ||
+                sWdt == NULL) {
+                errno = ENOMEM;
+                goto cleanup;
+            }
+        }
+    }
     // 出力ゼロ埋め (検証通過後のみ到達。非選択・dropは0のまま)。
     {
         size_t e = (size_t)n_experts;
@@ -1610,11 +1872,15 @@ static int jt_moe_bwd_batch_impl(
             }
         }
     }
-    // 5) routed expertのSwiGLU bwd＋dW/dX GEMM (expert_id昇順外側・m昇順内側)。
-    // m昇順は安定ソートのためtoken_pos昇順と一致 (決定論性)。
-    // dWはfloat加算のm昇順縮約 (単体版のtoken昇順加算と同一順序のため、
-    // dropなし時はbit一致。可変M_eの項数差のみ許容範囲で評価)。
-    // dXはdx_accへのexpert昇順scatter-addに固定 (§3.2改訂)。
+    // 5) routed expertのSwiGLU bwd＋dW/dX GEMM（Step 4a micro）。
+    // expert_id昇順外側・m昇順内側（安定ソートのためtoken_pos昇順と一致。決定論性）。
+    // gate系（dwdp/dlog/dWgate）は上記1)/2)/4) naiveのまま（bit同一）。
+    // 本節はdot（dYe·Wd）・dX（dg·Wg＋du·Wu）・dW（D^T·X）を同一カーネル
+    // jt_gemm_mat_f32（Mr=12×Nr=4・f32蓄積）に乗せる。Wdはexact転置してから投入する。
+    // K/縮約順序はm昇順でStep 3と同一。値はf32蓄積のためG3は1e-6。
+    // dXのdx_acc合算はexpert昇順・m昇順の既存f64加算（同一順）。
+    // dWはexpert別行への単一書込み（ゼロ埋め済みのため上書き＝加算と同一）。
+    // M_e=0は起動スキップ。M_e<12はテール経路のみ（核内処理）。
     for (int ee = 0; ee < n_experts; ee++) {
         size_t b0 = off[(size_t)ee];
         size_t Me = off[(size_t)ee + 1] - b0;
@@ -1624,8 +1890,23 @@ static int jt_moe_bwd_batch_impl(
         float *oWg;
         float *oWu;
         float *oWd;
+        int Mei;
+        int trc;
+        int grc;
+        size_t m;
+        int i;
+        int j;
         if (Me == 0) {
             continue;
+        }
+        if (Me > (size_t)INT32_MAX) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        Mei = (int)Me;
+        if (h > JT_BWD_MAX_WIDE || n > JT_BWD_MAX_WIDE) {
+            errno = EINVAL;
+            goto cleanup;
         }
         wgr = Wg + (size_t)ee * (size_t)h * (size_t)n;
         wur = Wu + (size_t)ee * (size_t)h * (size_t)n;
@@ -1633,7 +1914,8 @@ static int jt_moe_bwd_batch_impl(
         oWg = dWg + (size_t)ee * (size_t)h * (size_t)n;
         oWu = dWu + (size_t)ee * (size_t)h * (size_t)n;
         oWd = dWd + (size_t)ee * (size_t)h * (size_t)n;
-        for (size_t m = 0; m < Me; m++) {
+        // gather：Xe（X[t]）・dYe（w*dY。単体版と同一丸め）・G/U。
+        for (m = 0; m < Me; m++) {
             size_t q = perm[b0 + m];
             size_t t = q / (size_t)topk;
             float w;
@@ -1641,11 +1923,6 @@ static int jt_moe_bwd_batch_impl(
             const float *dYt;
             const float *Gp;
             const float *Up;
-            double dg[JT_BWD_MAX_WIDE];
-            double du[JT_BWD_MAX_WIDE];
-            double ss[JT_BWD_MAX_WIDE];
-            float dxe[JT_BWD_MAX_WIDE];
-            float dYe[JT_BWD_MAX_WIDE];
             if (q >= Tk || drop[q]) {
                 errno = EINVAL;
                 goto cleanup;
@@ -1659,147 +1936,210 @@ static int jt_moe_bwd_batch_impl(
             dYt = dY + t * (size_t)n;
             Gp = Gsel + q * (size_t)h;
             Up = Usel + q * (size_t)h;
-            if (h > JT_BWD_MAX_WIDE || n > JT_BWD_MAX_WIDE) {
-                errno = EINVAL;
-                goto cleanup;
+            memcpy(bXe + m * (size_t)n, Xt, (size_t)n * sizeof(float));
+            memcpy(bG + m * (size_t)h, Gp, (size_t)h * sizeof(float));
+            memcpy(bU + m * (size_t)h, Up, (size_t)h * sizeof(float));
+            for (j = 0; j < n; j++) {
+                bDYe[m * (size_t)n + (size_t)j] =
+                    (float)((double)w * (double)dYt[j]);
             }
-            // dYe = w*dY (単体版と同一丸め: (float)((double)w*(double)dY))。
-            for (int j = 0; j < n; j++) {
-                dYe[j] = (float)((double)w * (double)dYt[j]);
-            }
-            // SwiGLU bwd非線形 (jt_swiglu_bwdと同一式。perm順要素wise)。
-            // ドットは単体版と同一ヘルパー (AVX2時は同一のtol内一致、
-            // スカラー時は同一順序でbit一致)。
-            for (int i = 0; i < h; i++) {
-                double gi = (double)Gp[i];
-                double ui = (double)Up[i];
+        }
+        // dot：DOT[Me][h] = dYe[Me][n] · Wdt[n][h]（WdtはWdのexact転置）。
+        trc = jt_transpose_f32(wdr, bWdt, h, n);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(bDYe, bWdt, bDot, Mei, h, n);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        // 非線形（jt_swiglu_bwdと同一式。perm順要素wise）。
+        for (m = 0; m < Me; m++) {
+            for (i = 0; i < h; i++) {
+                double gi = (double)bG[m * (size_t)h + (size_t)i];
+                double ui = (double)bU[m * (size_t)h + (size_t)i];
                 double sig = jt_moe_bwd_sigmoid(gi);
                 double silu = gi * sig;
                 double dsilu = sig * (1.0 + gi * (1.0 - sig));
-                const float *wdrow = wdr + (size_t)i * (size_t)n;
-#ifdef __AVX2__
-                double acc = jt_moe_avx2_dot(dYe, wdrow, n);
-#else
-                double acc = 0.0;
-                for (int j = 0; j < n; j++) {
-                    acc += (double)dYe[j] * (double)wdrow[j];
-                }
-#endif
+                double acc = (double)bDot[m * (size_t)h + (size_t)i];
+                double gdv;
+                double udv;
+                double ssv;
                 if (!isfinite(acc)) {
                     errno = EINVAL;
                     goto cleanup;
                 }
-                dg[i] = acc * ui * dsilu;
-                du[i] = acc * silu;
-                ss[i] = silu * ui;
-                if (!isfinite(dg[i]) || !isfinite(du[i]) ||
-                    !isfinite(ss[i])) {
+                gdv = acc * ui * dsilu;
+                udv = acc * silu;
+                ssv = silu * ui;
+                if (!isfinite(gdv) || !isfinite(udv) || !isfinite(ssv)) {
                     errno = EINVAL;
                     goto cleanup;
                 }
-            }
-            // dX_e = dg*Wg + du*Wu (i昇順縮約。単体版と同一順序)。
-            for (int j = 0; j < n; j++) {
-                double acc = 0.0;
-                for (int i = 0; i < h; i++) {
-                    acc += dg[i] * (double)wgr[(size_t)i * (size_t)n +
-                                               (size_t)j];
-                    acc += du[i] * (double)wur[(size_t)i * (size_t)n +
-                                               (size_t)j];
-                }
-                dxe[j] = (float)acc;
-            }
-            // dX scatter-add (expert_id昇順の外側ループにより固定順)。
-            for (int j = 0; j < n; j++) {
-                dx_acc[t * (size_t)n + (size_t)j] += (double)dxe[j];
-            }
-            // dW GEMM (M_e縮約・m昇順。float加算で単体版と同一順序)。
-            for (int i = 0; i < h; i++) {
-                float *rg = oWg + (size_t)i * (size_t)n;
-                float *ru = oWu + (size_t)i * (size_t)n;
-                float *rd = oWd + (size_t)i * (size_t)n;
-                double gi_d = dg[i];
-                double ui_d = du[i];
-                double s = ss[i];
-                for (int j = 0; j < n; j++) {
-                    rg[j] += (float)(gi_d * (double)Xt[j]);
-                    ru[j] += (float)(ui_d * (double)Xt[j]);
-                    rd[j] += (float)(s * (double)dYe[j]);
-                }
+                bDg[m * (size_t)h + (size_t)i] = (float)gdv;
+                bDu[m * (size_t)h + (size_t)i] = (float)udv;
+                bSs[m * (size_t)h + (size_t)i] = (float)ssv;
             }
         }
+        // dX：dxe = Dg·Wg＋Du·Wu（2 GEMM＋f32加算）。scatterは既存f64順序。
+        grc = jt_gemm_mat_f32(bDg, wgr, bDxe, Mei, n, h);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(bDu, wur, bDxe2, Mei, n, h);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        for (m = 0; m < Me; m++) {
+            size_t q = perm[b0 + m];
+            size_t t = q / (size_t)topk;
+            for (j = 0; j < n; j++) {
+                double v = (double)bDxe[m * (size_t)n + (size_t)j] +
+                           (double)bDxe2[m * (size_t)n + (size_t)j];
+                float dxe = (float)v;
+                dx_acc[t * (size_t)n + (size_t)j] += (double)dxe;
+            }
+        }
+        // dW：D^T·X（3 GEMM。転置はexact。縮約m昇順でStep 3と同一順）。
+        trc = jt_transpose_f32(bDg, bDgt, Mei, h);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        trc = jt_transpose_f32(bDu, bDut, Mei, h);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        trc = jt_transpose_f32(bSs, bSst, Mei, h);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(bDgt, bXe, oWg, h, n, Mei);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(bDut, bXe, oWu, h, n, Mei);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(bSst, bDYe, oWd, h, n, Mei);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
     }
-    // 6) 共有expert (常時オン・容量制限対象外。token昇順)。
-    for (int t = 0; t < T; t++) {
-        const float *Xt = X + (size_t)t * (size_t)n;
-        const float *dYt = dY + (size_t)t * (size_t)n;
-        for (int sidx = 0; sidx < n_shared; sidx++) {
+    // 6) 共有expert（Step 4a micro。M=T=512の密GEMMを同一カーネルに乗せる）。
+    // 常時オン・容量制限対象外。token昇順・sidx昇順でStep 3と同一順序。
+    // dYは重み1（wなし）。X/dYは[T]連続のためgather不要（直接投入）。
+    // Gs/Usは[T][S][h]のためs毎にgatherする。dot/dX/dW値はf32のためG3は1e-6。
+    // dx_acc合算はt昇順・sidx昇順の既存f64順序（per-t加算順は従来と同一）。
+    for (int sidx = 0; sidx < n_shared; sidx++) {
+        const float *wdr = Wd_s + (size_t)sidx * (size_t)h * (size_t)n;
+        const float *wgr = Wg_s + (size_t)sidx * (size_t)h * (size_t)n;
+        const float *wur = Wu_s + (size_t)sidx * (size_t)h * (size_t)n;
+        float *oWg = dWg_s + (size_t)sidx * (size_t)h * (size_t)n;
+        float *oWu = dWu_s + (size_t)sidx * (size_t)h * (size_t)n;
+        float *oWd = dWd_s + (size_t)sidx * (size_t)h * (size_t)n;
+        int trc;
+        int grc;
+        int t;
+        int i;
+        int j;
+        if (T > INT32_MAX) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        // gather Gs/Us（s毎）。
+        for (t = 0; t < T; t++) {
             const float *Gp =
                 Gs + ((size_t)t * (size_t)n_shared + (size_t)sidx) *
                          (size_t)h;
             const float *Up =
                 Us + ((size_t)t * (size_t)n_shared + (size_t)sidx) *
                          (size_t)h;
-            const float *wdr =
-                Wd_s + (size_t)sidx * (size_t)h * (size_t)n;
-            const float *wgr =
-                Wg_s + (size_t)sidx * (size_t)h * (size_t)n;
-            const float *wur =
-                Wu_s + (size_t)sidx * (size_t)h * (size_t)n;
-            float *oWg = dWg_s + (size_t)sidx * (size_t)h * (size_t)n;
-            float *oWu = dWu_s + (size_t)sidx * (size_t)h * (size_t)n;
-            float *oWd = dWd_s + (size_t)sidx * (size_t)h * (size_t)n;
-            double dg[JT_BWD_MAX_WIDE];
-            double du[JT_BWD_MAX_WIDE];
-            double ss[JT_BWD_MAX_WIDE];
-            float dxe[JT_BWD_MAX_WIDE];
-            for (int i = 0; i < h; i++) {
-                double gi = (double)Gp[i];
-                double ui = (double)Up[i];
+            memcpy(sG + (size_t)t * (size_t)h, Gp,
+                   (size_t)h * sizeof(float));
+            memcpy(sU + (size_t)t * (size_t)h, Up,
+                   (size_t)h * sizeof(float));
+        }
+        // dot：sDot[T][h] = dY[T][n] · Wdt[n][h]。
+        trc = jt_transpose_f32(wdr, sWdt, h, n);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(dY, sWdt, sDot, T, h, n);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        // 非線形（同一式。token順要素wise）。
+        for (t = 0; t < T; t++) {
+            for (i = 0; i < h; i++) {
+                double gi = (double)sG[(size_t)t * (size_t)h + (size_t)i];
+                double ui = (double)sU[(size_t)t * (size_t)h + (size_t)i];
                 double sig = jt_moe_bwd_sigmoid(gi);
                 double silu = gi * sig;
                 double dsilu = sig * (1.0 + gi * (1.0 - sig));
-                const float *wdrow = wdr + (size_t)i * (size_t)n;
-#ifdef __AVX2__
-                double acc = jt_moe_avx2_dot(dYt, wdrow, n);
-#else
-                double acc = 0.0;
-                for (int j = 0; j < n; j++) {
-                    acc += (double)dYt[j] * (double)wdrow[j];
-                }
-#endif
+                double acc =
+                    (double)sDot[(size_t)t * (size_t)h + (size_t)i];
+                double gdv;
+                double udv;
+                double ssv;
                 if (!isfinite(acc)) {
                     errno = EINVAL;
                     goto cleanup;
                 }
-                dg[i] = acc * ui * dsilu;
-                du[i] = acc * silu;
-                ss[i] = silu * ui;
-            }
-            for (int j = 0; j < n; j++) {
-                double acc = 0.0;
-                for (int i = 0; i < h; i++) {
-                    acc += dg[i] * (double)wgr[(size_t)i * (size_t)n +
-                                               (size_t)j];
-                    acc += du[i] * (double)wur[(size_t)i * (size_t)n +
-                                               (size_t)j];
+                gdv = acc * ui * dsilu;
+                udv = acc * silu;
+                ssv = silu * ui;
+                if (!isfinite(gdv) || !isfinite(udv) || !isfinite(ssv)) {
+                    errno = EINVAL;
+                    goto cleanup;
                 }
-                dxe[j] = (float)acc;
+                sDg[(size_t)t * (size_t)h + (size_t)i] = (float)gdv;
+                sDu[(size_t)t * (size_t)h + (size_t)i] = (float)udv;
+                sSs[(size_t)t * (size_t)h + (size_t)i] = (float)ssv;
             }
-            for (int j = 0; j < n; j++) {
-                dx_acc[(size_t)t * (size_t)n + (size_t)j] +=
-                    (double)dxe[j];
+        }
+        // dX：2 GEMM＋f32加算。scatterは既存f64順序（t昇順）。
+        grc = jt_gemm_mat_f32(sDg, wgr, sDxe, T, n, h);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(sDu, wur, sDxe2, T, n, h);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        for (t = 0; t < T; t++) {
+            for (j = 0; j < n; j++) {
+                double v =
+                    (double)sDxe[(size_t)t * (size_t)n + (size_t)j] +
+                    (double)sDxe2[(size_t)t * (size_t)n + (size_t)j];
+                float dxe = (float)v;
+                dx_acc[(size_t)t * (size_t)n + (size_t)j] += (double)dxe;
             }
-            for (int i = 0; i < h; i++) {
-                float *rg = oWg + (size_t)i * (size_t)n;
-                float *ru = oWu + (size_t)i * (size_t)n;
-                float *rd = oWd + (size_t)i * (size_t)n;
-                for (int j = 0; j < n; j++) {
-                    rg[j] += (float)(dg[i] * (double)Xt[j]);
-                    ru[j] += (float)(du[i] * (double)Xt[j]);
-                    rd[j] += (float)(ss[i] * (double)dYt[j]);
-                }
-            }
+        }
+        // dW：D^T·X（Xは[T][n]連続で直接投入。縮約t昇順でStep 3と同一順）。
+        trc = jt_transpose_f32(sDg, sDgt, T, h);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        trc = jt_transpose_f32(sDu, sDut, T, h);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        trc = jt_transpose_f32(sSs, sSst, T, h);
+        if (trc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(sDgt, X, oWg, h, n, T);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(sDut, X, oWu, h, n, T);
+        if (grc != JT_OK) {
+            goto cleanup;
+        }
+        grc = jt_gemm_mat_f32(sSst, dY, oWd, h, n, T);
+        if (grc != JT_OK) {
+            goto cleanup;
         }
     }
     for (size_t i = 0; i < (size_t)T * (size_t)n; i++) {
@@ -1822,6 +2162,32 @@ cleanup:
     free(dx_acc);
     free(dwdp);
     free(dlog_q);
+    free(bXe);
+    free(bDYe);
+    free(bG);
+    free(bU);
+    free(bDot);
+    free(bDg);
+    free(bDu);
+    free(bSs);
+    free(bDgt);
+    free(bDut);
+    free(bSst);
+    free(bDxe);
+    free(bDxe2);
+    free(bWdt);
+    free(sDg);
+    free(sDu);
+    free(sSs);
+    free(sDot);
+    free(sDxe);
+    free(sDxe2);
+    free(sDgt);
+    free(sDut);
+    free(sSst);
+    free(sWdt);
+    free(sG);
+    free(sU);
     return rc;
 }
 
