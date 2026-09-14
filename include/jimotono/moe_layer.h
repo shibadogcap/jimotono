@@ -191,11 +191,14 @@ int jt_moe_batch_sort(const size_t *restrict ids, int T, int k, int E,
                       unsigned char *restrict drop,
                       size_t *restrict out_kept, size_t *restrict out_dropped);
 
-// MoE順伝播のバッチ版 (Tトークン分。Step 1: dispatch→既存GEMV→scatter-add)。
+// MoE順伝播のバッチ版 (Tトークン分。Step 2: expert単位バッチfwd・素朴GEMM)。
 // gate logits→実top-k→softmax まではトークン毎に単体版と同一核で計算し、
-// その後 jt_moe_batch_sort() で perm/off/drop を作り、kept ペアのみ既存
-// jt_swiglu_fwd 核 (GEMV のまま) で計算し、token 順に scatter-add で復元する。
-// drop なし時は単体版 jt_moe_fwd のトークンループと bit 一致する
+// その後 jt_moe_batch_sort() で perm/off/drop を作る。
+// Step 2 では expert 連続バッファ Xe [M_e][n] に gather し、M 方向に既存
+// jt_swiglu_fwd 核を拡張して expert-outer/M-inner 順 (§2.1) で計算する
+// (素朴 GEMM 参照実装。ブロッキング・SIMD 新規最適化なし・AVX-512 不使用。
+// 本格マイクロカーネルは Step 4)。各行の計算核と結合の token 順は Step 1 と
+// 同一のため、drop なし時は単体版 jt_moe_fwd のトークンループと bit 一致する
 // (同一順序の token 順 combine のため。AVX2 有効時も同一ヘルパー使用)。
 // drop あり時は dropped ペアの寄与を 0 とし renormalize しない。共有 expert は
 // 常時オン・容量制限対象外でトークン毎に単体版と同一に加算する。

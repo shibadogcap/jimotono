@@ -833,6 +833,11 @@ static int jt_moe_fwd_batch_impl(
     size_t *off = NULL;
     unsigned char *drop = NULL;
     float *stage_Ysel = NULL;  // cache_Ysel==NULL 時のみ確保
+    // Phase G Step 2: expert 連続ワークスペース ([maxMe][n/h])。
+    float *Xe = NULL;
+    float *Ye = NULL;
+    float *Ge = NULL;
+    float *Ue = NULL;
     if (X == NULL || Wgate == NULL || Wg == NULL || Wu == NULL ||
         Wd == NULL || Y == NULL || out_ids == NULL ||
         out_weights == NULL) {
@@ -966,34 +971,89 @@ static int jt_moe_fwd_batch_impl(
             goto cleanup;  // errnoは下位で設定済み
         }
     }
-    // dispatch→既存GEMV (kept のみ perm 順に計算。結合は token 順に後で行い、
-    // 単体版トークンループと同一順序にする。GEMM 化なし)。
-    for (size_t i = 0; i < kept; i++) {
-        size_t q = perm[i];
-        size_t t = q / (size_t)topk;
-        size_t p = q % (size_t)topk;
-        size_t e = out_ids[q];
-        const float *Xt = X + t * (size_t)n;
-        const float *wgr = Wg + e * (size_t)h * (size_t)n;
-        const float *wur = Wu + e * (size_t)h * (size_t)n;
-        const float *wdr = Wd + e * (size_t)h * (size_t)n;
-        float *Gp = (cache_Gsel != NULL)
-                        ? (cache_Gsel + q * (size_t)h)
-                        : tmpG;
-        float *Up = (cache_Usel != NULL)
-                        ? (cache_Usel + q * (size_t)h)
-                        : tmpU;
-        float *Yp = (cache_Ysel != NULL)
-                        ? (cache_Ysel + q * (size_t)n)
-                        : (stage_Ysel + q * (size_t)n);
-        (void)p;
-        int frc = validate
-                      ? jt_swiglu_fwd(Xt, wgr, wur, wdr, Gp, Up, Yp, n,
-                                      h)
-                      : jt_swiglu_fwd_unchecked(Xt, wgr, wur, wdr, Gp, Up,
-                                                Yp, n, h);
-        if (frc != JT_OK) {
-            goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+    // Phase G Step 2: expert 単位バッチ fwd (素朴 GEMM 参照実装)。
+    // expert 連続バッファ Xe [M_e][n] に gather し、M 方向に既存
+    // jt_swiglu_fwd 核を拡張して expert-outer/M-inner 順 (§2.1) で計算する。
+    // ブロッキング・SIMD 新規最適化なし・AVX-512 不使用 (Step 4)。
+    // bwd は単体版のまま。各行の計算核と結合の token 順は Step 1 と同一のため
+    // drop なし時は単体ループと bit 一致 (AVX2 有無によらず同一核経由)。
+    {
+        size_t maxMe = 0;
+        for (int e = 0; e < n_experts; e++) {
+            size_t Me = off[(size_t)e + 1] - off[(size_t)e];
+            if (Me > maxMe) {
+                maxMe = Me;
+            }
+        }
+        if (maxMe > 0) {
+            if (maxMe > SIZE_MAX / (size_t)n ||
+                maxMe > SIZE_MAX / (size_t)h) {
+                errno = EINVAL;
+                goto cleanup;
+            }
+            Xe = (float *)malloc(maxMe * (size_t)n * sizeof(float));
+            Ye = (float *)malloc(maxMe * (size_t)n * sizeof(float));
+            Ge = (float *)malloc(maxMe * (size_t)h * sizeof(float));
+            Ue = (float *)malloc(maxMe * (size_t)h * sizeof(float));
+            if (Xe == NULL || Ye == NULL || Ge == NULL || Ue == NULL) {
+                errno = ENOMEM;
+                goto cleanup;
+            }
+        }
+        for (int e = 0; e < n_experts; e++) {
+            size_t b0 = off[(size_t)e];
+            size_t Me = off[(size_t)e + 1] - b0;
+            const float *wgr;
+            const float *wur;
+            const float *wdr;
+            if (Me == 0) {
+                continue;  // M_e=0 の expert は起動スキップ (§4.2)
+            }
+            // gather: expert 連続配置 (perm 順。同一 expert 内は token 昇順で安定)。
+            for (size_t m = 0; m < Me; m++) {
+                size_t q = perm[b0 + m];
+                size_t t = q / (size_t)topk;
+                memcpy(Xe + m * (size_t)n, X + t * (size_t)n,
+                       (size_t)n * sizeof(float));
+            }
+            wgr = Wg + (size_t)e * (size_t)h * (size_t)n;
+            wur = Wu + (size_t)e * (size_t)h * (size_t)n;
+            wdr = Wd + (size_t)e * (size_t)h * (size_t)n;
+            // M 方向に既存核を拡張 (各行は Step 1 の per-pair 呼出しと同一)。
+            for (size_t m = 0; m < Me; m++) {
+                int frc =
+                    validate
+                        ? jt_swiglu_fwd(Xe + m * (size_t)n, wgr, wur, wdr,
+                                        Ge + m * (size_t)h,
+                                        Ue + m * (size_t)h,
+                                        Ye + m * (size_t)n, n, h)
+                        : jt_swiglu_fwd_unchecked(
+                              Xe + m * (size_t)n, wgr, wur, wdr,
+                              Ge + m * (size_t)h, Ue + m * (size_t)h,
+                              Ye + m * (size_t)n, n, h);
+                if (frc != JT_OK) {
+                    goto cleanup;  // errnoは下位で設定済み。Yは未更新。
+                }
+            }
+            // scatter: per-q cache 形式へ復元 (bwd は単体版のまま Step 3 申送り)。
+            for (size_t m = 0; m < Me; m++) {
+                size_t q = perm[b0 + m];
+                if (cache_Gsel != NULL) {
+                    memcpy(cache_Gsel + q * (size_t)h, Ge + m * (size_t)h,
+                           (size_t)h * sizeof(float));
+                }
+                if (cache_Usel != NULL) {
+                    memcpy(cache_Usel + q * (size_t)h, Ue + m * (size_t)h,
+                           (size_t)h * sizeof(float));
+                }
+                if (cache_Ysel != NULL) {
+                    memcpy(cache_Ysel + q * (size_t)n, Ye + m * (size_t)n,
+                           (size_t)n * sizeof(float));
+                } else {
+                    memcpy(stage_Ysel + q * (size_t)n, Ye + m * (size_t)n,
+                           (size_t)n * sizeof(float));
+                }
+            }
         }
     }
     // dropped 対応 cache スロットの 0 埋め (不定値混入防止。
@@ -1113,6 +1173,10 @@ cleanup:
     free(off);
     free(drop);
     free(stage_Ysel);
+    free(Xe);
+    free(Ye);
+    free(Ge);
+    free(Ue);
     return rc;
 }
 
