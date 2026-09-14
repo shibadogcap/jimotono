@@ -20,8 +20,15 @@
 //     (1) data_packのJT_DP_VOCAB_SIZE=48588がpack内ID<48588を強制し、
 //     50257語彙はdata_pack経路に乗らない (data_pack.c改変は既存テスト破壊の
 //     ため不可)。(2) BPEマージのC実装は1h-CPU枠外。(3) バイト列でも実言語の
-//     スケーリング曲線は観測可能。--vocab 50257は構造対応のみ
-//     (次元適応、encoderはbyte->2+b同一、258行以上は未使用・将来のBPE導入 reserve)。
+//     スケーリング曲線は観測可能。
+//   * Phase F6: V=48588 (llm-jp-tokenizer v2.2 Unigram) 経路を追加。
+//     TinyStoriesテキストをbpe C実装 (jt_bpe_encode) で物語単位にトークン化し、
+//     data_pack (.jtdp) 経由または直接で学習する。--vocab 48588 +
+//     --bpe-vocab data/llmjp-v22.jtvocab (scripts/bpe_make_vocab.py生成)。
+//     BPE経路の系列は生BPE ID列 (BOS/EOS付加なし。ID 0/1は実ピースのため
+//     衝突回避。物語境界は系列分割で保持)。V=258経路は不変。
+//   * 旧--vocab 50257 (構造対応のみ) は廃止。指定時は使用不可エラー。
+//     (50257はJT_DP_VOCAB_SIZE=48588を超えるIDを含むためpack経路に乗らない)
 //
 // 構成: byte embedding (学習対象) → L層の小規模MoE (jt_moe_fwd/bwd再利用、
 //   d=64既定・E=8・top-2・S=1・H=32、残差接続) → 線形head＋softmax CE。
@@ -31,8 +38,14 @@
 // data_pack経路: --pack PATH (既定data/tinystories16M.jtdp) が開ければ
 //   jt_dp_open経由で読む (正規経路)。なければテキスト直接読みにフォールバック
 //   (その旨をstdoutに明記)。--write-pack PATHでテキスト→.jtdp変換
-//   (jt_dp_writer使用)。byte-fallbackのIDは最大257のためJT_DP_VOCAB_SIZE制限
-//   (<48588) を満たし、V=258/50257いずれでもpack経路が有効。
+//   (jt_dp_writer使用)。V=258のbyte-fallback IDは最大257のため
+//   JT_DP_VOCAB_SIZE制限 (<48588) を満たす。V=48588のBPE IDは語彙由来で
+//   <48588 (bpe_make_vocab.pyがassert)。V=258/48588いずれでもpack経路が有効。
+// CE_per_byte正規化 (RULE.MD): トークン数の異なる語彙をtoks/sで比較禁止。
+//   比較軸は同一wall-clock・同一バイト数。valはCE_per_token × tokens/bytesを
+//   val_ce_pb列として記録 (tokens/bytesは当該Vの実測値 =
+//   (train+valペア数)/テキストバイト数)。pack経路時は--dataのファイルサイズを
+//   分母に用いる (同コーパス前提。取得不可時は0→val_ce_pbはn/a表示)。
 // 早期停止: --patience P (既定100・steps単位)。最良val更新からP steps経過で停止。
 //   加えて直近3回のval評価値が厳密に単調増加 (移動平均窓=1の3点連続上昇) したら停止。
 //   --patience 0で無効化。
@@ -47,15 +60,17 @@
 #include <time.h>
 
 #include "jimotono/common.h"
+#include "jimotono/bpe.h"
 #include "jimotono/data_pack.h"
 #include "jimotono/moe_layer.h"
 #include "jimotono/optim8.h"
 
 #define TS_BOS 0
 #define TS_EOS 1
-#define TS_BYTE_OFF 2 /* byte b -> 2+b (2..257) */
+#define TS_BYTE_OFF 2 /* byte b -> 2+b (2..257)。V=258経路のみ */
 #define TS_VOCAB_SMALL 258
-#define TS_VOCAB_BPE 50257
+#define TS_VOCAB_LLJ 48588 /* llm-jp-tokenizer v2.2 Unigram (bpe C実装で符号化) */
+#define TS_BPE_VOCAB_DEFAULT "data/llmjp-v22.jtvocab"
 
 #define TS_E 8
 #define TS_K 2
@@ -169,12 +184,14 @@ static void ts_usage(const char *prog) {
             "usage: %s [--data txt] [--pack jtdp] [--write-pack out.jtdp] "
             "[--steps N] [--time SECS] [--lr LR] [--batch B] [--d DIM] "
             "[--layers L] [--val-every K] [--patience P] [--vocab V] "
-            "[--max-stories N] [--max-val-pairs N]\n"
+            "[--bpe-vocab PATH] [--max-stories N] [--max-val-pairs N]\n"
             "  defaults: data=data/tinystories_head16M.txt "
             "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=3e-4 "
             "batch=64 d=64 layers=2 val-every=100 patience=100 vocab=258 "
+            "bpe-vocab=" TS_BPE_VOCAB_DEFAULT " "
             "max-stories=0(all) max-val-pairs=20000\n"
-            "  --vocab: 258 (byte+special) or 50257 (structural only) \n"
+            "  --vocab: 258 (byte+special) or 48588 (llm-jp v2.2 Unigram, "
+            "requires --bpe-vocab)\n"
             "  --patience 0 disables early stopping\n"
             "  --max-val-pairs 0 evaluates full val set\n",
             prog);
@@ -403,6 +420,7 @@ static int ts_bwd_one(ts_model_t *restrict m, int x,
 // ---- テキスト読み: <|endoftext|>区切りの物語を [BOS, bytes..., EOS] に変換 ----
 // seqs_out/lens_outは呼び出し側でfree (各行malloc)。戻り値は物語数。失敗時-1。
 // max_stories>0時は先頭max_stories話のみ (決定論的)。
+// V=258専用 (V=258経路は不変)。V=48588はts_read_text_bpeを使用。
 static long ts_read_text(const char *restrict path, int vocab,
                          uint32_t ***restrict seqs_out,
                          size_t **restrict lens_out, long max_stories,
@@ -420,7 +438,7 @@ static long ts_read_text(const char *restrict path, int vocab,
         errno = EINVAL;
         return -1;
     }
-    if (vocab != TS_VOCAB_SMALL && vocab != TS_VOCAB_BPE) {
+    if (vocab != TS_VOCAB_SMALL) {
         errno = EINVAL;
         return -1;
     }
@@ -531,8 +549,192 @@ fail: {
 }
 }
 
+// ---- ファイルサイズ (CE_per_byte分母用。失敗時0) ----
+static size_t ts_file_size(const char *restrict path) {
+    FILE *f = NULL;
+    long n = 0;
+    if (path == NULL) {
+        return 0;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (n = ftell(f)) < 0) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return (size_t)n;
+}
+
+// ---- BPEテキスト読み (V=48588専用): 物語バイト列をjt_bpe_encodeで符号化 ----
+// 区切り探索・max_stories先頭制限はts_read_textと同一 (決定論的)。
+// 系列は生BPE ID列 (BOS/EOSなし)。符号化失敗の物語は数えて捨てる
+// (skipped_out、NULL可。TinyStories英語ASCIIでは0になる想定)。
+// seqs_out/lens_outは呼び出し側でfree。戻り値は物語数。失敗時-1。
+static long ts_read_text_bpe(const char *restrict path,
+                             const char *restrict bpe_vocab_path,
+                             uint32_t ***restrict seqs_out,
+                             size_t **restrict lens_out, long max_stories,
+                             size_t *restrict nbytes_out,
+                             long *restrict skipped_out) {
+    FILE *f = NULL;
+    uint8_t *buf = NULL;
+    long fsz = 0;
+    jt_bpe_t bpe;
+    uint32_t **seqs = NULL;
+    size_t *lens = NULL;
+    size_t n = 0;
+    size_t cap = 0;
+    size_t start = 0;
+    size_t total = 0;
+    long skipped = 0;
+    memset(&bpe, 0, sizeof(bpe));
+    if (path == NULL || bpe_vocab_path == NULL || seqs_out == NULL ||
+        lens_out == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (jt_bpe_open(&bpe, bpe_vocab_path) != JT_OK) {
+        return -1; /* errnoはbpe側で設定済み */
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        jt_bpe_close(&bpe);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (fsz = ftell(f)) < 0 ||
+        fseek(f, 0, SEEK_SET) != 0) {
+        goto fail;
+    }
+    if (fsz == 0 || fsz > 512L * 1024L * 1024L) {
+        goto fail;
+    }
+    buf = (uint8_t *)malloc((size_t)fsz);
+    if (buf == NULL) {
+        goto fail;
+    }
+    if (fread(buf, 1, (size_t)fsz, f) != (size_t)fsz) {
+        goto fail;
+    }
+    fclose(f);
+    f = NULL;
+    total = (size_t)fsz;
+    while (start < total) {
+        size_t end = start;
+        size_t s0 = start;
+        size_t blen = 0;
+        uint32_t *tmp = NULL;
+        uint32_t *sq = NULL;
+        size_t cap_tok = 0;
+        size_t ntok = 0;
+        int erc = 0;
+        while (end + TS_DELIM_LEN <= total &&
+               memcmp(buf + end, TS_DELIM, TS_DELIM_LEN) != 0) {
+            end++;
+        }
+        if (end + TS_DELIM_LEN <= total) {
+            blen = end - start;
+            end += TS_DELIM_LEN;
+        } else {
+            blen = total - start;
+            end = total;
+        }
+        start = end;
+        if (blen == 0) {
+            continue;
+        }
+        if (max_stories > 0 && n >= (size_t)max_stories) {
+            break;
+        }
+        /* トークン上限は正規化後バイト長以下。blen*3+8 (オーバーフロー守衛) */
+        if (blen > (SIZE_MAX - 8u) / 3u) {
+            goto fail;
+        }
+        cap_tok = blen * 3u + 8u;
+        if (cap_tok / sizeof(uint32_t) > SIZE_MAX / sizeof(uint32_t)) {
+            goto fail;
+        }
+        tmp = (uint32_t *)malloc(cap_tok * sizeof(uint32_t));
+        if (tmp == NULL) {
+            goto fail;
+        }
+        erc = jt_bpe_encode(&bpe, (const char *)(buf + s0), blen, tmp,
+                            cap_tok, &ntok);
+        if (erc != JT_OK) {
+            free(tmp);
+            skipped++; /* 不正UTF-8等は当該話のみ捨てる (件数を報告) */
+            continue;
+        }
+        sq = (uint32_t *)malloc((ntok == 0 ? 1 : ntok) * sizeof(uint32_t));
+        if (sq == NULL) {
+            free(tmp);
+            goto fail;
+        }
+        if (ntok > 0) {
+            memcpy(sq, tmp, ntok * sizeof(uint32_t));
+        }
+        free(tmp);
+        if (n == cap) {
+            size_t ncap = (cap == 0) ? 4096 : cap * 2;
+            uint32_t **ns = NULL;
+            size_t *nl = NULL;
+            if (ncap > (size_t)4000000) {
+                free(sq);
+                goto fail;
+            }
+            ns = (uint32_t **)realloc(seqs, ncap * sizeof(uint32_t *));
+            nl = (size_t *)realloc(lens, ncap * sizeof(size_t));
+            if (ns == NULL || nl == NULL) {
+                if (ns != NULL && ns != seqs) {
+                    seqs = ns;
+                }
+                if (nl != NULL && nl != lens) {
+                    lens = nl;
+                }
+                free(sq);
+                goto fail;
+            }
+            seqs = ns;
+            lens = nl;
+            cap = ncap;
+        }
+        seqs[n] = sq;
+        lens[n] = ntok;
+        n++;
+    }
+    free(buf);
+    jt_bpe_close(&bpe);
+    if (nbytes_out != NULL) {
+        *nbytes_out = total;
+    }
+    if (skipped_out != NULL) {
+        *skipped_out = skipped;
+    }
+    *seqs_out = seqs;
+    *lens_out = lens;
+    return (long)n;
+fail: {
+    size_t i = 0;
+    int se = errno;
+    if (f != NULL) {
+        fclose(f);
+    }
+    free(buf);
+    for (i = 0; i < n; i++) {
+        free(seqs[i]);
+    }
+    free(seqs);
+    free(lens);
+    jt_bpe_close(&bpe);
+    errno = (se != 0) ? se : ENOMEM;
+    return -1;
+}
+}
+
 // .jtdp読み (data_pack正規経路)。ID>=vocabは拒否 (fail-closed)。
-// byte-fallbackのIDは最大257のためjt_dp_openの<48588検証も通過する。
+// V=258のbyte-fallback IDは最大257のためjt_dp_openの<48588検証も通過する。
 static long ts_read_pack(const char *restrict path, int vocab,
                          uint32_t ***restrict seqs_out,
                          size_t **restrict lens_out) {
@@ -546,7 +748,7 @@ static long ts_read_pack(const char *restrict path, int vocab,
         errno = EINVAL;
         return -1;
     }
-    if (vocab != TS_VOCAB_SMALL && vocab != TS_VOCAB_BPE) {
+    if (vocab != TS_VOCAB_SMALL && vocab != TS_VOCAB_LLJ) {
         errno = EINVAL;
         return -1;
     }
@@ -676,6 +878,7 @@ int main(int argc, char **argv) {
     long val_every = 100;
     long patience = 100; /* steps単位。0=無効 */
     int vocab = TS_VOCAB_SMALL;
+    const char *bpe_vocab_path = TS_BPE_VOCAB_DEFAULT;
     long max_stories = 0; /* 0=全話 */
     long max_val_pairs = 20000; /* 0=全val */
     uint32_t **seqs = NULL;
@@ -708,6 +911,7 @@ int main(int argc, char **argv) {
     double t0 = 0.0;
     long step = 0;
     long steps_done = 0;
+    double tok_per_byte = 0.0; /* (train+valペア数)/テキストバイト数 (当該V実測) */
     double init_train_ce = 0.0;
     double init_val_ce = 0.0;
     double last_train_ce = 0.0;
@@ -753,6 +957,8 @@ int main(int argc, char **argv) {
             patience = atol(argv[++i]);
         } else if (strcmp(argv[i], "--vocab") == 0 && i + 1 < argc) {
             vocab = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bpe-vocab") == 0 && i + 1 < argc) {
+            bpe_vocab_path = argv[++i];
         } else if (strcmp(argv[i], "--max-stories") == 0 && i + 1 < argc) {
             max_stories = atol(argv[++i]);
         } else if (strcmp(argv[i], "--max-val-pairs") == 0 && i + 1 < argc) {
@@ -768,10 +974,17 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
     }
+    if (vocab == 50257) {
+        fprintf(stderr,
+                "train_tinystories: --vocab 50257 is retired (JT_DP_VOCAB_SIZE "
+                "exceeded); use --vocab 48588 --bpe-vocab <jtvocab>\n");
+        errno = EINVAL;
+        goto cleanup;
+    }
     if (max_steps <= 0 || !(time_limit > 0.0) || !(lr > 0.0f) ||
         !isfinite(lr) || batch <= 0 || batch > 4096 || d < 8 || d > 256 ||
         n_layers < 1 || n_layers > 4 || val_every <= 0 || patience < 0 ||
-        (vocab != TS_VOCAB_SMALL && vocab != TS_VOCAB_BPE) ||
+        (vocab != TS_VOCAB_SMALL && vocab != TS_VOCAB_LLJ) ||
         max_stories < 0 || max_val_pairs < 0) {
         fprintf(stderr, "train_tinystories: invalid limits/args\n");
         errno = EINVAL;
@@ -783,9 +996,16 @@ int main(int argc, char **argv) {
         jt_dp_writer_t w;
         long wn = 0;
         long k = 0;
+        long skipped = 0;
         memset(&w, 0, sizeof(w));
-        n_stories = ts_read_text(data_path, vocab, &seqs, &lens, max_stories,
-                                 &nbytes);
+        if (vocab == TS_VOCAB_LLJ) {
+            n_stories = ts_read_text_bpe(data_path, bpe_vocab_path, &seqs,
+                                         &lens, max_stories, &nbytes,
+                                         &skipped);
+        } else {
+            n_stories = ts_read_text(data_path, vocab, &seqs, &lens,
+                                     max_stories, &nbytes);
+        }
         if (n_stories <= 0) {
             fprintf(stderr, "train_tinystories: cannot read '%s': %s\n",
                     data_path, strerror(errno));
@@ -810,8 +1030,9 @@ int main(int argc, char **argv) {
                     strerror(errno));
             goto cleanup;
         }
-        printf("train_ts: write-pack nseq=%ld bytes=%zu source=%s dest=%s\n",
-               wn, nbytes, data_path, write_pack);
+        printf("train_ts: write-pack nseq=%ld bytes=%zu skipped=%ld source=%s "
+               "dest=%s vocab=%d\n",
+               wn, nbytes, skipped, data_path, write_pack, vocab);
         ts_free_seqs(seqs, lens, n_stories);
         return 0;
     }
@@ -820,20 +1041,34 @@ int main(int argc, char **argv) {
     n_stories = ts_read_pack(pack_path, vocab, &seqs, &lens);
     if (n_stories > 0) {
         data_source = "pack";
+        /* pack内にバイト数記録なしのため、分母は--data実ファイルから参照 */
+        nbytes = ts_file_size(data_path);
     } else if (use_pack_opt) {
         fprintf(stderr, "train_tinystories: cannot open pack '%s': %s\n",
                 pack_path, strerror(errno));
         goto cleanup;
     } else {
         int se = errno;
-        n_stories = ts_read_text(data_path, vocab, &seqs, &lens, max_stories,
-                                 &nbytes);
+        long skipped = 0;
+        if (vocab == TS_VOCAB_LLJ) {
+            n_stories = ts_read_text_bpe(data_path, bpe_vocab_path, &seqs,
+                                         &lens, max_stories, &nbytes,
+                                         &skipped);
+        } else {
+            n_stories = ts_read_text(data_path, vocab, &seqs, &lens,
+                                     max_stories, &nbytes);
+        }
         if (n_stories <= 0) {
             fprintf(stderr, "train_tinystories: cannot read '%s': %s\n",
                     data_path, strerror(errno));
             goto cleanup;
         }
         data_source = "direct(txt)";
+        if (vocab == TS_VOCAB_LLJ) {
+            printf("train_ts: bpe encode stories=%ld skipped=%ld "
+                   "vocab_file=%s\n",
+                   n_stories, skipped, bpe_vocab_path);
+        }
         (void)se;
     }
 
@@ -908,6 +1143,16 @@ int main(int argc, char **argv) {
            "train_pairs=%ld val_pairs=%ld vocab=%d source=%s\n",
            n_stories, n_train_stories, n_stories - n_train_stories,
            n_train_pairs, n_val_pairs, vocab, data_source);
+    /* CE_per_byte正規化の分母 (RULE.MD)。pack時は--data参照値 (0ならn/a) */
+    if (nbytes > 0) {
+        tok_per_byte =
+            (double)(n_train_pairs + n_val_pairs) / (double)nbytes;
+    }
+    printf("train_ts: text_bytes=%zu tok_per_byte=%.6f (vocab=%d%s)\n",
+           nbytes, tok_per_byte, vocab,
+           strcmp(data_source, "pack") == 0
+               ? "; pack assumes pack content == --data file"
+               : "");
     if (strcmp(data_source, "direct(txt)") == 0) {
         printf("train_ts: note: pack '%s' unavailable; using direct "
                "txt read (fallback). Run --write-pack to enable data_pack "
@@ -972,7 +1217,21 @@ int main(int argc, char **argv) {
            "params=%zu lr=%.5f batch=%ld patience=%ld\n",
            n_layers, d, TS_E, TS_K, TS_S, TS_H, vocab, m.lt.n_total, lr,
            batch, patience);
-    fflush(stdout);
+    /* 常駐見積り (d=64維持。V=48588でemb/head各64*48588*4B≈12.4MB。許容内) */
+    {
+        size_t n = m.lt.n_total;
+        size_t nblocks = (n + 63u) / 64u;
+        double p_mb = (double)n * 4.0 / 1048576.0;
+        double g_mb = (double)n * 4.0 / 1048576.0;
+        double o_mb =
+            ((double)n * 2.0 + (double)nblocks * 8.0) / 1048576.0;
+        double emb_mb =
+            (double)(size_t)vocab * (size_t)d * 4.0 / 1048576.0;
+        printf("train_ts: mem_est P=%.1fMB G=%.1fMB optim8=%.1fMB "
+               "total=%.1fMB (emb=%.1fMB head=%.1fMB)\n",
+               p_mb, g_mb, o_mb, p_mb + g_mb + o_mb, emb_mb, emb_mb);
+        fflush(stdout);
+    }
     acts =
         (float *)malloc((size_t)(n_layers + 1) * (size_t)d * sizeof(float));
     cids = (size_t *)malloc((size_t)n_layers * (size_t)TS_K * sizeof(size_t));
@@ -1029,8 +1288,10 @@ int main(int argc, char **argv) {
         last_val_ce = init_val_ce;
         best_val_ce = init_val_ce;
         best_val_step = 0;
-        printf("train_ts: init train_ce=%.4f val_ce=%.4f (val_cap=%ld/%ld)\n",
-               init_train_ce, init_val_ce,
+        printf("train_ts: init train_ce=%.4f val_ce=%.4f val_ce_pb=%.6f "
+               "(tok_per_byte=%.6f val_cap=%ld/%ld)\n",
+               init_train_ce, init_val_ce, init_val_ce * tok_per_byte,
+               tok_per_byte,
                (max_val_pairs > 0 && max_val_pairs < n_val_pairs)
                    ? max_val_pairs
                    : n_val_pairs,
@@ -1115,9 +1376,10 @@ int main(int argc, char **argv) {
                 n_prev++;
             }
             printf("train_ts: step=%ld train_ce=%.4f val_ce=%.4f "
-                   "best=%.4f@%ld elapsed=%.1fs\n",
-                   step + 1, last_train_ce, last_val_ce, best_val_ce,
-                   best_val_step, ts_now_sec() - t0);
+                   "val_ce_pb=%.6f best=%.4f@%ld elapsed=%.1fs\n",
+                   step + 1, last_train_ce, last_val_ce,
+                   last_val_ce * tok_per_byte, best_val_ce, best_val_step,
+                   ts_now_sec() - t0);
             fflush(stdout);
             if (n_prev >= 3 && prev_vals[0] < prev_vals[1] &&
                 prev_vals[1] < prev_vals[2]) {
@@ -1141,10 +1403,13 @@ int main(int argc, char **argv) {
         double el = ts_now_sec() - t0;
         double toks = (double)steps_done * (double)batch;
         printf("train_ts: done steps=%ld train_ce: %.4f -> %.4f "
-               "val_ce: %.4f -> %.4f (ratio %.3f) early=%d(%s) "
-               "tokens=%.0f elapsed=%.1fs toks_per_s=%.1f\n",
+               "val_ce: %.4f -> %.4f val_ce_pb: %.6f -> %.6f "
+               "(tok_per_byte=%.6f ratio %.3f) early=%d(%s) "
+               "tokens=%.0f elapsed=%.1fs toks_per_s=%.1f "
+               "(toks/s cross-vocab compare PROHIBITED per RULE.MD)\n",
                steps_done, init_train_ce, last_train_ce, init_val_ce,
-               last_val_ce,
+               last_val_ce, init_val_ce * tok_per_byte,
+               last_val_ce * tok_per_byte, tok_per_byte,
                (init_val_ce > 0.0) ? last_val_ce / init_val_ce : 0.0,
                stopped_early, stop_reason, toks, el,
                (el > 0.0) ? toks / el : 0.0);
