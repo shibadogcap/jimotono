@@ -81,15 +81,17 @@
   - head-lr再調整（設計規模で0.15〜0.35周辺を再sweep。vm過剰側反転の立上がり遅延をlogで確認しながら）。
   - k=512への拡大（head 12.70M→25.40M。A100M予算内であることは同文書§2で確認済み。
     `TS_HEAD_MID_MAX` 256→512＋mid/dmバッファ拡大の実装改変が必須のため、設計改訂として親管理で実施）。
-- S1ゲート条件への組込み（`analysis/p3-training-scale.md` §3 S1 exitに追加）：
-  - 「S1最初1000 stepsでのfactorized/dense val差≦1%（未達時は上記再調整を経て再測定）」をexit条件の一項目とする。
+- S1ゲート条件への組込み（`analysis/p3-training-scale.md` §3 S1 exitに追加。S1必須ゲート）：
+  - G0：dense経路の1B学習でval loss単調減少。
+  - G1：factorized head差：val差≦1%（design scale、2000 steps）。
+  - 未達時フォールバック（順序固定）：(1) k=512へ拡大 → (2) full head INT4へ（k=512と同等優先度。12.4MB/tokenでfactorized k=256の12.7MBと同等、二層積なしで安定。量子化精度はG2/G4で検証） → (3) 未達時はP3a再設計。
   - 飽和＜0.3%・drop steady-state≦5%等の既存exit条件は変更しない。
 - 禁止の再確認：本wtではk=512の実装・実行を行わない。proxyでのk=512 sweepは体制非再現のため行わない。
 
 ## 4. contingency（Stage 1行き詰まり時の脱出路）
 
 - 本節は §3 未達・停滞時の対処であり、実装の着手ではない（P3本体判断・親管理）。
-- C1：full head＋INT4（12.4MB/token）。
+- C1：full head＋INT4（12.4MB/token。k=512と同等優先度。「最後の手段」扱い禁止）。
   factorizedの表現律速が疑われる場合、headのみfullに戻しINT4でfetchを抑える対案。
   交通費は指示値12.4MB/token（factorized k=256 INT8 12.7MBと同級。`analysis/p3-design-inputs.md` §(b)B1・
   `analysis/vocab-budget.md` §3との整合は実測で確定）。dense常駐・A100M会計への影響は設計改訂で再勘定する。
