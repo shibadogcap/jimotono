@@ -42,6 +42,8 @@ cleanup:
 }
 
 // スカラー参照核（f32蓄積・k逐次）。AVX2核とbit一致する。
+// 非AVX2ビルドでのみ使用（AVX2時は#else側が有効化されるため未定義化）。
+#ifndef __AVX2__
 static void jt_mat_scalar_block(const float *restrict A, const float *restrict B,
                                 float *restrict C, int M, int N, int K) {
     for (int m = 0; m < M; m++) {
@@ -57,6 +59,7 @@ static void jt_mat_scalar_block(const float *restrict A, const float *restrict B
         }
     }
 }
+#endif  // __AVX2__ fallback reference kernel only
 
 #ifdef __AVX2__
 // 1 Nベクトル（8 f32）× mb行（mb≤12）のマイクロ。
