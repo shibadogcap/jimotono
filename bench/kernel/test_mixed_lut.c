@@ -17,6 +17,24 @@
 #include "jimotono/lut_aware.h"
 #include "jimotono/mixed_prec.h"
 
+#if defined(_WIN32)
+#include <malloc.h>
+// MSVCにaligned_allocがないため_aligned_mallocで代替。
+static void *td_aligned_alloc(size_t align, size_t size) {
+    return _aligned_malloc(size, align);
+}
+static void td_aligned_free(void *p) {
+    _aligned_free(p);
+}
+#else
+static void *td_aligned_alloc(size_t align, size_t size) {
+    return aligned_alloc(align, size);
+}
+static void td_aligned_free(void *p) {
+    free(p);
+}
+#endif
+
 static int g_fail = 0;
 
 #define CHECK(cond, ...)                                                  \
@@ -348,7 +366,7 @@ static void test_export_binary_one(uint32_t rows, uint32_t cols, int bits, uint3
               "bin direct dq r=%u", r);
     }
     // export (64B整列バッファ。page_bytesは64の倍数のためaligned_alloc可)。
-    buf = (unsigned char *)aligned_alloc(JT_LUT_ALIGN, (size_t)d.page_bytes);
+    buf = (unsigned char *)td_aligned_alloc(JT_LUT_ALIGN, (size_t)d.page_bytes);
     CHECK(buf != NULL, "bin buf alloc page=%llu", (unsigned long long)d.page_bytes);
     if (!buf) {
         goto done;
@@ -403,7 +421,7 @@ done:
     free(sc_rt);
     free(q_direct);
     free(q_rt);
-    free(buf);
+    td_aligned_free(buf);
 }
 
 static void test_export_binary(void) {
@@ -421,7 +439,7 @@ static void test_export_binary(void) {
         unsigned char *buf = NULL;
         size_t wrote = 0xDEADu;
         CHECK(jt_lut_export_desc(2, 2, 4, 2, &d) == JT_OK, "bin fail desc");
-        buf = (unsigned char *)aligned_alloc(JT_LUT_ALIGN, (size_t)d.page_bytes);
+        buf = (unsigned char *)td_aligned_alloc(JT_LUT_ALIGN, (size_t)d.page_bytes);
         CHECK(buf != NULL, "bin fail alloc");
         if (buf) {
             memset(buf, 0xA5, (size_t)d.page_bytes);
@@ -469,7 +487,7 @@ static void test_export_binary(void) {
                 CHECK(wrote == 0, "bin nan wrote");
                 CHECK(buf[0] == 0xA5, "bin nan untouched=%02x", buf[0]);
             }
-            free(buf);
+            td_aligned_free(buf);
         }
     }
 }
