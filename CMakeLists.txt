@@ -58,6 +58,7 @@ add_library(jimotono_core
   src/w8a8.c
   src/data_pack.c
   src/bpe.c
+  src/lowbit.c
 )
 # POSIX宣言 (setenv/fileno/mkdtemp等) は厳格C11(__STRICT_ANSI__)で隠れる。
 # Phase G Step 4a: AVX2マイクロカーネルTUに -mavx2（FMAなし）。
@@ -171,6 +172,9 @@ if(JIMOTONO_BUILD_BENCH)
   # 既存tol不変 (本テスト内の許可用tolのみ使用。既存テストのtolに触れない)。
   add_executable(test_w8a8 bench/kernel/test_w8a8.c)
   target_link_libraries(test_w8a8 PRIVATE jimotono_core)
+  # Stage 3b-2: routed低ビット副線 (fake-quant/真LUT) の単体検証 (ctest登録)。
+  add_executable(test_lowbit bench/kernel/test_lowbit.c)
+  target_link_libraries(test_lowbit PRIVATE jimotono_core)
   # bench_schema.md の commit 記録用にビルド時ハッシュを埋め込む (取得不可時は空)。
   execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE JIMOTONO_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
@@ -235,6 +239,7 @@ if(JIMOTONO_BUILD_BENCH)
   add_test(NAME model1b COMMAND test_model1b)
   add_test(NAME moe_layer COMMAND test_moe_layer)
   add_test(NAME w8a8 COMMAND test_w8a8)
+  add_test(NAME lowbit COMMAND test_lowbit)
   add_test(NAME data_pack COMMAND test_data_pack)
   add_test(NAME bpe COMMAND test_bpe)
   # S0b-4: 正しさのみassert。帯域値は参考出力 (速度での合否判定なし)。

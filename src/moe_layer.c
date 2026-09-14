@@ -16,6 +16,41 @@
 #include "jimotono/train_bwd.h"
 #include "jimotono/moe_gemm.h"
 #include "jimotono/w8a8.h"
+#include "jimotono/lowbit.h"
+
+// Stage 3b-2: fake-quant (per-column奇対称レベル) を同一レイアウトに上書き。
+// Wは[K][H] row-major、作業列バッファcol[K]を使用する。
+// 戻り値: JT_OK / JT_ERR_INVAL / JT_ERR_NOMEM。
+static int jt_moe_fq_cols(float *restrict W, int k, int h, int bits) {
+    float *col = NULL;
+    if (W == NULL || k <= 0 || h <= 0) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (bits != 2 && bits != 4) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    col = (float *)malloc((size_t)k * sizeof(float));
+    if (col == NULL) {
+        errno = ENOMEM;
+        return JT_ERR_NOMEM;
+    }
+    for (int j = 0; j < h; j++) {
+        for (int t = 0; t < k; t++) {
+            col[t] = W[(size_t)t * (size_t)h + (size_t)j];
+        }
+        if (jt_lowbit_fakequant(col, col, (size_t)k, bits) != JT_OK) {
+            free(col);  // errnoは下位由来
+            return JT_ERR_INVAL;
+        }
+        for (int t = 0; t < k; t++) {
+            W[(size_t)t * (size_t)h + (size_t)j] = col[t];
+        }
+    }
+    free(col);
+    return JT_OK;
+}
 
 // P2 SIMD (Phase D) AVX2 パス (train_bwd.c と同一方針)。
 // - 出力 dim 方向の elementwise/f64累積は演算順序同一・FMA 不使用で bit同一。
@@ -1031,6 +1066,9 @@ static int jt_moe_fwd_batch_impl(
     // ON時はexpert/共有のGEMMのみINT8化し、sort/renormalize/combine・
     // gate logits・silu・bwdはfp32のまま (bwd不変=STE相当)。
     int w8a8_on = jt_w8a8_is_enabled();
+    // Stage 3b-2: 低ビット副線モード (0=OFF既定、1=fake-quant、2=真LUT)。
+    // w8a8_onと同時ON時は低ビットを優先する (設計: 副線の明示選択)。
+    int lbmode = jt_lowbit_get_mode();
     // 入力の有限検査 (fail-closed: Y更新前に拒否)。unchecked では省略し、
     // 呼び出し側のステップ冒頭検証＋区間内不変に委ねる (単体版と同一条件)。
     if (validate) {
@@ -1256,7 +1294,43 @@ static int jt_moe_fwd_batch_impl(
             // （外側の有限検査のみ差異。計算核はbit一致）。
             // Stage 3 (W8A8): w8a8_on時のみINT8経路 (gate/up=per-channel、
             // down=per-tensor)。OFF時は下記elseの従来核のみ (bit同一・速度不変)。
-            if (w8a8_on) {
+            // Stage 3b-2: lbmode!=0時は低ビット副線 (gate/up=INT2)。
+            // mode 1=fake-quant (転置後にper-column量子化→fp32 GEMM、bwd不変=STE)、
+            // mode 2=真LUT (転置後にbit-plane参照、bwd不変=STE)。
+            // OFF時は下記の従来核のみ (bit同一・速度不変)。
+            if (lbmode != 0) {
+                trc = jt_transpose_f32(wgr, Wgt, h, n);
+                if (trc != JT_OK) {
+                    goto cleanup;
+                }
+                trc = jt_transpose_f32(wur, Wut, h, n);
+                if (trc != JT_OK) {
+                    goto cleanup;
+                }
+                if (lbmode == 1) {
+                    if (jt_moe_fq_cols(Wgt, n, h, 2) != JT_OK ||
+                        jt_moe_fq_cols(Wut, n, h, 2) != JT_OK) {
+                        goto cleanup;  // errnoは下位由来。Yは未更新。
+                    }
+                    grc = jt_gemm_mat_f32(Xe, Wgt, Ge, Mei, h, n);
+                    if (grc != JT_OK) {
+                        goto cleanup;
+                    }
+                    grc = jt_gemm_mat_f32(Xe, Wut, Ue, Mei, h, n);
+                    if (grc != JT_OK) {
+                        goto cleanup;
+                    }
+                } else {
+                    grc = jt_lowbit_gemm_lut(Xe, Wgt, Ge, Mei, h, n, 2);
+                    if (grc != JT_OK) {
+                        goto cleanup;
+                    }
+                    grc = jt_lowbit_gemm_lut(Xe, Wut, Ue, Mei, h, n, 2);
+                    if (grc != JT_OK) {
+                        goto cleanup;
+                    }
+                }
+            } else if (w8a8_on) {
                 grc = jt_moe_gemm_w8a8_pc(Xe, wgr, Ge, Mei, h, n);
                 if (grc != JT_OK) {
                     goto cleanup;  // errnoは下位で設定済み。Yは未更新。
@@ -1289,7 +1363,34 @@ static int jt_moe_fwd_batch_impl(
                     goto cleanup;
                 }
             }
-            if (w8a8_on) {
+            // Stage 3b-2: lbmode!=0時は低ビット副線 (down=INT4)。
+            // fake-quantはモデル重みを変更できないためfq作業域へ複写＋量子化。
+            // 真LUTはwdr ([h][n]=[K][H]) を直接参照する。bwd不変=STE。
+            if (lbmode != 0) {
+                if (lbmode == 1) {
+                    float *wfq = (float *)malloc((size_t)h * (size_t)n *
+                                                 sizeof(float));
+                    if (wfq == NULL) {
+                        errno = ENOMEM;
+                        goto cleanup;
+                    }
+                    memcpy(wfq, wdr, (size_t)h * (size_t)n * sizeof(float));
+                    if (jt_moe_fq_cols(wfq, h, n, 4) != JT_OK) {
+                        free(wfq);
+                        goto cleanup;  // errnoは下位由来。Yは未更新。
+                    }
+                    grc = jt_gemm_mat_f32(SeT, wfq, Ye, Mei, n, h);
+                    free(wfq);
+                    if (grc != JT_OK) {
+                        goto cleanup;
+                    }
+                } else {
+                    grc = jt_lowbit_gemm_lut(SeT, wdr, Ye, Mei, n, h, 4);
+                    if (grc != JT_OK) {
+                        goto cleanup;
+                    }
+                }
+            } else if (w8a8_on) {
                 grc = jt_moe_gemm_w8a8_pt(SeT, wdr, Ye, Mei, n, h);
             } else {
                 grc = jt_gemm_mat_f32(SeT, wdr, Ye, Mei, n, h);
