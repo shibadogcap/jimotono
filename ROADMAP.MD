@@ -369,49 +369,69 @@ make bench
 - 「1誤差伝播あたり20Mサイクル以下」の達成を検証
 - 「勾配チェックポインティングのメモリ削減効果」を測定
 
-## 13. Phase 3: モデルアーキテクチャ
+## 13. Phase 3: モデルアーキテクチャ（P3a/b/c/d設計＋S1 1B確立）
+
+### P3実装順序
+
+- P3a（アーキテクチャ前提凍結）→ P3b（推論設計）→ P3c（学習スケール設計）→ P3d（本統合）の順で設計を固定する。段階改訂・比率変更・容量/量子化方針の変更は設計改訂扱い（場当たり調整禁止）
+- 実実行はS1＝1B確立を最初に行う。1B実実行タイミング＝P3設計凍結（P3d統合完了）後、S2着手前。S1 exit通過後にS2＝10B拡大へ進む（S2/S3はPhase 4）
+- ゲートはPhase GのG1–G4を流用する：G1 bit一致（perm/off/dropマスクbit一致・loss相対差≦1e-6）、G2関数等価性（最終val差≦1%・勾配ノルム平均/分散±10%以内・drop率はsteady-stateトリガ分離）、G3同一関数内最適化（bit一致または相対差1e-6・G2基準流用禁止）、G4 routing結合発散枠（構造等価・最終val差≦1%・増幅飽和<0.3%・性能目標・train loss不使用）。Step 4 micro（`jt_gemm_mat_f32`、Mr=12×Nr=4）を新ベースラインに固定し回帰判定に使う
 
 ### 完了条件
-- 総10〜20B / アクティブ100MのMoEを構築
-- Gated DeltaNet-2の線形：フル比率をアブレーションで決定
-- CSA（4:1圧縮 + top-1024選択）を実装
-- エキスパート内混合精度（down=4bit, gate/up=2bit）を実装
-- 小規模データ（10Bトークン）で学習
+
+- P3a/b/c/dの設計文書を凍結（`analysis/p3-architecture.md`・`analysis/p3-inference-engine.md`・`analysis/p3-training-scale.md`・`analysis/p3-integration.md`）。矛盾発見時は設計会議へ申送り（Phase Gの再拡大は禁止）
+- 総10〜20B / アクティブ100Mの方針を維持（A300-500Mは条件付き選択肢。η実測＋(i)–(iv)の設計改訂でのみ採用）
+- Gated DeltaNet-2の線形：フル比率4:1〜5:1を維持（変更は設計改訂）。フル層のみにCSA（4:1圧縮 + top-1024選択）＋FP4（E2M1・16ch毎E4M3・RoPE後量子化・オンフライ逆量子化・層単位FP8フォールバック付き）を適用
+- エキスパート内混合精度（down=4bit, gate/up=2bit・共有expert INT8・注意射影INT8・emb/head INT8＋factorized head・untie既定）を方針維持。W8A8 INT8を学習・prefillのGEMM本線、T-MAC LUTをGEMM体制の副線に限定（decode GEMV本線化禁止）
+- S1＝1B確立を実実行：L=24・d=1024・E=64/layer・expert_hidden=128・shared=2・top-k=4・GDN 5:1（total 0.712B・active 96M・dense INT4 69.6MiB・SSD 264MiB）。exit条件＝学習peak≦2GB実測・fetch≦103MiB実測・drop steady-state（最後100 step平均）≦5%・Step 4 micro基準回帰なし（最終val差≦1%・飽和＜0.3%・perm/off/drop bit一致）・η実測の記録。公称8B/2.6Bを受入条件に使わない
 
 ### 並列実行可能
 - アーキテクチャ探索とデータパイプラインは並行
 - 混合精度戦略とルーティング設計は独立
+- S1実実行とS2仕様凍結準備（粒度ポリシー・pin機構・offload-fractionノブ予約）は並行可能。ただしS2実実行はS1 exit通過後に限る
 
 ### ドキュメント更新
 - ARCHITECTURE.MDを確定版に更新
 - RULE.MDの未解決課題を更新
+- P3d統合記録（矛盾C1–C7・未解決課題集約・G1–G4流用）を反映
 
 ### 敵対レビュー
 - 「Qwen3.8-27B相当の性能」が達成可能かレビュー
 - スケーリング則の外挿が妥当か検証
+- S1 exitの実測検証（peak・fetch・drop・Step 4 micro回帰なし・η記録）とG1–G4ゲートの適用を検証
+- 「1トークンあたり103 MiB以下」のNVMe読み込みをpin-hit率＋Delta持続率の実測で検証（論文値転載での代替不可）
 
-## 14. Phase 4: 大規模学習とRL
+## 14. Phase 4: 大規模学習とRL（S2 10B拡大＋S3 Corpus本格＋RL順次）
+
+### P4再定義
+
+- Phase 4＝S2＝10B拡大（総量下限10B・P3a範囲内で単点固定は本体設計）＋S3＝LLM-jp Corpus v4本格＋RL順次＋評価とする。小規模一括学習ではなく段階投入（ja_wiki subset→SwallowCode-v2→Japanese Function Calling Dataset順）で合成val頭打ちの脱却を図る。フル688B一括の単機学習は不可と明記
+- S2 entry＝S1 exit通過＋粒度ポリシー＋pin機構の仕様凍結＋offload-fractionノブ予約。S2 exit＝dense≦2GB／全体≦8GB・A100M基準維持・NVMe≦103MiB・起動≦50/token・容量勘定の維持
+- RLは順次適用に再定義する：(1)SFT → (2)ORPO（SFTと同時・1回）→ (3)SPO（過最適化抑制・1回）→ (4)GRPO（KL削除・生成N回＋更新1回）＋RLVR（ルールベース報酬のみ）。SimPOはORPO代替、三重同時適用禁止。GRPO先行開始禁止（SFT＋ORPO/SPO通過がentry条件）。旧「ORPOまたはSPO」表記は本順次表記に置き換える
 
 ### 完了条件
-- LLM-jp Corpus v4でCPT
-- Japanese Function Calling DatasetでSFT
-- ORPOまたはSPOで選好学習
-- GRPO + RLVRで推論強化
-- 日本語MT-Bench、SWE-bench Pro、ツールコール成功率を評価
+- S2＝10B拡大の学習を完遂（S2 exit条件を満たすこと）
+- S3＝LLM-jp Corpus v4で段階学習（日本語6,880億＋コード218Bを段階投入。ja_wiki subset→SwallowCode-v2→JFCD順）
+- Japanese Function Calling Datasetを含む選好ペアでSFT＋ORPO→SPOで選好学習（SimPOは代替肢）
+- GRPO + RLVRで推論強化（コード実行サンドボックス＋成否判定器・生成N回予算・KV微小維持・W8A8本線確定が前提。報酬はルールベースのみ）
+- 日本語MT-Bench、SWE-bench Pro、ツールコール成功率を評価（合否はP3本体評価で判定）
 
 ### 並列実行可能
-- CPTとSFTは順次だが、RLはSFT完了後に並行開発可能
+- S2拡大とS3前処理（取得・ライセンス・`.jtdp`再利用・C encoderは訓練クリティカルパス外）は並行可能。ただしS3実学習はS2 exit通過後に限る
+- RLパイプライン開発はSFT完了後に並行開発可能
 - 評価パイプラインは学習と並行
 
 ### ドキュメント更新
 - 全ドキュメントを最終版に更新
 - ベンチマーク結果をROADMAPにフィードバック
+- RL順序（ORPO→SPO→GRPO＋RLVR）と段階ゲート（S2/S3 entry/exit）の記録を反映
 
 ### 敵対レビュー
 - 「日本語MT-Bench GPT-4o以上」の達成を検証
 - 「ツールコール成功率90%以上」の達成を検証
+- RL順序の遵守（GRPO先行なし・参照モデル不要性・順伝播回数・ルールベース報酬のみ）を検証
 
-## 15. Phase 5: 統合と最適化
+## 15. Phase 5: 統合と最適化（P5再定義）
 
 ### 完了条件
 - OpenAI互換APIサーバーを実装

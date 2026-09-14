@@ -91,6 +91,12 @@
 - **依存**：`analysis/f2-breakdown.md` §4–§6、`analysis/roofline.md` D4–D7、`analysis/phase-g-summary.md` §3（Step 4 micro新ベースライン・追跡基準値）・§5（cap=1.5・renormalize・μ=0.01）・§6、`analysis/p3-design-inputs.md` §(c)C3、`analysis/training-speedup.md` P0/P1、`analysis/p3-architecture.md` §4・§6。
 - **ゲート条件**：S1 exit＝bwd wall半減実測＋val固定費除去実測＋optim半減実測＋sync横ばい実測＋drop steady-state≦5%＋Step 4 micro基準回帰なし（最終val差≦1%・飽和＜0.3%・perm/off/drop bit一致）。公称8B/2.6Bを受入条件・設計目標として引用しないこと。LFM2/Gemma値を同語彙速度比較に使わないこと。絶対toks/s目標の固定はSTREAM実測後に設計改訂で行うこと。
 
+## 追補A. RL順序の意図（ORPO＋SPO両用の理由・実験計画とパイプラインの分離・P3d確認記録）
+
+- **ORPO＋SPO両用の理由（誤記ではない）**：ORPO＝選好学習（odds-ratio、SFTと同時・順伝播1回）、SPO＝過最適化抑制（順伝播1回）であり役割が異なるため、順次適用 (1)SFT → (2)ORPO → (3)SPO → (4)GRPO＋RLVR を既定とする。SimPO（選好学習・1回）はORPOの代替肢であり、ORPO／SimPO／SPOの三重同時適用は重複のため禁止（設計改訂扱い）。ROADMAP Phase 4の「ORPOまたはSPO」表記は計画段階の選択肢表現であり、本書の順次既定と矛盾するためROADMAP改訂で「ORPO→SPO順次・SimPO代替」に統一する（P3d申送り）。
+- **パイプライン設計（コード経路）**：SFT損失／ORPO 1-pass／SPO正則化／GRPO N生成＋更新1回＋RLVRサンドボックス（コード実行・ツールコール成否のルールベース報酬のみ、報酬モデル導入は設計改訂）。GRPO先行開始禁止（SFT＋ORPO/SPO通過がentry条件）、参照モデル不要性の維持。
+- **実験計画（評価順序・本体設計への入力）**：S1後半〜S2でORPO/SPOの効果（選好改善＋過最適化抑制）を検証し、GRPO/RLVRは (i)サンドボックス＋判定器、(ii)生成N回分の計算・メモリ・KV予算（CSA2＋FP4微小維持）、(iii)W8A8本線確定を満たした後に開始する。成功基準（MT-Bench・SWE-bench Pro 50・ツールコール90%）の合否は本書で付けずP3本体評価に委譲する。
+
 ## 参照URL一覧（本書の前提に限定）
 
 - https://github.com/JustVugg/colibri
