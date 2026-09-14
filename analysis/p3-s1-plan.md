@@ -19,8 +19,8 @@ date: 2026-09-14
 - model1b accounting defines the target; engine kernels are dim-agnostic
   (JT_BWD_MAX_WIDE bounds apply — verify 1024/48588 fit before S1).
 
-## 5. factorized head (opt-in, composite gate)
-- §7 composite gate applies.
+## 5. factorized head (opt-in, §12 composite gate applies)
+- dense default; enable per Stage 4c gate.
 
 ## 6. lowbit (W8A8 main line, INT4/INT2副線)
 - W8A8 default-off path + INT2/INT4 lowbit paths (mode 1/2).
@@ -43,10 +43,10 @@ date: 2026-09-14
 - [x] INT8 fast paths (AVX2/VNNI)
 - [x] factorized head flag (gate open, dense default)
 - [x] x-platform I/O thin layer (Linux real-run, macOS real-run, Windows fread)
-- [ ] Stage 3b-2 INT4/INT2 + T-MAC (design approved, impl pending)
+- [x] Stage 3b-2 INT4/INT2 + T-MAC (src/lowbit.c merged; G2 marginal recorded)
 - [ ] G1 fusion decode remeasure (after decode impl)
 
-## 4. factorized head × lowbit: S1 composite gate
+## 12. S1 composite gate (factorized × lowbit)
 - factorized単独: val diff ≤ 1% @2000 steps (design scale)
 - 低ビット単独: val diff ≤ 1% (TinyStories T=512。真LUT +0.98%で通過)
 - 複合 (factorized + 低ビット): val diff ≤ 1%
@@ -63,11 +63,12 @@ date: 2026-09-14
 ## 10. S1 stages (gated, no bulk implementation)
 - Stage 4a: 1B model definition + data loader. gate: accounting matches §1,
   loader roundtrip bit-identical.
-- Stage 4b: engine 1B readiness (dims fit, 16GB budget assert). gate: ctest
-  + proxy equivalence at scale dims.
-- Stage 4c: factorized head enable. gate: §7 composite (factorized part).
-- Stage 4d: lowbit enable. gate: §7 composite (lowbit part).
-- Stage 4e: full evaluation, 2000 steps. gate: §7 composite + §11 items.
+- Stage 4b: engine 1B readiness (dims fit, 16GB budget assert). gate:
+  forward/backward operate at scale dims + 100 steps loss monotonic
+  decrease + memory within budget + ctest green.
+- Stage 4c: factorized head enable. gate: §12 composite (factorized part).
+- Stage 4d: lowbit enable. gate: §12 composite (lowbit part).
+- Stage 4e: full evaluation, 2000 steps. gate: §12 composite + §11 items.
 
 ## 11. Go/No-Go (final)
 - Go conditions:
@@ -77,6 +78,8 @@ date: 2026-09-14
   4. throughput ≥ 100 tok/s
   5. RSS < 14GB
   6. grad norm: no divergence
-  7. checkpoint save→resume→trajectory match
-- Fallback per condition: §7 order (INT8 revert → k=512 → full INT4 → P3a).
-  Any red without fallback pass → No-Go, S2/S3 blocked, design review.
+  7. checkpoint save→resume→trajectory match (failure = No-Go;
+     no fresh-run fallback)
+- Fallback per condition: §12 order (INT8 revert → k=512 → full INT4 → P3a).
+  Checkpoint failure has no fallback (must-fix).
+  Any other red without fallback pass → No-Go, S2/S3 blocked, design review.
