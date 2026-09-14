@@ -155,6 +155,10 @@ static void tn_usage(const char *prog) {
             "  defaults: data=data/names.txt pack=data/names.jtdp steps=500 "
             "time=1200 lr=1e-3 batch=256 d=64 layers=2 val-every=25 "
             "sample=0 temp=0 seed=0x53414D50 maxlen=20\n"
+            "  --factorized-head: Stage 1 factorized output head "
+            "(d->k->V untie; default dense)\n"
+            "  --head-k K: bottleneck dim (1..256; 0=auto d/4, e.g. d=64->16; "
+            "requires --factorized-head)\n"
             "  --write-pack: names.txt -> .jtdp変換のみ行い終了 "
             "(data_pack正規経路)\n"
             "  --sample N: 学習完了後に最終重みでN個の名前を生成 (forwardのみ)\n"
@@ -165,8 +169,9 @@ static void tn_usage(const char *prog) {
 }
 
 // ---- パラメータ配置 (単一Pバッファ。Gも同一配置) ----
-//   [emb V*d][layer0][layer1]...[Wo V*d][bo V]
-//   layer: [Wgate E*d][Wg E*H*d][Wu ..][Wd ..][Wgs S*H*d][Wus ..][Wds ..]
+//   dense: [emb V*d][layer0][layer1]...[Wo V*d][bo V]
+//   factorized (--factorized-head): [emb V*d][layers][W1 d*k][b1 k][W2 k*V][bo V]
+//     (Stage 1: analysis/vocab-budget.md 既定。embはfullのままuntie。k既定=d/4)
 typedef struct tn_layout {
     size_t off_emb;
     size_t layer_stride;
@@ -177,14 +182,20 @@ typedef struct tn_layout {
     size_t off_wgs;
     size_t off_wus;
     size_t off_wds;
-    size_t off_head_wo;
-    size_t off_head_bo;
+    size_t off_head_wo; /* dense専用。fact時はoff_hw1と同値の未使用番兵 */
+    size_t off_head_bo; /* 両式で有効 (出力bias) */
+    size_t off_hw1;     /* fact専用: W1 d*k */
+    size_t off_hb1;     /* fact専用: b1 k */
+    size_t off_hw2;     /* fact専用: W2 k*V */
     size_t n_total;
     int n_layers;
     int d;
+    int use_fact;
+    int head_k;
 } tn_layout_t;
 
-static void tn_build_layout(tn_layout_t *lt, int n_layers, int d) {
+static void tn_build_layout(tn_layout_t *lt, int n_layers, int d,
+                            int use_fact, int head_k) {
     size_t e = (size_t)TN_E;
     size_t h = (size_t)TN_H;
     size_t dd = (size_t)d;
@@ -195,6 +206,8 @@ static void tn_build_layout(tn_layout_t *lt, int n_layers, int d) {
     memset(lt, 0, sizeof(*lt));
     lt->n_layers = n_layers;
     lt->d = d;
+    lt->use_fact = (use_fact != 0) ? 1 : 0;
+    lt->head_k = (use_fact != 0) ? head_k : 0;
     lt->off_emb = 0;
     lt->off_wgate = 0;
     lt->off_wg = e * dd;
@@ -204,6 +217,16 @@ static void tn_build_layout(tn_layout_t *lt, int n_layers, int d) {
     lt->off_wus = e * dd + (size_t)3 * routed + shared;
     lt->off_wds = e * dd + (size_t)3 * routed + (size_t)2 * shared;
     lt->layer_stride = e * dd + (size_t)3 * routed + (size_t)3 * shared;
+    if (lt->use_fact) {
+        size_t kk = (size_t)head_k;
+        lt->off_hw1 = v * dd + (size_t)n_layers * lt->layer_stride;
+        lt->off_hb1 = lt->off_hw1 + dd * kk;
+        lt->off_hw2 = lt->off_hb1 + kk;
+        lt->off_head_bo = lt->off_hw2 + kk * v;
+        lt->off_head_wo = lt->off_hw1; /* dense専用番兵。fact時は未使用 */
+        lt->n_total = lt->off_head_bo + v;
+        return;
+    }
     lt->off_head_wo = v * dd + (size_t)n_layers * lt->layer_stride;
     lt->off_head_bo = v * dd + (size_t)n_layers * lt->layer_stride + v * dd;
     lt->n_total = v * dd + (size_t)n_layers * lt->layer_stride + v * dd + v;
@@ -217,6 +240,182 @@ typedef struct tn_model {
     jt_optim8_t opt;
     int opt_inited;
 } tn_model_t;
+
+// ---- Stage 1 factorized head (d→k→Vの2段線形＋bias。embはfullのままuntie) ----
+// analysis/vocab-budget.md 既定 (d=1024・k=256)。proxy既定k=d/4。
+// 密headの原文は各呼出し側のelse内に不変で残し、本ヘルパーはuse_fact時のみ使用。
+// fail-closed: 全入力検証・有限性検査。失敗時はG/logits不変でJT_ERR_INVAL。
+#define TN_HEAD_MID_MAX 256
+
+// fwd: mid[i] = b1[i] + Σ_j W1[i][j] hl[j]、logits[v] = bo[v] + Σ_i W2[v][i] mid[i]。
+static int tn_head_fact_fwd(const tn_model_t *restrict m,
+                            const float *restrict hl,
+                            float *restrict mid, float *restrict logits) {
+    int d = 0;
+    int k = 0;
+    const float *P = NULL;
+    const float *W1 = NULL;
+    const float *b1 = NULL;
+    const float *W2 = NULL;
+    const float *bo = NULL;
+    int i = 0;
+    int v = 0;
+    int j = 0;
+    if (m == NULL || hl == NULL || mid == NULL || logits == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (!m->lt.use_fact) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    d = m->lt.d;
+    k = m->lt.head_k;
+    if (d < 8 || d > 256 || k < 1 || k > TN_HEAD_MID_MAX) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    P = m->P;
+    if (P == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    W1 = P + m->lt.off_hw1;
+    b1 = P + m->lt.off_hb1;
+    W2 = P + m->lt.off_hw2;
+    bo = P + m->lt.off_head_bo;
+    for (i = 0; i < k; i++) {
+        double acc = (double)b1[i];
+        if (!isfinite(acc)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        for (j = 0; j < d; j++) {
+            acc += (double)W1[(size_t)i * (size_t)d + (size_t)j] *
+                   (double)hl[j];
+        }
+        if (!isfinite(acc)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        mid[i] = (float)acc;
+    }
+    for (v = 0; v < TN_VOCAB; v++) {
+        double acc = (double)bo[v];
+        for (i = 0; i < k; i++) {
+            acc += (double)W2[(size_t)v * (size_t)k + (size_t)i] *
+                   (double)mid[i];
+        }
+        if (!isfinite(acc)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        logits[v] = (float)acc;
+    }
+    return JT_OK;
+}
+
+// bwd: dlog[V] (CE由来・scale済み) から両段の勾配をGへ加算し、dh[d]を上書きする。
+// midはhlから再計算 (fwdと同一式。余分な保持なし)。G更新前の失敗ではG不変。
+static int tn_head_fact_bwd(tn_model_t *restrict m, const float *restrict hl,
+                            const float *restrict dlog, float *restrict dh) {
+    int d = 0;
+    int k = 0;
+    const float *P = NULL;
+    float *G = NULL;
+    const float *W1 = NULL;
+    const float *b1 = NULL;
+    const float *W2 = NULL;
+    float *GW1 = NULL;
+    float *Gb1 = NULL;
+    float *GW2 = NULL;
+    float *Gbo = NULL;
+    float mid[TN_HEAD_MID_MAX];
+    float dm[TN_HEAD_MID_MAX];
+    int i = 0;
+    int v = 0;
+    int j = 0;
+    if (m == NULL || hl == NULL || dlog == NULL || dh == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (!m->lt.use_fact) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    d = m->lt.d;
+    k = m->lt.head_k;
+    if (d < 8 || d > 256 || k < 1 || k > TN_HEAD_MID_MAX) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    P = m->P;
+    G = m->G;
+    if (P == NULL || G == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    W1 = P + m->lt.off_hw1;
+    b1 = P + m->lt.off_hb1;
+    W2 = P + m->lt.off_hw2;
+    GW1 = G + m->lt.off_hw1;
+    Gb1 = G + m->lt.off_hb1;
+    GW2 = G + m->lt.off_hw2;
+    Gbo = G + m->lt.off_head_bo;
+    for (v = 0; v < TN_VOCAB; v++) {
+        if (!isfinite((double)dlog[v])) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+    }
+    for (i = 0; i < k; i++) {
+        double acc = (double)b1[i];
+        if (!isfinite(acc)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        for (j = 0; j < d; j++) {
+            acc += (double)W1[(size_t)i * (size_t)d + (size_t)j] *
+                   (double)hl[j];
+        }
+        if (!isfinite(acc)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        mid[i] = (float)acc;
+    }
+    for (i = 0; i < k; i++) {
+        double acc = 0.0;
+        for (v = 0; v < TN_VOCAB; v++) {
+            acc += (double)dlog[v] *
+                   (double)W2[(size_t)v * (size_t)k + (size_t)i];
+        }
+        if (!isfinite(acc)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        dm[i] = (float)acc;
+    }
+    for (j = 0; j < d; j++) {
+        dh[j] = 0.0f;
+    }
+    for (v = 0; v < TN_VOCAB; v++) {
+        float g = dlog[v];
+        Gbo[v] += g;
+        for (i = 0; i < k; i++) {
+            GW2[(size_t)v * (size_t)k + (size_t)i] += g * mid[i];
+        }
+    }
+    for (i = 0; i < k; i++) {
+        float e = dm[i];
+        Gb1[i] += e;
+        for (j = 0; j < d; j++) {
+            GW1[(size_t)i * (size_t)d + (size_t)j] += e * hl[j];
+            dh[j] += e * W1[(size_t)i * (size_t)d + (size_t)j];
+        }
+    }
+    return JT_OK;
+}
 
 // 1サンプル分のforward。actsは[(L+1)*d]作業域 (層入力の保存)。
 // caches: ids[L*K], w[L*K], Gsel[L*K*H], Usel[L*K*H], Ysel[L*K*d],
@@ -280,7 +479,14 @@ static int tn_fwd_one(const tn_model_t *restrict m, int x,
             xout[j] = (float)t;
         }
     }
-    {
+    if (m->lt.use_fact) {
+        /* Stage 1 factorized head。密headはelse内の原文のまま */
+        float mid[TN_HEAD_MID_MAX];
+        if (tn_head_fact_fwd(m, acts + (size_t)L * (size_t)d, mid, logits) !=
+            JT_OK) {
+            return JT_ERR_INVAL;
+        }
+    } else {
         const float *hl = acts + (size_t)L * (size_t)d;
         for (v = 0; v < TN_VOCAB; v++) {
             double acc = (double)bo[v];
@@ -323,7 +529,13 @@ static int tn_bwd_one(tn_model_t *restrict m, int x,
     if (tn_ce_bwd(probs, TN_VOCAB, y, dlog_scale, dlog) != JT_OK) {
         return JT_ERR_INVAL;
     }
-    {
+    if (m->lt.use_fact) {
+        /* Stage 1 factorized head。密headはelse内の原文のまま */
+        const float *hl = acts + (size_t)L * (size_t)d;
+        if (tn_head_fact_bwd(m, hl, dlog, dh) != JT_OK) {
+            return JT_ERR_INVAL;
+        }
+    } else {
         const float *hl = acts + (size_t)L * (size_t)d;
         for (j = 0; j < d; j++) {
             dh[j] = 0.0f;
@@ -633,6 +845,8 @@ int main(int argc, char **argv) {
     double temp = 0.0; /* --temp T: 0=greedy、>0で温度サンプリング */
     uint64_t seed = 0x53414D50ULL; /* 決定論的既定seed */
     int max_len = 20;  /* 1名前あたり最大文字数 */
+    int use_fact = 0;  /* --factorized-head: Stage 1の2段head (既定0=密head) */
+    int head_k = 0;    /* --head-k K (0=auto d/4)。fact時のみ有効 */
     uint32_t **seqs = NULL;
     size_t *lens = NULL;
     long n_names = 0;
@@ -705,6 +919,10 @@ int main(int argc, char **argv) {
                     strcmp(argv[i], "--max-len") == 0) &&
                    i + 1 < argc) {
             max_len = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--factorized-head") == 0) {
+            use_fact = 1;
+        } else if (strcmp(argv[i], "--head-k") == 0 && i + 1 < argc) {
+            head_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-sched") == 0) {
             no_sched = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
@@ -722,10 +940,24 @@ int main(int argc, char **argv) {
         !isfinite(lr) || batch <= 0 || batch > 4096 || d < 8 || d > 256 ||
         n_layers < 1 || n_layers > 4 || val_every <= 0 || n_sample < 0 ||
         n_sample > 100000 || !isfinite(temp) || temp < 0.0 || temp > 5.0 ||
-        max_len < 1 || max_len > 64) {
+        max_len < 1 || max_len > 64 || head_k < 0 ||
+        head_k > TN_HEAD_MID_MAX) {
         fprintf(stderr, "train_names: invalid limits/args\n");
         errno = EINVAL;
         goto cleanup;
+    }
+    if (head_k != 0 && !use_fact) {
+        fprintf(stderr,
+                "train_names: --head-k requires --factorized-head\n");
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (use_fact && head_k == 0) {
+        /* 既定k=d/4 (d=1024で256となりvocab-budget.mdの指定と一致) */
+        head_k = d / 4;
+        if (head_k < 1) {
+            head_k = 1;
+        }
     }
 
     /* ---- --write-pack: names.txt -> .jtdp変換のみ ---- */
@@ -856,7 +1088,7 @@ int main(int argc, char **argv) {
     lens = NULL;
 
     /* ---- モデル確保・初期化 ---- */
-    tn_build_layout(&m.lt, n_layers, d);
+    tn_build_layout(&m.lt, n_layers, d, use_fact, head_k);
     m.P = (float *)malloc(m.lt.n_total * sizeof(float));
     m.G = (float *)malloc(m.lt.n_total * sizeof(float));
     if (m.P == NULL || m.G == NULL) {
@@ -893,6 +1125,12 @@ int main(int argc, char **argv) {
         for (p = 0; p < (size_t)TN_VOCAB; p++) {
             m.P[m.lt.off_head_bo + p] = 0.0f;
         }
+        if (use_fact) {
+            /* 中間bias b1も0 (W1/W2は上記ループの小一様のまま) */
+            for (p = 0; p < (size_t)m.lt.head_k; p++) {
+                m.P[m.lt.off_hb1 + p] = 0.0f;
+            }
+        }
     }
     {
         jt_optim8_cfg_t cfg;
@@ -909,9 +1147,9 @@ int main(int argc, char **argv) {
         m.opt_inited = 1;
     }
     printf("train_names: layers=%d d=%d E=%d K=%d S=%d H=%d V=%d "
-           "params=%zu lr=%.5f batch=%ld\n",
+           "params=%zu lr=%.5f batch=%ld head_fact=%d head_k=%d\n",
            n_layers, d, TN_E, TN_K, TN_S, TN_H, TN_VOCAB, m.lt.n_total, lr,
-           batch);
+           batch, use_fact, use_fact ? head_k : 0);
     fflush(stdout);
     acts = (float *)malloc((size_t)(n_layers + 1) * (size_t)d * sizeof(float));
     cids = (size_t *)malloc((size_t)n_layers * (size_t)TN_K * sizeof(size_t));
