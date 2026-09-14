@@ -151,14 +151,16 @@ static void tn_usage(const char *prog) {
             "usage: %s [--data names.txt] [--pack names.jtdp] "
             "[--write-pack out.jtdp] [--steps N] [--time SECS] [--lr LR] "
             "[--batch B] [--d DIM] [--layers L] [--val-every K] "
-            "[--sample N] [--temp T] [--seed S] [--maxlen M]\n"
+            "[--sample N] [--temp T] [--seed S] [--maxlen M] [--no-sched]\n"
             "  defaults: data=data/names.txt pack=data/names.jtdp steps=500 "
             "time=1200 lr=1e-3 batch=256 d=64 layers=2 val-every=25 "
             "sample=0 temp=0 seed=0x53414D50 maxlen=20\n"
             "  --write-pack: names.txt -> .jtdp変換のみ行い終了 "
             "(data_pack正規経路)\n"
             "  --sample N: 学習完了後に最終重みでN個の名前を生成 (forwardのみ)\n"
-            "  --temp T: 0でgreedy(argmax)、T>0で温度サンプリング (決定論的)\n",
+            "  --temp T: 0でgreedy(argmax)、T>0で温度サンプリング (決定論的)\n"
+            "  --no-sched: lrスケジュール無効化 (固定lr。既定はwarmup 100 + "
+            "cosine decay)\n",
             prog);
 }
 
@@ -576,6 +578,43 @@ static void tn_free_seqs(uint32_t **seqs, size_t *lens, long n) {
     free(lens);
 }
 
+// S0b-3: lrスケジュール (warmup 100 + cosine decay。train_proxy100m.cの
+// px_sched_lrと同一式。bench/commonは測定基盤専用のため各ファイルに移植し、
+// 過剰な共通化はしない)。
+// step<W: 線形warmup B*(step+1)/W。以降: cosine B*0.5*(1+cos(pi*(step+1-W)/(T-W)))。
+// T<=W時はwarmupのみ。常に有限・非負を返す。
+#ifndef TN_LR_PI
+#define TN_LR_PI 3.14159265358979323846
+#endif
+static float tn_sched_lr(long step, long total, float base) {
+    double B = (double)base;
+    double W = 100.0;
+    double T = (total > 0) ? (double)total : 1.0;
+    double s = (double)(step + 1);
+    double lr = B;
+    if (!(B > 0.0) || !isfinite(B)) {
+        return base;
+    }
+    if (s <= W) {
+        lr = B * (s / W);
+    } else if (T <= W) {
+        lr = B;
+    } else {
+        double p = (s - W) / (T - W);
+        if (p < 0.0) {
+            p = 0.0;
+        }
+        if (p > 1.0) {
+            p = 1.0;
+        }
+        lr = B * 0.5 * (1.0 + cos(p * TN_LR_PI));
+    }
+    if (!isfinite(lr) || lr < 0.0) {
+        lr = 0.0;
+    }
+    return (float)lr;
+}
+
 int main(int argc, char **argv) {
     int rc_all = 1;
     const char *data_path = "data/names.txt";
@@ -585,6 +624,7 @@ int main(int argc, char **argv) {
     long max_steps = 500;
     double time_limit = 1200.0;
     float lr = 1e-3f;
+    int no_sched = 0; /* 0=既定: warmup 100 + cosine decay (proxyと同一式) */
     long batch = 256;
     int d = 64;
     int n_layers = 2;
@@ -665,6 +705,8 @@ int main(int argc, char **argv) {
                     strcmp(argv[i], "--max-len") == 0) &&
                    i + 1 < argc) {
             max_len = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-sched") == 0) {
+            no_sched = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             tn_usage(argv[0]);
@@ -989,6 +1031,9 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         }
+        /* S0b-3: lrスケジュール適用 (既定ON。--no-sched時は固定)。
+           opt.lrを更新するのみで更新式は不変。proxyと同一式。 */
+        m.opt.lr = no_sched ? lr : tn_sched_lr(step, max_steps, lr);
         if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
             fprintf(stderr, "train_names: optim failed at step=%ld\n", step);
             goto cleanup;

@@ -560,9 +560,15 @@ static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
             dx_acc[j] += acc;
         }
         // 非選択expertのdWは0で埋める (上書き・加算ではない)。
+        // S0b-1: 要素毎スカラーループをmemset化 (同一箇所に正確な0を書く
+        // ためbit同一。dW系/dWgate系の2走査も単一ループに融合)。
+        // 背景: proxy dims (E=16,H=128,N=1024) で本zero-fillは25.2MB/call。
+        // 非選択12/16が純粋な0書きであり、F2のbwd効率1/5の主因だった。
         {
             size_t e = (size_t)n_experts;
             size_t hhn = (size_t)h * (size_t)n;
+            size_t hhn_b = hhn * sizeof(float);
+            size_t n_b = (size_t)n * sizeof(float);
             // 選択集合のルックアップ (k<=64のため線形走査)。
             for (size_t ee = 0; ee < e; ee++) {
                 int sel = 0;
@@ -570,27 +576,10 @@ static int jt_moe_bwd_impl(const float *restrict dY, const float *restrict X,
                     sel |= (ids[p] == ee);
                 }
                 if (!sel) {
-                    float *rg = dWg + ee * hhn;
-                    float *ru = dWu + ee * hhn;
-                    float *rd = dWd + ee * hhn;
-                    for (size_t i = 0; i < hhn; i++) {
-                        rg[i] = 0.0f;
-                        ru[i] = 0.0f;
-                        rd[i] = 0.0f;
-                    }
-                }
-            }
-            // dWgate/dLogitsの非選択行も0 (選択行は後段で上書き)。
-            for (size_t ee = 0; ee < e; ee++) {
-                int sel = 0;
-                for (int p = 0; p < topk; p++) {
-                    sel |= (ids[p] == ee);
-                }
-                if (!sel) {
-                    float *rg = dWgate + ee * (size_t)n;
-                    for (int j = 0; j < n; j++) {
-                        rg[j] = 0.0f;
-                    }
+                    memset(dWg + ee * hhn, 0, hhn_b);
+                    memset(dWu + ee * hhn, 0, hhn_b);
+                    memset(dWd + ee * hhn, 0, hhn_b);
+                    memset(dWgate + ee * (size_t)n, 0, n_b);
                     if (dLogits != NULL) {
                         dLogits[ee] = 0.0f;
                     }

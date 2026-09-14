@@ -199,7 +199,7 @@ static void ts_usage(const char *prog) {
             "[--steps N] [--time SECS] [--lr LR] [--batch B] [--d DIM] "
             "[--layers L] [--val-every K] [--patience P] [--vocab V] "
             "[--bpe-vocab PATH] [--max-stories N] [--max-val-pairs N] "
-            "[--moe-batch] [--seq S] [--aux-weight W]\n"
+            "[--moe-batch] [--seq S] [--aux-weight W] [--no-sched]\n"
             "  defaults: data=data/tinystories_head16M.txt "
             "pack=data/tinystories16M.jtdp steps=500 time=3600 lr=3e-4 "
             "batch=64 d=64 layers=2 val-every=100 patience=100 vocab=258 "
@@ -212,7 +212,9 @@ static void ts_usage(const char *prog) {
             "  --moe-batch: Phase G batch dispatch (cap=1.5; T=seq*batch)\n"
             "  --seq S: tokens per sequence (1..512). T_step=seq*batch (<=1024)\n"
             "  --aux-weight W: load-balancing L_aux weight (0..0.1, default "
-            "0.01; tunable 0.01-0.1)\n",
+            "0.01; tunable 0.01-0.1)\n"
+            "  --no-sched: lrスケジュール無効化 (固定lr。既定はwarmup 100 + "
+            "cosine decay)\n",
             prog);
 }
 
@@ -1831,6 +1833,43 @@ static int ts_eval_val(const ts_model_t *restrict m, const int *restrict vx,
     return JT_OK;
 }
 
+// S0b-3: lrスケジュール (warmup 100 + cosine decay。train_proxy100m.cの
+// px_sched_lrと同一式。bench/commonは測定基盤専用のため各ファイルに移植し、
+// 過剰な共通化はしない)。
+// step<W: 線形warmup B*(step+1)/W。以降: cosine B*0.5*(1+cos(pi*(step+1-W)/(T-W)))。
+// T<=W時はwarmupのみ。常に有限・非負を返す。
+#ifndef TS_LR_PI
+#define TS_LR_PI 3.14159265358979323846
+#endif
+static float ts_sched_lr(long step, long total, float base) {
+    double B = (double)base;
+    double W = 100.0;
+    double T = (total > 0) ? (double)total : 1.0;
+    double s = (double)(step + 1);
+    double lr = B;
+    if (!(B > 0.0) || !isfinite(B)) {
+        return base;
+    }
+    if (s <= W) {
+        lr = B * (s / W);
+    } else if (T <= W) {
+        lr = B;
+    } else {
+        double p = (s - W) / (T - W);
+        if (p < 0.0) {
+            p = 0.0;
+        }
+        if (p > 1.0) {
+            p = 1.0;
+        }
+        lr = B * 0.5 * (1.0 + cos(p * TS_LR_PI));
+    }
+    if (!isfinite(lr) || lr < 0.0) {
+        lr = 0.0;
+    }
+    return (float)lr;
+}
+
 int main(int argc, char **argv) {
     int rc_all = 1;
     const char *data_path = "data/tinystories_head16M.txt";
@@ -1840,6 +1879,7 @@ int main(int argc, char **argv) {
     long max_steps = 500;
     double time_limit = 3600.0;
     float lr = 3e-4f;  //既定: 1e-3は1645 stepで発散実績のため3e-4
+    int no_sched = 0; /* 0=既定: warmup 100 + cosine decay (proxyと同一式) */
     long batch = 64;
     int d = 64;
     int n_layers = 2;
@@ -1963,6 +2003,8 @@ int main(int argc, char **argv) {
             g_ts_seq = atol(argv[++i]);
         } else if (strcmp(argv[i], "--aux-weight") == 0 && i + 1 < argc) {
             g_ts_aux_w = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--no-sched") == 0) {
+            no_sched = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             ts_usage(argv[0]);
@@ -2523,7 +2565,10 @@ int main(int argc, char **argv) {
                         rr, amax, amin, amed, rmax, wmax, g_ts_moe_batch,
                         Tstep);
             }
-            if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
+            /* S0b-3: lrスケジュール適用 (既定ON。--no-sched時は固定)。
+           opt.lrを更新するのみで更新式は不変。proxyと同一式。 */
+        m.opt.lr = no_sched ? lr : ts_sched_lr(step, max_steps, lr);
+        if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
                 fprintf(stderr,
                         "train_tinystories: optim failed at step=%ld\n",
                         step);
@@ -2708,6 +2753,9 @@ int main(int argc, char **argv) {
                         rmax, wmax, g_ts_moe_batch, batch);
             }
         }
+        /* S0b-3: lrスケジュール適用 (既定ON。--no-sched時は固定)。
+           opt.lrを更新するのみで更新式は不変。proxyと同一式。 */
+        m.opt.lr = no_sched ? lr : ts_sched_lr(step, max_steps, lr);
         if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
             fprintf(stderr, "train_tinystories: optim failed at step=%ld\n",
                     step);
