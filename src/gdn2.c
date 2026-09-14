@@ -310,15 +310,27 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             goto cleanup;
         }
 
-        // 1) 大域忘却: S' = D S (alpha は fp32 累積済みを核外から受領)。
+        // G1融合 (Stage 2): S走査 7パス→2パス。
+        // F1: 大域忘却(scale)+選択的消去の係数(c累積)を単一i走査に融合。
+        //   要素毎の演算順序は旧2パスと同一:
+        //   tmp=fl(S*ai) → c+=fl(ke*tmp) (i昇順、j昇順) のため bit同一。
+        //   旧step 1のRWと旧step 2のRが1走査にまとまり、DRAM的には
+        //   2回目のRがキャッシュヒットになる (削減はS 5パス分=320KB/層、
+        //   roofline D7 G1。20線形層で6.4MB/token)。
+        for (int j = 0; j < dv; j++) {
+            c[j] = 0.0f;
+        }
         for (int i = 0; i < dk; i++) {
             float ai = alpha[i];
+            float ke = b[i] * kn[i];  // b_t は fp32 維持 (精度優先)。
             float *row = S + (size_t)i * (size_t)dv;
 #ifdef __AVX2__
             jt_gdn2_avx2_scale(row, ai, dv);
+            jt_gdn2_avx2_add(c, ke, row, dv);
 #else
-            int j = 0;
             // dv 4分割: 独立4チェーンで FMA レイテンシ隠蔽 (性能NOTE参照)。
+            // scale→add の順に同一jブロックで処理し、旧順序を保存する。
+            int j = 0;
             for (; j + 3 < dv; j += 4) {
                 row[j] *= ai;
                 row[j + 1] *= ai;
@@ -328,20 +340,7 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 row[j] *= ai;
             }
-#endif
-        }
-
-        // 2) 選択的消去の係数: c^T = (b⊙k)^T S'。
-        for (int j = 0; j < dv; j++) {
-            c[j] = 0.0f;
-        }
-        for (int i = 0; i < dk; i++) {
-            float ke = b[i] * kn[i];  // b_t は fp32 維持 (精度優先)。
-            const float *row = S + (size_t)i * (size_t)dv;
-#ifdef __AVX2__
-            jt_gdn2_avx2_add(c, ke, row, dv);
-#else
-            int j = 0;
+            j = 0;
             for (; j + 3 < dv; j += 4) {
                 c[j] += ke * row[j];
                 c[j + 1] += ke * row[j + 1];
@@ -354,12 +353,32 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
 #endif
         }
 
-        // 3) 消去: S'' = S' - k c^T。
+        // vw = w⊙v (S非接触。F2の入力。旧step 4と同一式・同一順序)。
+        // 将来の削減はここから: (1) w スカラー化 (2) w 量子化 (b は維持)。
+#ifdef __AVX2__
+        jt_gdn2_avx2_mul(vw, w, v, dv);
+#else
+        for (int j = 0; j < dv; j++) {
+            vw[j] = w[j] * v[j];
+        }
+#endif
+
+        // G1融合 (Stage 2): 消去(sub)+書込み(add)+読出し(out累積)を
+        // 単一i走査(F2)に融合。要素毎の演算順序は旧3パスと同一:
+        //   t1=fl(row-ki*c) → t2=fl(t1+ki*vw) → out+=fl(qn*t2)
+        //   (i昇順、j昇順) のため bit同一。旧step 3/5のRWと旧step 6のRが
+        //   1走査にまとまる (F1と合わせ S走査は2パスのみ)。
+        for (int j = 0; j < dv; j++) {
+            out_o[j] = 0.0f;
+        }
         for (int i = 0; i < dk; i++) {
             float ki = kn[i];
+            float qi = qn[i];
             float *row = S + (size_t)i * (size_t)dv;
 #ifdef __AVX2__
             jt_gdn2_avx2_sub(row, ki, c, dv);
+            jt_gdn2_avx2_add(row, ki, vw, dv);
+            jt_gdn2_avx2_add(out_o, qi, row, dv);
 #else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
@@ -371,27 +390,7 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 row[j] -= ki * c[j];
             }
-#endif
-        }
-
-        // 4) 選択的書込みの値: vw = w⊙v。
-        // 将来の削減はここから: (1) w スカラー化 (2) w 量子化 (b は維持)。
-#ifdef __AVX2__
-        jt_gdn2_avx2_mul(vw, w, v, dv);
-#else
-        for (int j = 0; j < dv; j++) {
-            vw[j] = w[j] * v[j];
-        }
-#endif
-
-        // 5) 書込み: S = S'' + k vw^T。
-        for (int i = 0; i < dk; i++) {
-            float ki = kn[i];
-            float *row = S + (size_t)i * (size_t)dv;
-#ifdef __AVX2__
-            jt_gdn2_avx2_add(row, ki, vw, dv);
-#else
-            int j = 0;
+            j = 0;
             for (; j + 3 < dv; j += 4) {
                 row[j] += ki * vw[j];
                 row[j + 1] += ki * vw[j + 1];
@@ -401,20 +400,7 @@ int jt_gdn2_decode_step(float *restrict S, float *restrict out_o,
             for (; j < dv; j++) {
                 row[j] += ki * vw[j];
             }
-#endif
-        }
-
-        // 6) 読出し: o = S^T q (更新後 S を使用)。
-        for (int j = 0; j < dv; j++) {
-            out_o[j] = 0.0f;
-        }
-        for (int i = 0; i < dk; i++) {
-            float qi = qn[i];
-            const float *row = S + (size_t)i * (size_t)dv;
-#ifdef __AVX2__
-            jt_gdn2_avx2_add(out_o, qi, row, dv);
-#else
-            int j = 0;
+            j = 0;
             for (; j + 3 < dv; j += 4) {
                 out_o[j] += qi * row[j];
                 out_o[j + 1] += qi * row[j + 1];
@@ -803,11 +789,24 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 tmp[i] *= At[i];
             }
         }
+        // G1融合 (Stage 2): S_out のスケール+ランク1累積を単一i走査に融合。
+        // 旧: S全行スケール (1パス) 後に s=0..C-1 の加算 (Cパス) = C+1パス。
+        // 新: 行i毎に scale→s昇順add を同一走査で処理し、S走査は1パスのみ。
+        // 要素毎の演算順序は旧と同一 (scale丸め後に s=0..C-1 の加算丸め、
+        // i昇順・j昇順) のため bit同一。
+        // B形成(step 2)・Out形成(step 5)のS読出しは融合対象外:
+        // 前者は前進代入、後者はP加算の入力であり、中間のsolveを跨ぐため
+        // 融合すると依存を壊す (記録のみ。許容判断はしない)。
         for (int i = 0; i < dk; i++) {
             float cf = tmp[i];
             float *Sr = S + (size_t)i * (size_t)dv;
 #ifdef __AVX2__
             jt_gdn2_avx2_scale(Sr, cf, dv);
+            for (int s = 0; s < C; s++) {
+                float w =
+                    (Pdec + (size_t)s * (size_t)dk)[i];
+                jt_gdn2_avx2_add(Sr, w, G + (size_t)s * (size_t)dv, dv);
+            }
 #else
             int j = 0;
             for (; j + 3 < dv; j += 4) {
@@ -819,18 +818,10 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
             for (; j < dv; j++) {
                 Sr[j] *= cf;
             }
-#endif
-        }
-        for (int s = 0; s < C; s++) {
-            const float *Es = G + (size_t)s * (size_t)dv;
-            const float *Ws = Pdec + (size_t)s * (size_t)dk;
-            for (int i = 0; i < dk; i++) {
-                float w = Ws[i];
-                float *Sr = S + (size_t)i * (size_t)dv;
-#ifdef __AVX2__
-                jt_gdn2_avx2_add(Sr, w, Es, dv);
-#else
-                int j = 0;
+            for (int s = 0; s < C; s++) {
+                float w = (Pdec + (size_t)s * (size_t)dk)[i];
+                const float *Es = G + (size_t)s * (size_t)dv;
+                j = 0;
                 for (; j + 3 < dv; j += 4) {
                     Sr[j] += w * Es[j];
                     Sr[j + 1] += w * Es[j + 1];
@@ -840,8 +831,8 @@ static int jt_gdn2_prefill_chunk_impl(float *restrict S, float *restrict Out,
                 for (; j < dv; j++) {
                     Sr[j] += w * Es[j];
                 }
-#endif
             }
+#endif
         }
     }
 
