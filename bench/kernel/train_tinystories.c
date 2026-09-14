@@ -217,6 +217,11 @@ static void ts_usage(const char *prog) {
             "(d->k->V untie; default dense)\n"
             "  --head-k K: bottleneck dim (1..256; 0=auto d/4, e.g. d=64->16; "
             "requires --factorized-head)\n"
+            "  --head-init MODE: standard (default, a=0.125) or vm "
+            "(variance-matched: dense-output match with fan-in ratio kept; "
+            "requires --factorized-head)\n"
+            "  --head-lr-scale R: head-only lr factor (0.05..1.0, default "
+            "1.0 = common lr; e.g. 0.25; requires --factorized-head)\n"
             "  --no-sched: lrスケジュール無効化 (固定lr。既定はwarmup 100 + "
             "cosine decay)\n",
             prog);
@@ -294,6 +299,14 @@ typedef struct ts_model {
     float *G;
     jt_optim8_t opt;
     int opt_inited;
+    /* Stage 1 (b)(c): head専用lr用の第2オプティマイザ。use_head_opt=1時のみ
+       使用し、body=[0,opt.n)をopt、head=[opt.n,n_total)をopt_headが担当する。
+       head_lr_scaleはbody lrに対するhead lrの比 (0.05..1.0)。単一opt時
+       (scale==1.0) は従来とbit同一の数値を保つ。 */
+    jt_optim8_t opt_head;
+    int opt_head_inited;
+    int use_head_opt;
+    float head_lr_scale;
 } ts_model_t;
 
 // ---- Stage 1 factorized head (d→k→Vの2段線形＋bias。embはfullのままuntie) ----
@@ -2124,6 +2137,45 @@ static float ts_sched_lr(long step, long total, float base) {
     return (float)lr;
 }
 
+// ---- Stage 1 (b)(c): 層別lr適用ヘルパー (fail-closed) ----
+// body lrはスケジュール適用値 (no_sched時は固定)。head lr = body*scale。
+// use_head_opt=0時は従来の単一opt更新と同一 (数値不変)。
+// use_head_opt=1時はbody/headを各optで更新する (各々bias補正は自step基準。
+// 両optは同回数stepするためtは一致)。更新式自体はjt_optim8_step不変。
+static int ts_optim_step(ts_model_t *restrict m, long step, long total,
+                         float base_lr, int no_sched) {
+    float body_lr = 0.0f;
+    if (m == NULL || m->P == NULL || m->G == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (!(base_lr > 0.0f) || !isfinite((double)base_lr)) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    body_lr = no_sched ? base_lr : ts_sched_lr(step, total, base_lr);
+    if (!isfinite((double)body_lr) || body_lr < 0.0f) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (!m->use_head_opt) {
+        m->opt.lr = body_lr;
+        return jt_optim8_step(&m->opt, m->P, m->G, m->lt.n_total);
+    }
+    if (!m->opt_head_inited ||
+        !(m->head_lr_scale >= 0.05f && m->head_lr_scale <= 1.0f)) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    m->opt.lr = body_lr;
+    m->opt_head.lr = body_lr * m->head_lr_scale;
+    if (jt_optim8_step(&m->opt, m->P, m->G, m->opt.n) != JT_OK) {
+        return JT_ERR_INVAL;
+    }
+    return jt_optim8_step(&m->opt_head, m->P + m->opt.n, m->G + m->opt.n,
+                          m->opt_head.n);
+}
+
 int main(int argc, char **argv) {
     int rc_all = 1;
     const char *data_path = "data/tinystories_head16M.txt";
@@ -2145,6 +2197,8 @@ int main(int argc, char **argv) {
     long max_val_pairs = 20000; /* 0=全val */
     int use_fact = 0; /* --factorized-head: Stage 1の2段head (既定0=密head) */
     int head_k = 0;   /* --head-k K (0=auto d/4)。fact時のみ有効 */
+    int head_init_vm = 0; /* --head-init vmで1 (既定0=standard)。fact専用 */
+    float head_lr_scale = 1.0f; /* --head-lr-scale (既定1.0=共通lr) */
     uint32_t **seqs = NULL;
     size_t *lens = NULL;
     long n_stories = 0;
@@ -2263,6 +2317,21 @@ int main(int argc, char **argv) {
             use_fact = 1;
         } else if (strcmp(argv[i], "--head-k") == 0 && i + 1 < argc) {
             head_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--head-init") == 0 && i + 1 < argc) {
+            const char *mv = argv[++i];
+            if (strcmp(mv, "standard") == 0) {
+                head_init_vm = 0;
+            } else if (strcmp(mv, "vm") == 0) {
+                head_init_vm = 1;
+            } else {
+                fprintf(stderr,
+                        "train_tinystories: --head-init must be "
+                        "standard|vm\n");
+                errno = EINVAL;
+                goto cleanup;
+            }
+        } else if (strcmp(argv[i], "--head-lr-scale") == 0 && i + 1 < argc) {
+            head_lr_scale = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--no-sched") == 0) {
             no_sched = 1;
         } else if (strcmp(argv[i], "-h") == 0 ||
@@ -2298,6 +2367,27 @@ int main(int argc, char **argv) {
     if (head_k != 0 && !use_fact) {
         fprintf(stderr,
                 "train_tinystories: --head-k requires --factorized-head\n");
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (head_init_vm && !use_fact) {
+        fprintf(stderr,
+                "train_tinystories: --head-init vm requires "
+                "--factorized-head\n");
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (!isfinite((double)head_lr_scale) || head_lr_scale < 0.05f ||
+        head_lr_scale > 1.0f) {
+        fprintf(stderr,
+                "train_tinystories: --head-lr-scale must be in [0.05, 1.0]\n");
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (head_lr_scale != 1.0f && !use_fact) {
+        fprintf(stderr,
+                "train_tinystories: --head-lr-scale != 1 requires "
+                "--factorized-head\n");
         errno = EINVAL;
         goto cleanup;
     }
@@ -2501,6 +2591,30 @@ int main(int argc, char **argv) {
         size_t p = 0;
         size_t emb_n = (size_t)vocab * (size_t)d;
         uint64_t key = 0x1234ULL;
+        /* Stage 1 (b) variance-matched init: 密head出力分散 d*V0 に対し
+           factorizedは k*d*V1*V2 (V0=a0^2/3, a0=0.125)。standardは
+           V1=V2=V0で出力が1/(k*V0)倍 (d=64,k=16で約1/12) と過小になり、
+           Adam正規化で相対stepが過大→積フィードバックで発散した (診断:
+           gnorm 28→7000超・train_ce 15超・valは100 stepで+2.5%から200 stepで
+           +87%へ発散)。vmはW1/W2のboundを共に (d/k)^1/4倍 (d/k=4で約1.414,
+           a=0.1768) し、積分散をd/k倍 (=4倍) だけ持ち上げる。密完全一致
+           (12倍: a1=0.1645/a2=0.3290のfan-in比保持形) も試したが、Adamの
+           bounded-step下では大初期値が相対進捗を遅らせ200 step val +18.6%と
+           悪化したため、安定優先の部分補償である本式を採用する。k/d比のみの
+           関数で設計規模 (1024→256, d/k=4) にそのまま外挿できる。 */
+        double sc_w1 = 0.125;
+        double sc_w2 = 0.125;
+        if (use_fact && head_init_vm) {
+            double dk = (double)d / (double)head_k;
+            double f = pow(dk, 0.25);
+            if (!isfinite(f) || !(f > 0.0)) {
+                fprintf(stderr, "train_tinystories: vm factor failed\n");
+                errno = EINVAL;
+                goto cleanup;
+            }
+            sc_w1 = 0.125 * f;
+            sc_w2 = 0.125 * f;
+        }
         for (p = 0; p < n; p++) {
             double u = (double)(ts_hash64(key * 2ULL + 0x9e3779b9ULL +
                                          (uint64_t)p) >>
@@ -2513,6 +2627,18 @@ int main(int argc, char **argv) {
                 size_t rel = (p - emb_n) % m.lt.layer_stride;
                 if (rel < (size_t)TS_E * (size_t)d) {
                     sc = 0.05;
+                } else {
+                    sc = 0.125;
+                }
+            } else if (use_fact) {
+                /* factorized head域: [off_hw1,off_hb1)=W1, [off_hb1,off_hw2)
+                   =b1(後段で0埋め), [off_hw2,off_head_bo)=W2, 以降=bo(0埋め) */
+                if (p < m.lt.off_hb1) {
+                    sc = sc_w1;
+                } else if (p < m.lt.off_hw2) {
+                    sc = 0.125;
+                } else if (p < m.lt.off_head_bo) {
+                    sc = sc_w2;
                 } else {
                     sc = 0.125;
                 }
@@ -2536,19 +2662,50 @@ int main(int argc, char **argv) {
         jt_optim8_cfg_default(&cfg);
         cfg.lr = lr;
         cfg.eps = 1e-4f;
-        if (jt_optim8_init(&m.opt, m.lt.n_total, &cfg) != JT_OK) {
-            fprintf(stderr, "train_tinystories: optim init failed\n");
-            goto cleanup;
+        m.use_head_opt =
+            (use_fact && head_lr_scale != 1.0f) ? 1 : 0;
+        m.head_lr_scale = head_lr_scale;
+        m.opt_head_inited = 0;
+        if (!m.use_head_opt) {
+            if (jt_optim8_init(&m.opt, m.lt.n_total, &cfg) != JT_OK) {
+                fprintf(stderr, "train_tinystories: optim init failed\n");
+                goto cleanup;
+            }
+            m.opt_inited = 1;
+        } else {
+            /* Stage 1 (c) head専用lr: body=[0,off_hw1)をopt、head以下
+               (W1/b1/W2/bo)をopt_headが担当。更新式は不変でlrのみ分離。
+               head lr = lr*scale (1/3〜1/10範囲内、行列では0.25使用)。 */
+            jt_optim8_cfg_t hcfg = cfg;
+            size_t n_body = m.lt.off_hw1;
+            size_t n_head = m.lt.n_total - n_body;
+            hcfg.lr = lr * head_lr_scale;
+            if (n_body == 0 || n_head == 0) {
+                fprintf(stderr, "train_tinystories: head split failed\n");
+                errno = EINVAL;
+                goto cleanup;
+            }
+            if (jt_optim8_init(&m.opt, n_body, &cfg) != JT_OK) {
+                fprintf(stderr, "train_tinystories: optim init failed\n");
+                goto cleanup;
+            }
+            m.opt_inited = 1;
+            if (jt_optim8_init(&m.opt_head, n_head, &hcfg) != JT_OK) {
+                fprintf(stderr, "train_tinystories: head optim init failed\n");
+                goto cleanup;
+            }
+            m.opt_head_inited = 1;
         }
-        m.opt_inited = 1;
     }
     printf("train_ts: layers=%d d=%d E=%d K=%d S=%d H=%d V=%d "
            "params=%zu lr=%.5f batch=%ld seq=%ld T=%ld patience=%ld "
-           "moe_batch=%d cap=%.2f aux_w=%.4f head_fact=%d head_k=%d\n",
+           "moe_batch=%d cap=%.2f aux_w=%.4f head_fact=%d head_k=%d "
+           "head_init=%s head_lr_scale=%.2f\n",
            n_layers, d, TS_E, TS_K, TS_S, TS_H, vocab, m.lt.n_total, lr,
            batch, g_ts_seq, g_ts_seq * batch, patience, g_ts_moe_batch,
            (double)TS_CAP_FACTOR, (double)g_ts_aux_w, use_fact,
-           use_fact ? head_k : 0);
+           use_fact ? head_k : 0, head_init_vm ? "vm" : "standard",
+           (double)head_lr_scale);
     /* 常駐見積り (d=64維持。V=48588でemb/head各64*48588*4B≈12.4MB。許容内) */
     {
         size_t n = m.lt.n_total;
@@ -2855,8 +3012,7 @@ int main(int argc, char **argv) {
             }
             /* S0b-3: lrスケジュール適用 (既定ON。--no-sched時は固定)。
            opt.lrを更新するのみで更新式は不変。proxyと同一式。 */
-        m.opt.lr = no_sched ? lr : ts_sched_lr(step, max_steps, lr);
-        if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
+        if (ts_optim_step(&m, step, max_steps, lr, no_sched) != JT_OK) {
                 fprintf(stderr,
                         "train_tinystories: optim failed at step=%ld\n",
                         step);
@@ -3043,8 +3199,7 @@ int main(int argc, char **argv) {
         }
         /* S0b-3: lrスケジュール適用 (既定ON。--no-sched時は固定)。
            opt.lrを更新するのみで更新式は不変。proxyと同一式。 */
-        m.opt.lr = no_sched ? lr : ts_sched_lr(step, max_steps, lr);
-        if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
+        if (ts_optim_step(&m, step, max_steps, lr, no_sched) != JT_OK) {
             fprintf(stderr, "train_tinystories: optim failed at step=%ld\n",
                     step);
             goto cleanup;
@@ -3127,6 +3282,9 @@ cleanup:
     free(vy);
     if (m.opt_inited) {
         jt_optim8_fini(&m.opt);
+    }
+    if (m.opt_head_inited) {
+        jt_optim8_fini(&m.opt_head);
     }
     free(m.P);
     free(m.G);
