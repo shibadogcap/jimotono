@@ -1381,7 +1381,7 @@ int main(int argc, char **argv) {
                    last_val_ce * tok_per_byte, best_val_ce, best_val_step,
                    ts_now_sec() - t0);
             fflush(stdout);
-            if (n_prev >= 3 && prev_vals[0] < prev_vals[1] &&
+            if (patience > 0 && n_prev >= 3 && prev_vals[0] < prev_vals[1] &&
                 prev_vals[1] < prev_vals[2]) {
                 stopped_early = 1;
                 stop_reason = "val-rise-x3";
