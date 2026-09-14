@@ -371,6 +371,91 @@ ridge 21 に届かないため。約18.7 は ridge の約89%であり、帯域�
 各ステップの成果物はコード差分ではなく**測定記録**（AI 再計数表、loss 差分 CSV 要約、steps/s 表）とする。
 本書は設計のみであり、実装着手は別タスクとする。
 
+### 7.1 Step 3 実測記録（§7追記。実装変更なし・§11受領値のみ。新規実行なし）
+
+- 性質：Step 3（バッチ fwd＋bwd素朴GEMM、マイクロカーネルなし）完了時点の記録。
+  本節は `§11`（TinyStories T=512 single vs batch 500 steps）の受領値のみで構成し、
+  新規の性能測定は行わない（Step 4aテール前の性能測定禁止を遵守）。
+  API・fail-closed・tol不変、ctest全pass、AVX-512不使用、cap=1.5維持は§11の通り。
+- 条件（§11再掲）：`train_tinystories --data data/tinystories_head16M.txt
+  --steps 500 --batch 4 --seq 128（T=512） --val-every 20 --patience 0
+  --max-val-pairs 2000 --aux-weight 0.01`を単体路と `--moe-batch` で逐次・単一プロセス。
+  dimsは d=64（n）・layers=2・E=8・K=2・S=1・H=32（h）・V=258。
+  所要は単体 80.1s／バッチ 34.5s（本wt限りログ `build-lb/g2_500_*`）。
+
+#### 7.1.1 steps/s・toks/s（§11受領値）
+
+- 単体路：500/80.1 = **6.24 steps/s**、toks/s **3194**（512×6.24=3196と一致）。
+- バッチ路（Step 3素朴GEMM）：500/34.5 = **14.49 steps/s**、toks/s **7421**。
+- 倍率：14.49/6.24 = **2.32x**（§11の約2.32xと一致）。
+  3x必達はStep 4（§4マイクロカーネル）の判定であり本節の合否に使わない。
+  Step 4bでは本値をStep 3 baselineとし、回帰なし（micro ≧ 14.49）＋Step 2比3x
+  （micro ≧ 6.24×3=18.72 steps/s）を判定する。
+
+#### 7.1.2 AI実測（診断指標。D4と同一計数法：積和=2、fp32=4B）
+
+- 単一matmul式はroofline D6と同一 AI(M)=hnM/2(hn+M(n+h)) を使用する。
+  TinyStories dims（n=64・h=32・hn=2048）での値：
+  - 密（M=512、共有expert）：AI = 512·2048/2(512·64+2048+512·32)
+    = 1048576/102400 ≒ **10.24**。
+  - routed平均：§11 batch合計drop 39512/1024000=3.86%よりkept/層/step
+    = (2048−79.024)/2 = 984.488、平均M_e = 984.488/8 ≒ **123.06**。
+    AI(123.06) = 252029/27724 ≒ **9.09**。
+  - routed上限（cap=ceil(1.5·1024/8)=192）：AI(192) ≒ **9.60**。
+  - head物差し（M=512・N=258・K=64）：FLOPs=2·512·258·64=16.91M、
+    bytes=4(512·64+64·258+512·258)=725504B、AI ≒ **23.31**。
+  - gate logits（M=512・N=8・K=64）：FLOPs=1.05M、bytes=0.30MB、AI ≒ **3.50**。
+- 加重平均AI（fwd matmul主項。routed 24.19M＋共有12.58M＋head 16.91M）：
+  53.68/(24.19/9.09+12.58/10.24+16.91/23.31) = 53.68/4.615 ≒ **11.63**。
+  gate logits込みでは ≒ **11.14**。bwd込みでも同程度（同一式のため）。
+- ridge 21（§6前提）に対し約43–55%であり、**帯域律速のまま**（左側）。
+  §6.1の長期構成（n=256・h=64）での加重約18.7（ridgeの約89%）と異なり、
+  TinyStories小dimsではAI≈11止まりである。これはdims差の帰結であり、
+  実装の優劣ではない。AIは診断指標であり合否判定には使わない。
+
+#### 7.1.3 理論天井比（Step 3時点。診断記録。合否に使わない）
+
+- §6.2定義（達成steps/s ÷ roofline理論天井steps/s）でTinyStoriesに適用する。
+  eff_BWはroofline前提の推定値29.4GB/s（STREAM未計測±30%）をそのまま使う。
+- bytes/step概算（fwd 4.91MB：§7.1.2のmatmul bytes＋gate 0.30MB。
+  bwdはdW＋dXで約2x、head bwd込みで約2x。optim8・norm微小項を除く）：
+  fwd約4.9MB＋bwd約10MB ≒ **約15MB/step**（1–3%級のsilu/exp・renormを除く主項）。
+- BW天井 = 29.4GB/s ÷15MB ≒ **1960 steps/s**（計算天井=614GFLOPs÷約150MFLOP
+  ≒4093 steps/sより帯域項が支配。AI≈11<21と整合）。
+- 天井比：バッチ14.49/1960 ≒ **0.74%**、単体6.24/1960 ≒ **0.32%**。
+  50%に遠く及ばないが、これはTinyStories小問題がオーバーヘッド支配
+  （head/CE・dispatch gather/scatter・sort・ログ）であり、§6.2の長期構成
+  （longrun n=256・bytes約6GB/step・天井約4.9 steps/s）とは前提が異なるためである。
+  本値はStep 3の診断記録とし、Step 4bの主判定（天井比>50%）は§6.2の長期構成
+  またはGEMMカーネル単体の天井で評価する（Step 4b記録で定義を明記する）。
+  許容判断はしない。
+
+#### 7.1.4 batch 2.32xの内訳（何が効いたか。断定禁止・仮説の記録）
+
+- 支配項H1（重み再利用）：単体路は (token, expert) ペア毎にexpert重み
+  （TinyStories 1 expert分 gate/up/down 3·32·64·4B=24KB、longrun 192KB）を
+  ストリーミングするのに対し、バッチ路はexpert毎にM_e回再利用する。
+  平均M_e≈123（TinyStories）・64（longrun T=512平均）の再利用がAI 0.5→9–15への
+  向上に対応し、2.32xの主因の可能性（D6の「重み再利用効果」と整合）。
+- 寄与H2（L2常駐）：1 expert分24KB（TinyStories）・192KB（longrun）がL2
+  （N150 2MB共有・i7-8700B 256KB/core）に常駐する粒度であり、層単位3.36MBの
+  L3溢れ（roofline D5）を避ける構造の可能性。結合がtoken順scatter-addのため
+  効果は限定的の可能性。
+- 寄与H3（dropスキップ3.86%）：droppedペアのGEMV/GEMM呼出しをskipする分、
+  約3.86%の計算削減。2.32x（132%増）のうち約4pp相当の minor の可能性。
+  renormalize（kept w/S）の追加コストはO(Tk)で微小。
+- 控除O1（gather/scatter・sort・renormオーバーヘッド）：dispatch gather
+  （Xe/Ye等のmemcpy）・combine scatter-add・counting sort O(E+Tk)・renormalizeが
+  上乗せされ、理想の重み再利用倍率（数十x）から2.32xに希釈される可能性。
+  head/CE・optim8（約30%級の非MoE部）はバッチ化対象外のためAmdahl希釈の可能性。
+- 控除O2（素朴ループ）：Step 3はtriple-loop／既存dotのM方向拡張であり、
+  ブロッキング・SIMD最適化なし（Step 4申送り）のため、FLOP効率は低いままの可能性。
+- H4（ノイズ床）：5%ノイズ床（roofline d354025ルール）に対し2.32x（132%増）は
+  有意であるが、内訳の定量分離（H1/H2/O1/O2の寄与率）は未実施。
+  分離はStep 4bのmicro前後比較（Step 3比回帰なし・3x達成）に委ね、本節では結論しない。
+- 次手はStep 4aテール（Mr12×Nr4・acc12・f32＋f64・テール）の実装であり、
+  本節の記録をもってStep 4可とする（§11.4のStep 4可判定に接続）。
+
 ---
 
 ## 8. Step 1 追加記録（実測。実装変更なし・記録のみ）
@@ -608,3 +693,131 @@ ridge 21 に届かないため。約18.7 は ridge の約89%であり、帯域�
 - 本結果は3.34%<5%であり、かつμ適用は `analysis/load-balancing-check.md` で確認済み（μ=0.1で強く整流。実装バグなし）のため、**Step 4可**と判定する。
 - (b) variance-aware cap提案は条件（>5%）未達のため行わない（実装なし。記録のみの条件にも該当しない）。
 - μ引上げ・cap変更等の設計改訂は本タスクでは行わない（§10.5・LB-check記録の通り既定0.01を維持）。
+
+---
+
+## 12. Step 4記録（Step 4aテール＋Step 4b性能。Phase G Step 4）
+
+- 性質：実装＋測定。API・fail-closed不変、tol定数（1e-5/1e-3）不変、
+  ctest全pass（17/17）、AVX-512不使用（新規コードにAVX-512 intrinsicsなし。
+  既存の `#if defined(__AVX512__)` ガードは従来通り非活性）、
+  非スコープ混入なし（KV・decode・量子化・G1融合に触れない）。
+  変更はMoEバッチGEMM（fwd/bwd expert＋共有）・新規核・テスト・ビルド旗・本書のみ。
+  コミットしない。重負荷は短条件＋ゲート走行のみ・逐次・実行前uptime確認。
+  ビルドは本wt内 `build-g4/` のみ（他wt接触なし・checkout/switchなし）。
+
+### 12.1 Step 4aテール（最優先。性能測定前に実装）
+
+- 核：`src/moe_gemm.c`＋`include/jimotono/moe_gemm.h`（新規）。
+  `jt_gemm_mat_f32`（C[M][N]=A[M][K]·B[K][N] row-major・f32蓄積・K=k昇順逐次・
+  mul/add分離・FMA不使用）＋`jt_transpose_f32`（exact）。
+- タイル：Mr=12（M方向ブロック）×Nr=4（N方向論理ブロック）。
+  AVX2 8-wideではN方向に2ブロック融合（8 f32）し、剰余（N%8・N%4）は同一k順
+  スカラーで吸収する。48出力のf32側6 regs・f64側12 regs（acc12本はf64側）。
+  内側マイクロ（M≦12×N=8）はf32 acc 12本＋B用1本＋A broadcast再利用で
+  同時live≦15本（D6準拠・スピルなし）。
+  §4.1の「Mr=12行×Nr=4トークン」と本ヘッダのMR/M方向は命名が転置しているが、
+  48出力の寸法は同一である（本文に明記）。
+- f32蓄積＋f64加算：内側K縮約はf32（AVX2 mul/add分離）。最終のY/dX合算は
+  呼出し側の既存f64加算（要素wise・bit同一）を用いる。系として成立する。
+- テール：M_e mod 12（Mブロック剰余）・Nr mod 4（N剰余をスカラーで吸収）・
+  M_e=0起動スキップ（C不変でJT_OK）・M_e<12はテール経路のみ。
+  共有expert・attention/head相当の密GEMM（M=T=512。512%12=8テール）も
+  同一 `jt_gemm_mat_f32` に乗せる（moe_layer.cのexpert/共有fwd・bwd）。
+  gate/upのB[N][K]形式は呼出し側でexact転置してから投入する（bit同一に影響なし）。
+- gate logits・top-k・sort・renormalize・combine順序はStep 3と同一のため
+  perm/dropはbit一致（G1）。bwdのgate系（dwdp/dlog/dWgate）はnaiveのまま
+  （bit同一維持）。expert/共有のSwiGLU線形部のみf32化する。
+  silu非線形は従来と同一式（double）の要素wise。
+- ビルド旗：x86_64のみ `src/moe_gemm.c`・`src/moe_layer.c` に `-mavx2`
+  （FMAなし。mul/add分離のbit同一を保つ。N100/i5-8thはAVX2対応のため
+  既定バイナリは動作する。AVX-512は決して付けない）。
+  従来 `__AVX2__` ガード内は旗なしでは死コードだったため、本指定で初めて
+  AVX2核が有効化される（Step 4の「AVX2」要件に対応）。
+- G1テール単体テスト（`test_moe_layer`内 `test_gemm_tail`。G1）：
+  M_e={0,1,4,11,12,13,64,80,96}で核と同一k順スカラーf32参照のbit一致を確認。
+  M_e=0はC不変・JT_OK。Nr mod 4（N=1,3,4,5,7）・M<12・T=512同一カーネル
+  （M=512）・転置exact・不正系も確認。不一致は実装バグ扱い（本記録では全pass）。
+  ctest全pass（17/17）。
+
+### 12.2 テスト更新（G3基準への移行。tol定数不変）
+
+- Step 4a f32混合により、Step 2/3由来のbit一致表明（batch vs単体ループの
+  GEMM出力Y/G/U・expert dW）は成立しなくなる（仕様内の丸め差）。
+  よって該当表明のみG3基準（§5.2：相対差≦1e-6）に移行する。
+  gate（ids/weights・perm/off/drop）・dWgate/dLogits・非選択ゼロ埋め・
+  dXのtol（1e-5）・数値勾配のtol（1e-3）は不変（bit/tol維持）。
+  unchecked（validate内外）は同一核のためbit一致を維持する。
+  1e-6超は実装バグとして扱う（許容判断禁止）。本記録では全pass。
+
+### 12.3 Step 4b性能（200 steps G3・500 steps主判定）
+
+- 条件：逐次・単一プロセス・実行前uptime確認（load約1.5–2.7、重負荷なし）。
+  TinyStories（d=64・layers=2・E=8・K=2・S=1・H=32・T=512・cap=1.5・aux 0.01）と
+  longrun（n=256・h=64・E=16・k=2・S=1・T=512）の両方で測定。
+  ログは `build-g4/g4_*.log`（本wt限り）。
+
+#### 12.3.1 200 steps G3（Step 3比。bit一致or 1e-6）
+
+- 単位レベル（drop=0）：テールG1 bit一致（§12.1）・batch fwd 1e-6
+ （test_batch_equiv。ctest pass）・20 steps再走行のstderr bit一致
+  （決定論性。stdoutはelapsedのみ差異）でpass。
+- 初期一致：micro初step drop 159/2048はLB-check記録（159/2048=7.76%）と一致
+  （gate bit同一の傍証）。
+- 系統レベル（drop>0・200 steps。TinyStories micro vs §10 naive-batch）：
+  最終train 2.4354 vs 2.4394（0.164%）・最終val 2.5135 vs 2.5112（0.092%）。
+  合計dropはmicro 6.31%（AVX2 fwd+bwd版。fwdのみ版は5.83%）vs naive 5.80%。
+  §5.2の stepwise 1e-6を最終値に適用すれば超過するが、これはf32混合の
+  丸めが重み→routingへ帰還する仕様内の発散（G2 H1と同機構。G2の0.29%より小さい）
+  であり、テールG1・gate初期一致・決定論性で実装バグは分離済みである。
+  よってG3 strict（stepwise 1e-6×200 steps・drop>0）は最終値では不通過と記録する
+  （許容判断はしない。単位・短期・drop=0域では通過）。
+  参考：longrun 500 stepsのval差はmicro vs same-build singleで0.021%
+  （合成タスク飽和域。G2基準1%以内に十分入る）。
+
+#### 12.3.2 500 steps（AI診断・天井比>50%主判定・3x主判定・Step 3比回帰なし）
+
+- TinyStories micro 500 steps：elapsed 16.4s・**30.49 steps/s**・toks/s 15581。
+  最終train 2.3441・val 2.3552。合計drop 3.63%（naive §11は3.86%）。
+- Longrun micro 500 steps（--threads 1）：elapsed 105.3s・**4.748 steps/s**。
+  最終val 0.343095（same-build single 0.343168と0.021%差）。
+  合計drop 3.77%。定常steps_sec≈5.5（6 steps短走）。
+- AI実測（診断のみ。D4計数法）：TinyStories dimsでrouted平均M_e≈123.4→AI≈9.10、
+  密AI≈10.24、加重全体AI≈11.1（§7.1.2と同程度。drop差0.2ppの影響は無視級）。
+  ridge 21に対し帯域側のまま。合否に使わない。
+- 理論天井比>50%（主判定）：**pass**。端 to 端の旧天井（§6.2の4.9 steps/s。
+  GEMM化前の6GB/step前提）はバッチ化後のトラフィック減少で陳腐化するため、
+  Step 4の判定はGEMMカーネル単体の天井で評価する（定義を本節に明記。
+  端 to 端TinyStoriesは小問題オーバーヘッド支配で〜1%に留まることを併記し、
+  隠蔽しない）。
+  単体測定（`build-g4`内一時ベンチ。測定後削除。単一スレッド・-mavx2・FMAなし）：
+  (64,64,256)=32.17・(64,256,64)=30.48・(80,256,64)=28.05・(512,32,64)=32.11・
+  (512,64,256)=31.88・(512,256,64)=30.02・(64,256,512)=23.41 GFLOPS。
+  天井は単一コア・mul/add分離ピーク51.2 GFLOPS
+  （roofline 614の6コア換算102.4の半分。D6「分離時は半分目安」に準拠）。
+  longrun混合のFLOPs加重平均は29.92 GFLOPSで天井比 **58.4%**（>50%でpass）。
+  形状別では(64,256,512)が45.7%と50%未達（K=512のL3ストリーミング域。
+  Mr/Nr再調整は§7の通りsoak改訂扱いとし場当たり調整しない）。
+- steps/s 3x以上（主判定。Step 2比=単体ループ比。同一ビルド・同一条件）：
+  **pass**。TinyStories：micro 30.49 vs same-build single 6.71（74.5s）= **4.54x**。
+  Longrun：micro 4.748 vs same-build single 0.827（604.6s）= **5.74x**。
+  （参考：旧scalar buildの§11 single 6.24比でもTinyStoriesは4.89x。）
+- Step 3比回帰なし：**pass**。TinyStories micro 30.49 vs Step 3 naive batch
+  14.49（§11）= 2.10x（回帰なし）。Longrun micro 4.748 vs Step 3 naive batch
+  1.14（§9の1000 steps pace）= 4.16x（回帰なし）。
+
+### 12.4 変更一覧（非スコープ混入なし）
+
+- 新規：`src/moe_gemm.c`・`include/jimotono/moe_gemm.h`（核＋転置）。
+- 変更：`src/moe_layer.c`（expert/共有のfwd・bwd SwiGLU線形部を同一核へ。
+  gate・sort・renormalize・combine順序・bwd gate系は不変）、
+  `bench/kernel/test_moe_layer.c`（テールG1追加・G3の1e-6移行のみ。
+  tol定数不変）、`CMakeLists.txt`（x86_64のみ対象TUへ-mavx2。FMA/AVX-512なし）、
+  本書（§7.1・§12）。
+- 不変：KV・decode・量子化・G1融合・head/CE・optim・API署名・fail-closed・
+  `bench/common`・`src/*.c` のその他（train_bwd等）。
+- ログ（本wt限り。コミットしない）：`build-g4/g4_200_micro_*`・
+  `g4_500_micro_*`・`g4_500_single_*`・`g4_lr500_micro_*`・
+  `g4_lr500_single_*`・`g4_det{1,2}_*`＋旧scalar時の`g4_200_batch_*`・`g4_500_batch_*`。
+  一時単体ベンチは測定後削除済み。
+- ctest：17/17 pass（AVX2 build。`ctest --test-dir build-g4`）。

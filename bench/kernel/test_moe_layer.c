@@ -12,6 +12,7 @@
 
 #include "jimotono/common.h"
 #include "jimotono/moe_layer.h"
+#include "jimotono/moe_gemm.h"
 #include "jimotono/routing.h"
 #include "jimotono/train_bwd.h"
 
@@ -755,7 +756,11 @@ static void test_batch_sort_invalid(void) {
           "batch sort mutated on error");
 }
 
-// batch vs 単体ループの等価性 (drop なし → bit 一致)。
+// batch vs 単体ループの等価性（Step 4a改訂）。
+// gate（ids/weights・perm/off/drop）はmicro化の影響を受けないためbit一致（G1）。
+// expert GEMM出力（Y/Gsel/Usel/Ysel/Gs/Us）はf32蓄積のためStep 3（f64ドット）と
+// bit一致せず、G3基準（§5.2：相対差≦1e-6）で評価する。tol定数（1e-5/1e-3）は不変。
+// 不一致が1e-6超なら実装バグとして修正する（許容判断禁止）。
 static void test_batch_equiv(void) {
     const int n = 4;
     const int h = 2;
@@ -823,23 +828,33 @@ static void test_batch_equiv(void) {
     if (dropped != 0) {
         return;
     }
-    CHECK(memcmp(Ys, Yb, sizeof(Ys)) == 0, "batch equiv Y bits");
     CHECK(memcmp(ids_s, ids_b, sizeof(ids_s)) == 0,
           "batch equiv ids bits");
     CHECK(memcmp(w_s, w_b, sizeof(w_s)) == 0,
           "batch equiv weights bits");
-    CHECK(memcmp(Gs_s, Gs_b, sizeof(Gs_s)) == 0,
-          "batch equiv Gsel bits");
-    CHECK(memcmp(Us_s, Us_b, sizeof(Us_s)) == 0,
-          "batch equiv Usel bits");
-    CHECK(memcmp(Ysel_s, Ysel_b, sizeof(Ysel_s)) == 0,
-          "batch equiv Ysel bits");
-    CHECK(memcmp(sGs_s, sGs_b, sizeof(sGs_s)) == 0,
-          "batch equiv Gs bits");
-    CHECK(memcmp(sUs_s, sUs_b, sizeof(sUs_s)) == 0,
-          "batch equiv Us bits");
+    // G3（Step 4a f32混合）：GEMM出力は相対差1e-6で評価する。
+    for (int i = 0; i < T * n; i++) {
+        CHECK(fwd_close(Yb[i], (double)Ys[i], 1e-6),
+              "batch equiv Y[%d] b=%f s=%f", i, Yb[i], Ys[i]);
+    }
+    for (int i = 0; i < T * k * h; i++) {
+        CHECK(fwd_close(Gs_b[i], (double)Gs_s[i], 1e-6),
+              "batch equiv Gsel[%d]", i);
+        CHECK(fwd_close(Us_b[i], (double)Us_s[i], 1e-6),
+              "batch equiv Usel[%d]", i);
+    }
+    for (int i = 0; i < T * k * n; i++) {
+        CHECK(fwd_close(Ysel_b[i], (double)Ysel_s[i], 1e-6),
+              "batch equiv Ysel[%d]", i);
+    }
+    for (int i = 0; i < T * S * h; i++) {
+        CHECK(fwd_close(sGs_b[i], (double)sGs_s[i], 1e-6),
+              "batch equiv Gs[%d]", i);
+        CHECK(fwd_close(sUs_b[i], (double)sUs_s[i], 1e-6),
+              "batch equiv Us[%d]", i);
+    }
     CHECK(off[E] == kept, "batch equiv off[E]!=kept");
-    // unchecked 版も bit 一致。
+    // unchecked 版は checked batch と同一核のため bit 一致。
     {
         float Yu[24];
         size_t idsu[12];
@@ -852,9 +867,9 @@ static void test_batch_equiv(void) {
                                         NULL);
         CHECK(rc == JT_OK, "batch equiv unchecked rc=%d", rc);
         if (rc == JT_OK) {
-            CHECK(memcmp(Ys, Yu, sizeof(Ys)) == 0,
+            CHECK(memcmp(Yb, Yu, sizeof(Yb)) == 0,
                   "batch equiv unchecked Y bits");
-            CHECK(memcmp(ids_s, idsu, sizeof(ids_s)) == 0,
+            CHECK(memcmp(ids_b, idsu, sizeof(ids_b)) == 0,
                   "batch equiv unchecked ids bits");
         }
     }
@@ -956,9 +971,12 @@ static void test_batch_drop_fwd(void) {
                   p, got, want);
         }
     }
-    // kept トークン (t0-4) は単体版と bit 一致 (renormalize なしのため)。
-    CHECK(memcmp(Ys, Yb, (size_t)5 * (size_t)n * sizeof(float)) == 0,
-          "batch drop kept rows bits");
+    // kept トークン (t0-4) は単体版とG3 1e-6で一致 (Step 4a f32混合のため
+    // bit一致しない。renormalizeなし区間のため差はf32/f64丸めのみ）。
+    for (int i = 0; i < 5 * n; i++) {
+        CHECK(fwd_close(Yb[i], (double)Ys[i], 1e-6),
+              "batch drop kept rows[%d] b=%f s=%f", i, Yb[i], Ys[i]);
+    }
     // 部分 drop トークン (t5-7): dropped 側寄与 0・kept は renormalize。
     // 期待値 = kept 側の (w/S)*Ysel (単体版 cache 値で再結合)。
     for (int t = 5; t < T; t++) {
@@ -1358,12 +1376,24 @@ static void test_bwd_batch_equiv(void) {
         }
         CHECK(memcmp(dWr, dWb, sizeof(dWr)) == 0, "bwd equiv dWgate bits");
         CHECK(memcmp(dlr, dlb, sizeof(dlr)) == 0, "bwd equiv dLogits bits");
-        CHECK(memcmp(dWgr, dWgb, sizeof(dWgr)) == 0, "bwd equiv dWg bits");
-        CHECK(memcmp(dWur, dWub, sizeof(dWur)) == 0, "bwd equiv dWu bits");
-        CHECK(memcmp(dWdr, dWdb, sizeof(dWdr)) == 0, "bwd equiv dWd bits");
-        CHECK(memcmp(sgr, sgb, sizeof(sgr)) == 0, "bwd equiv dWg_s bits");
-        CHECK(memcmp(sur, sub, sizeof(sur)) == 0, "bwd equiv dWu_s bits");
-        CHECK(memcmp(sdr, sdb, sizeof(sdr)) == 0, "bwd equiv dWd_s bits");
+        // G3（Step 4a f32混合）：expert dWは相対差1e-6で評価する。
+        // gate系（dWgate/dLogits）はnaiveのままのためbit一致を維持する。
+        for (int i = 0; i < E * h * n; i++) {
+            CHECK(fwd_close(dWgb[i], (double)dWgr[i], 1e-6),
+                  "bwd equiv dWg[%d]", i);
+            CHECK(fwd_close(dWub[i], (double)dWur[i], 1e-6),
+                  "bwd equiv dWu[%d]", i);
+            CHECK(fwd_close(dWdb[i], (double)dWdr[i], 1e-6),
+                  "bwd equiv dWd[%d]", i);
+        }
+        for (int i = 0; i < S * h * n; i++) {
+            CHECK(fwd_close(sgb[i], (double)sgr[i], 1e-6),
+                  "bwd equiv dWg_s[%d]", i);
+            CHECK(fwd_close(sub[i], (double)sur[i], 1e-6),
+                  "bwd equiv dWu_s[%d]", i);
+            CHECK(fwd_close(sdb[i], (double)sdr[i], 1e-6),
+                  "bwd equiv dWd_s[%d]", i);
+        }
         // dXはexpert昇順scatterのためtol内一致 (既存tol不変)。
         for (int i = 0; i < T * n; i++) {
             double d = fabs((double)dXb[i] - (double)dXr[i]);
@@ -1527,6 +1557,134 @@ static void test_bwd_batch_invalid(void) {
     }
 }
 
+// ---- Phase G Step 4a: microkernelテール単体テスト（G1 bit一致） ----
+// Mr=12×Nr=4・acc12・f32蓄積。M_e={0,1,4,11,12,13,64,80,96}で
+// jt_gemm_mat_f32 とスカラーf32三重ループ（同一k順）のbit一致を確認する。
+// 一致しなければ実装バグ（G1）。Nr mod 4（N tail）・M_e=0スキップ・M_e<12も含む。
+// 共有expert・attentionのT=512も同一カーネル（M=512ケースで確認）。
+static float g_gemm_val(int a, int b, int salt) {
+    int v = (a * 31 + b * 17 + salt * 13) % 11;
+    return (float)(v - 5) / 5.0f;
+}
+
+static void test_gemm_tail_one(int M, int N, int K) {
+    float *A = NULL;
+    float *B = NULL;
+    float *C = NULL;
+    float *R = NULL;
+    size_t msize = (M > 0) ? ((size_t)M * (size_t)K) : 1;
+    size_t nsize = (size_t)K * (size_t)N;
+    int rc;
+    if (M == 0) {
+        // M_e=0は起動スキップ（C不変でJT_OK）。
+        float sentinel[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                             5.0f, 6.0f, 7.0f, 8.0f};
+        float b0[8] = {0.5f, 0.5f, 0.5f, 0.5f,
+                       0.5f, 0.5f, 0.5f, 0.5f};
+        float c0[8];
+        memcpy(c0, sentinel, sizeof(c0));
+        rc = jt_gemm_mat_f32(b0, b0, c0, 0, 2, 4);
+        CHECK(rc == JT_OK, "gemm tail M=0 rc=%d", rc);
+        CHECK(memcmp(c0, sentinel, sizeof(c0)) == 0,
+              "gemm tail M=0 mutated");
+        return;
+    }
+    A = (float *)malloc(msize * sizeof(float));
+    B = (float *)malloc(nsize * sizeof(float));
+    C = (float *)malloc((size_t)M * (size_t)N * sizeof(float));
+    R = (float *)malloc((size_t)M * (size_t)N * sizeof(float));
+    CHECK(A != NULL && B != NULL && C != NULL && R != NULL,
+          "gemm tail M=%d OOM", M);
+    if (A == NULL || B == NULL || C == NULL || R == NULL) {
+        free(A);
+        free(B);
+        free(C);
+        free(R);
+        return;
+    }
+    for (size_t i = 0; i < msize; i++) {
+        A[i] = g_gemm_val((int)(i / (size_t)K), (int)(i % (size_t)K), 91);
+    }
+    for (size_t i = 0; i < nsize; i++) {
+        B[i] = g_gemm_val((int)(i / (size_t)N), (int)(i % (size_t)N), 92);
+    }
+    for (int i = 0; i < M * N; i++) {
+        C[i] = 99.0f;
+        R[i] = 99.0f;
+    }
+    rc = jt_gemm_mat_f32(A, B, C, M, N, K);
+    CHECK(rc == JT_OK, "gemm tail M=%d N=%d K=%d rc=%d", M, N, K, rc);
+    if (rc != JT_OK) {
+        free(A);
+        free(B);
+        free(C);
+        free(R);
+        return;
+    }
+    // 参照：同一k順スカラーf32（AVX2核とbit一致するはず）。
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += A[(size_t)m * (size_t)K + (size_t)k] *
+                       B[(size_t)k * (size_t)N + (size_t)n];
+            }
+            R[(size_t)m * (size_t)N + (size_t)n] = acc;
+        }
+    }
+    CHECK(memcmp(C, R, (size_t)M * (size_t)N * sizeof(float)) == 0,
+          "gemm tail M=%d N=%d K=%d bits", M, N, K);
+    free(A);
+    free(B);
+    free(C);
+    free(R);
+}
+
+static void test_gemm_tail(void) {
+    // M_e sweep（タスク指定値）。N/Kは軽量代表（実 dims n=64/h=32 とは別に
+    // テール境界（mod 12・mod 4/8）を踏む値を選ぶ）。
+    static const int kMs[] = {0, 1, 4, 11, 12, 13, 64, 80, 96};
+    size_t i;
+    for (i = 0; i < sizeof(kMs) / sizeof(kMs[0]); i++) {
+        test_gemm_tail_one(kMs[i], 20, 32);
+    }
+    // Nr mod 4 tail（N=1,3,4,5,7,8,12）・M<12・M%12≠0も個別に確認。
+    test_gemm_tail_one(5, 1, 16);
+    test_gemm_tail_one(5, 3, 16);
+    test_gemm_tail_one(5, 4, 16);
+    test_gemm_tail_one(11, 7, 16);
+    test_gemm_tail_one(13, 5, 16);
+    // 共有expert・attention相当のT=512同一カーネル（M=512・N=32・K=32軽量）。
+    test_gemm_tail_one(512, 32, 32);
+    // 転置exact（gate/up用 [h][n]→[n][h]）。
+    {
+        float src[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+        float dst[6] = {0, 0, 0, 0, 0, 0};
+        float want[6] = {1.0f, 4.0f, 2.0f, 5.0f, 3.0f, 6.0f};
+        int trc = jt_transpose_f32(src, dst, 2, 3);
+        CHECK(trc == JT_OK, "gemm transpose rc=%d", trc);
+        if (trc == JT_OK) {
+            CHECK(memcmp(dst, want, sizeof(dst)) == 0,
+                  "gemm transpose bits");
+        }
+        CHECK(jt_transpose_f32(NULL, dst, 2, 3) == JT_ERR_INVAL,
+              "gemm transpose NULL");
+        CHECK(jt_transpose_f32(src, dst, 0, 3) == JT_ERR_INVAL,
+              "gemm transpose rows=0");
+    }
+    // 不正系（fail-closed：C不変までは本テストで確認しないがrcのみ確認。
+    // 公開APIのfail-closedは既存テストで担保）。
+    {
+        float a = 1.0f;
+        float c = 7.0f;
+        CHECK(jt_gemm_mat_f32(NULL, &a, &c, 1, 1, 1) == JT_ERR_INVAL,
+              "gemm NULL A");
+        CHECK(jt_gemm_mat_f32(&a, &a, &c, -1, 1, 1) == JT_ERR_INVAL,
+              "gemm M<0");
+        CHECK(c == 7.0f, "gemm mutated on error");
+    }
+}
+
 int main(void) {
     test_fwd_known();
     test_grad();
@@ -1544,6 +1702,7 @@ int main(void) {
     test_bwd_batch_equiv();
     test_bwd_batch_drop();
     test_bwd_batch_invalid();
+    test_gemm_tail();
     if (g_fail != 0) {
         fprintf(stderr, "moe_layer: FAIL\n");
         return 1;
