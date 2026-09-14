@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 
 // MSVC旧版などINFINITY未定義環境へのフォールバック (C11 portable)。
 #ifndef INFINITY
@@ -70,6 +71,106 @@ int jt_routing_topk(const float *restrict logits, size_t n, size_t k,
     float inv = (float)(1.0 / sum);
     for (size_t p = 0; p < k; p++) {
         out_weights[p] *= inv;
+    }
+    return JT_OK;
+}
+
+int jt_routing_balance_loss(const size_t *restrict ids,
+                            const float *restrict weights,
+                            size_t T, size_t k, size_t E,
+                            float *restrict out_aux,
+                            float *restrict out_entropy) {
+    double *sumw = NULL;
+    size_t *cnt = NULL;
+    double aux = 0.0;
+    double ent = 0.0;
+    size_t Tk = 0;
+    if (ids == NULL || weights == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (T == 0 || k == 0 || E == 0 || E > 4096 || k > E) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (out_aux == NULL && out_entropy == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (k > SIZE_MAX / (T > 0 ? T : 1)) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    Tk = T * k;
+    // 範囲・有限検査（出力更新前に完了。fail-closed）。
+    for (size_t q = 0; q < Tk; q++) {
+        float w = weights[q];
+        if (ids[q] >= E) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        if (!(w >= 0.0f) || !(w <= 1.0f) || !isfinite((double)w)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+    }
+    // E<=4096のため固定上限の自動配列（VLA回避）。
+    {
+        static double s_sumw[4096];
+        static size_t s_cnt[4096];
+        double inv = 0.0;
+        if (E > 4096) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        sumw = s_sumw;
+        cnt = s_cnt;
+        for (size_t e = 0; e < E; e++) {
+            sumw[e] = 0.0;
+            cnt[e] = 0;
+        }
+        for (size_t q = 0; q < Tk; q++) {
+            size_t e = ids[q];
+            sumw[e] += (double)weights[q];
+            cnt[e]++;
+        }
+        inv = 1.0 / (double)Tk;
+        for (size_t e = 0; e < E; e++) {
+            double f = (double)cnt[e] * inv;
+            double p = sumw[e] * inv;
+            aux += f * p;
+        }
+        aux *= (double)E;
+        // top-k疎エントロピーのトークン平均（w=0項は0とみなす）。
+        for (size_t t = 0; t < T; t++) {
+            for (size_t p = 0; p < k; p++) {
+                double w = (double)weights[t * k + p];
+                if (w > 0.0) {
+                    ent += -(w * log(w));
+                }
+            }
+        }
+        ent /= (double)T;
+    }
+    if (!isfinite(aux) || !isfinite(ent)) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    if (out_aux != NULL) {
+        float o = (float)aux;
+        if (!isfinite((double)o)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        *out_aux = o;
+    }
+    if (out_entropy != NULL) {
+        float o = (float)ent;
+        if (!isfinite((double)o)) {
+            errno = EINVAL;
+            return JT_ERR_INVAL;
+        }
+        *out_entropy = o;
     }
     return JT_OK;
 }

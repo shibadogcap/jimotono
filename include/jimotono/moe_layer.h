@@ -19,7 +19,12 @@
 //   選択内: softmaxヤコビアン J=diag(w)-w w^T 経由
 //     dL/dlogit_e = w_e * (dL/dw_e - sum_q w_q*dL/dw_q)
 //     dL/dw_p = dot(Y_{id_p}, dY)
-// L_CE・μL_balとの合算は呼び出し側で行うこと (routing.h準拠、TODO)。
+// L_CE・μL_balとの合算は呼び出し側で行うこと (routing.h準拠)。
+// μL_bal は jt_routing_balance_loss() の L_aux に重み μ=0.01既定
+// （調整範囲 0.01〜0.1）を掛けて合算する。f_e は定数扱いのため
+// dL_aux/dw（kept の expert e 宛て。平均損失基準で μ*E*f_e/(T*k)、
+// 合計G基準ではT倍の μ*E*f_e/K）を dL/dw_p に加算してから
+// 上記ヤコビアンを適用する（train_tinystories 実装）。
 //
 // [系列集約]
 // jt_moe_sticky_seq_loss() は jt_routing_sticky_loss() の系列平均ヘルパー。
