@@ -9,11 +9,16 @@
 //   - 対称ゼロ点0 INT8 (q ∈ [-127,127]。-128は非対称のため不使用)。
 //   - per-tensorスケール (行列全体で1 scale) と per-channelスケール
 //     (row-major行単位=出力チャネル単位で1 scale/行) のみ。
-//   - 量子化・逆量子化カーネル (スカラー。SIMD分岐は将来のAVX2-VNNI/
-//     NEON-I8MM予約。AVX-512は決して使用しない)。
+//   - 量子化・逆量子化カーネル (スカラー)。
 //   - int8 GEMM: C[M][N] = sA * sB[n] * Σ_k Aq[M][K]·Bq[K][N] (int32蓄積)。
 //     B側は per-tensor (sB単一) または per-channel (列単位=N単位) に対応。
 //     A側は per-tensor単一scale、または行単位scale (per-token) に対応。
+//   - GEMM整数蓄積部のSIMDバックエンド (Stage 3b-1。同一関数内dispatch。
+//     公開API・検証・tol不変。整数exactのため出力はbit同一):
+//     AVX2 emul (#ifdef __AVX2__) / AVX512-VNNI (Ryzen用。__AVX512F__＋
+//     __AVX512VNNI__ガード。__AVX512__マクロは存在しない) /
+//     AVX-VNNI (N100用予約。__AVXVNNIINT8__＋-mavxvnniint8) /
+//     非対応CPUは同一k順スカラー。FMA不使用。
 //
 // [fp32並存・フラグ]
 //   - 既存 jt_gemm_mat_f32 (moe_gemm.c) には一切手を入れない (既定経路)。
@@ -31,8 +36,8 @@
 //
 // [規約]
 //   - C11・restrict・errnoベース＋goto cleanup (AGENTS.MD 7.1)。
-//   - リトルエンディアン前提 (common.h)。クロスプラット (SIMDなし)。
-//   - AVX-512禁止。本ファイルに __AVX512__ 分岐を置かないこと。
+//   - リトルエンディアン前提 (common.h)。クロスプラット (SIMDはifdef分岐)。
+//   - AVX-512はVNNIドット経路 (Ryzen用) に限定し、一般GEMMには使わない。
 
 #include <stddef.h>
 #include <stdint.h>
