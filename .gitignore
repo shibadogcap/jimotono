@@ -1,7 +1,10 @@
 build-*/
 Testing/
+*.log
 data/*.jtdp
 data/*.jtvocab
+*.jtdp
+*.jtvocab
 artifacts/ckpt/*
 artifacts/quant/*
 artifacts/lut/*
@@ -14,3 +17,10 @@ artifacts/route/*
 !artifacts/route/.gitkeep
 .DS_Store
 *.dSYM/
+# secrets (never commit)
+*.pem
+*.key
+.env
+*id_rsa*
+*.p12
+*.pfx
