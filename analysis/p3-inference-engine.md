@@ -59,6 +59,13 @@
 - **依存**：P3a §4（A100M基準＋保守表・A300-500M条件付き選択肢）、`analysis/active-upper-bound.md` §2–§4、`analysis/p3-design-inputs.md` §(a)・§(c)C1–C2、`analysis/vocab-budget.md`（head縮小）、`analysis/kv-cache-design.md`（KV微小）、`analysis/f2-breakdown.md`（sync実測）、AGENTS.md §8。
 - **ゲート条件**：公称8B/2.6Bを受入条件・設計目標として引用しないこと。LFM2/Gemma値を同語彙速度比較に使わないこと。NVMe 103MiB/token内にpin-hit率＋Delta持続率で収める実測をP3受入条件に含めること。A300-500M選択肢の採用はP3a §4の(i)–(iv)＋η実測を満たした設計改訂でのみ行うこと。
 
+## 追補A. 3予測器先読みの設計根拠（1予測器99%案との比較・P3d確認記録）
+
+- **対象の整理**：AGENTS.md §3.2の単一予測器（NeuroPrefetcher：レイヤ0実行後に全下流MLPのスパース活性を予測）と、AGENTS.md §4.2の3予測器和集合（S∪L∪Mを先読み）は両立する記述であり、本書§2は後者（和集合）を採用する。写像：S＝StickyMoE熱（ホットpin）／L＝Delta持続（トークン間82〜85%持続、残り15〜18%のみ読込）／M＝Router-lookahead（現層post-attentionから次層を71.6%予測）＋batch-union併用（同一expertは全positionで1回だけ読む）。
+- **1予測器案との比較**：単一予測器は実装が単純で過剰fetchが小さいが、単独recallは他系実測の71.6%（lookahead）／82〜85%（Delta）級に留まり、AGENTS.md §8の99%以上・スイッチ率59%減・ミス3.92倍減には届かない。和集合は3機構のカバレッジを重ねてrecallを上げる代わりに、和集合サイズ（≦3者の合計）分の過剰fetchと、ordering（io_uring＋compute重ね合わせ時の順序）・batch-unionの複雑性を払う。
+- **帯域コスト**：NVMe予算103MiB/tokenに対しP3想定約100MB/tokenは境界上（C1受入条件）。和集合の過剰fetchはpin-hit率（Sticky熱pin）＋Delta持続率で103MiB内に吸収することを受入条件とする（本書§5と同一）。単一予測器は和集合が予算超過した場合のフォールバック／アブレーション対照とする（設計改訂扱いで切替え）。
+- **結論**：既定は3予測器和集合を維持し、単一予測器への縮退は予算未達時の対照とする。いずれも論文値転載で代替せず、pin-hit率＋Delta持続率＋fetch実測で判定する。
+
 ## 参照URL一覧（本書の推論範囲に限定・P3aとの重複は維持）
 
 - https://www.alphaxiv.org/abs/2609.deepseek-v4-1-flash.pdf
