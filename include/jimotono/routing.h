@@ -56,6 +56,22 @@ extern "C" {
 int jt_routing_topk(const float *restrict logits, size_t n, size_t k,
                     size_t *restrict out_ids, float *restrict out_weights);
 
+// load-balancing補助損失 + ルーティングエントロピー (Switch Transformer流)。
+//   f_e = cnt_e / (T*k)（割当て率）, P_e = sum_w_e / (T*k)（平均確率）,
+//   L_aux = E * Σ_e f_e * P_e（均等時は k^2/E→約1、崩壊時は k に近づく）。
+//   f_e は hard 選択のため定数扱い（straight-through。微分は P_e 経由のみ）。
+//   entropy は top-k 重みのトークン平均エントロピー H = -1/T Σ_{t,p} w*ln w
+//  （密分布ではなく疎top-kの代理指標。崩壊検出用ログ列）。
+//   ids [T*k]（token-major、全要素<E）、weights [T*k]（0..1・有限）。
+//   T>0、k>=1、E>=1（E<=4096、k<=E）。out_aux/out_entropyはNULL可（片方のみ取得可）。
+//   cap検証は含まない（capは jt_moe_batch_sort 側で1.0–1.5に固定。2.0での隠蔽禁止）。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno=EINVAL)。
+int jt_routing_balance_loss(const size_t *restrict ids,
+                            const float *restrict weights,
+                            size_t T, size_t k, size_t E,
+                            float *restrict out_aux,
+                            float *restrict out_entropy);
+
 // StickyMoE soft-hard損失 (1トークン分の寄与)。
 //   L_cons = ||g_t - g_{t-1}||_2^2 (全層平均の前の1トークン分)
 //   L_hard = (t-s(t))/W * ||g_t - g_{s(t)}||_2^2 (線形ランプ付き窓アンカー拘束)
