@@ -67,6 +67,10 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   set_source_files_properties(src/moe_gemm.c PROPERTIES COMPILE_OPTIONS "-mavx2")
   set_source_files_properties(src/moe_layer.c PROPERTIES COMPILE_OPTIONS "-mavx2")
   set_source_files_properties(src/train_bwd.c PROPERTIES COMPILE_OPTIONS "-mavx2")
+  # Stage 3b-1: w8a8.c のint8 GEMM高速路 (AVX2 emul。FMAなし・AVX-512なし)。
+  # N100/i7-8700BいずれもAVX2対応のため既定バイナリは動作する。
+  # AVX512-VNNI/AVX-VNNIは既定ビルドに含めない (別途手動コンパイル確認)。
+  set_source_files_properties(src/w8a8.c PROPERTIES COMPILE_OPTIONS "-mavx2")
 endif()
 # Linuxのみ全ターゲットへ_GNU_SOURCE (O_DIRECT用定義と統一)。
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
