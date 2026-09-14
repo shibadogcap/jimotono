@@ -16,10 +16,20 @@
 //     未検証コードを最小化。コンパイル確認＋単体テストの等価性で担保。
 //     注: clangに __AVX512__ マクロは存在しないため
 //     defined(__AVX512F__) && defined(__AVX512VNNI__) でガードする。
-//   - AVX-VNNI (N100。__AVXVNNIINT8__): 将来パス予約のみ (本TUはAVX2路に
-//     フォールスルー。_mm256_dpbssd_epi32 は -mavxvnniint8 で利用可を
-//     確認済み。plain -mavxvnniでは不可)。NEON-I8MMは将来予約。いずれも非対応CPUでは同一k順
-//     スカラーフォールバック (bit同一)。
+//   - AVX-VNNI (N100。__AVXVNNI__ガード。-mavxvnniで有効化):
+//     _mm256_dpbusd_epi32 (u8*s8→i32蓄積)＋0x80バイアス補正の連続dot
+//     (AVX512-VNNI路と同一の数学でexact)。N100実機で実行・bit一致・
+//     速度を確認済みの本命路 (panel/dot路でAVX2路比1.7〜1.9x)。
+//     dispatch優先度は AVX-VNNI-INT8 > AVX-VNNI >
+//     AVX2 emul (いずれも整数exactでbit同一)。VNNIビルドではAVX2 emul
+//     dotは除外し、一般GEMMのアウタープロダクト型ブロック (cvt/mullo
+//     exact) とスカラーフォールバックは共用・維持する。
+//   - AVX-VNNI-INT8 (__AVXVNNIINT8__ガード。-mavxvnniint8で有効化):
+//     _mm256_dpbssd_epi32 (s8*s8→i32蓄積。補正不要・exact) の連続dot。
+//     N100/Gracemontは本命令を持たない (CPUID 7:1 EAX[4]=1表示でも
+//     VEX VPDPBSSDは#UDする。N100実機で確認。AVX-VNNI-INT8は7:1 EDX[4]
+//     で、本機は0)。将来の対応CPU用に用意し、N100向けには使わない
+//     (N100では-mavxvnniのみを付け、AVX-VNNI路を使うこと)。
 //   - FMA不使用。整数accは加算順序不変で完全一致するため、float化の
 //     順序を既存と同一に保てば出力はbit同一 (G3: bit一致 or 相対差1e-6)。
 
@@ -34,7 +44,8 @@
 #include "jimotono/common.h"
 #include "jimotono/train_bwd.h"
 
-#if defined(__AVX2__) || defined(__AVX512F__) || defined(__AVXVNNI__)
+#if defined(__AVX2__) || defined(__AVX512F__) || defined(__AVXVNNI__) || \
+    defined(__AVXVNNIINT8__)
 #include <immintrin.h>
 #endif
 
@@ -74,7 +85,8 @@ static int jt_w8a8_gemm_scalar_body(const int8_t *restrict Aq,
 // 出力はbit同一になる (G3)。検証・q値域検査は呼出し側の既存路が先に行う。
 
 #if defined(__AVX2__) && \
-    !(defined(__AVX512F__) && defined(__AVX512VNNI__))
+    !(defined(__AVX512F__) && defined(__AVX512VNNI__)) && \
+    !defined(__AVXVNNIINT8__) && !defined(__AVXVNNI__)
 // 連続int8 dot (exact)。maddubsはu8*s8のpair加算 (int16飽和) のため、
 // even/odd分離で単一積相当を取り出す: pat=[1,0..]で偶レーン、
 // [0,1..]で奇レーン。q∈[-127,127]より抽出値は±127以内で飽和なし。
@@ -118,7 +130,7 @@ static int32_t jt_w8a8_dot_avx2(const int8_t *restrict a,
         return total;
     }
 }
-#endif  // AVX2 dot (VNNIビルドではvnni dotを使用するため除外)
+#endif  // AVX2 dot (VNNI系ビルドでは各vnni dotを使用するため除外)
 
 #ifdef __AVX2__
 // アウタープロダクト型ブロック (exact)。固定kの寄与 a*Brow[n] (n方向) は
@@ -238,27 +250,150 @@ static int32_t jt_w8a8_dot_vnni(const int8_t *restrict a,
 }
 #endif  // AVX512-VNNI
 
-// AVX-VNNI (N100): 将来パス予約。本TUはAVX2路にフォールスルーする
-// (実装任意のため)。調査結果 (Apple Clang 17):
-//   - plain -mavxvnni (__AVXVNNI__) ではint8ドット intrinsicは使えない
-//     (_mm256_dpbssd_epi32は 'avxvnniint8' featureを要求しエラー)。
-//   - -mavxvnniint8 (__AVXVNNIINT8__) で _mm256_dpbssd_epi32 (s8*s8,
-//     int32蓄積・補正不要・exact) が利用可 (コンパイル確認済み)。
-// 将来N100向けビルドでは -mavxvnniint8 をTU毎に付け、
-//   #ifdef __AVXVNNIINT8__ → _mm256_dpbssd_epi32連続dot
-// の分岐をjt_w8a8_dot_*と同形で追加する (本変更のVNNI dotを参照)。
-// NEON-I8MM (ARM64) は将来予約。
+#if defined(__AVXVNNI__) && !defined(__AVXVNNIINT8__)
+// Σb事前計算 (busd補正用。dot側の逐次和ループをGEMM外へ巻き上げ)。
+// b列ごとに1回だけ求め、全M行で共用する (panel路はpack後にcache-hotな
+// P列から、N==1路はB列から1回)。SIMDはcvt (i8→i16)＋madd (対1加算) の
+// exact構成 (pair和は|b0+b1|≤254でi16に収まる。総和は|Σb|≤127*K≤5.2e5)。
+// スカラーテールはk順。整数exactのためdot側の内部合算と同一値 (G3)。
+static int32_t jt_w8a8_colsum_busd(const int8_t *restrict b, int k) {
+#ifdef __AVX2__
+    __m256i s = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    int i = 0;
+    int n = k & ~31;
+    for (; i < n; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i lo16 =
+            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
+        __m256i hi16 =
+            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+        s = _mm256_add_epi32(s, _mm256_madd_epi16(lo16, ones));
+        s = _mm256_add_epi32(s, _mm256_madd_epi16(hi16, ones));
+    }
+    {
+        __m128i lo = _mm256_castsi256_si128(s);
+        __m128i hi = _mm256_extracti128_si256(s, 1);
+        __m128i s4 = _mm_add_epi32(lo, hi);
+        __m128i s2 = _mm_add_epi32(s4, _mm_srli_si128(s4, 8));
+        __m128i s1 = _mm_add_epi32(s2, _mm_srli_si128(s2, 4));
+        int32_t total = _mm_cvtsi128_si32(s1);
+        for (; i < k; i++) {
+            total += (int32_t)b[i];
+        }
+        return total;
+    }
+#else
+    {
+        int32_t total = 0;
+        for (int i = 0; i < k; i++) {
+            total += (int32_t)b[i];
+        }
+        return total;
+    }
+#endif
+}
 
-#if defined(__AVX2__) || (defined(__AVX512F__) && defined(__AVX512VNNI__))
+// AVX-VNNI連続dot (N100/Gracemont用。-mavxvnniで__AVXVNNI__定義)。
+// _mm256_dpbusd_epi32(acc, va, vb) はu8*s8→i32蓄積のため、a側に0x80
+// バイアスを掛け、呼出し側が事前計算した sumB=Σb で補正してexactに求める
+// (AVX512-VNNI路と同一の数学):
+//   raw=Σ(a+128)*b=Σab＋128*Σb  →  Σab=raw−128*Σb
+// dpbusdはint32直接蓄積 (int16飽和なし) のため補正式は全域でexact
+// (|Σb|≤127*K≤5.2e5、128*Σb≤6.7e7<2^31。K≤JT_BWD_MAX_WIDEとq値域検査が前提)。
+// bit同一性の証明 (G3): AVX512-VNNI路の証明と同一。整数の加算・乗算は
+// オーバーフローがなければ順序不変のため、32B/stepのk順累積・8レーン
+// 水平加算・テールk順加算の総和はスカラー逐次和と同一int32になる。
+// sumBの計算場所 (dot内/事前) を変えても値は同一。
+// 後段のfloat化は既存路と同一式・同一順序のため出力floatはbit同一。
+// FMA不使用。N100実機でAVX2路ビルドとのbit一致を確認済み
+// (14形状・pt/ch全一致。G3ゲート通過)。
+static int32_t jt_w8a8_dot_vnni256_busd(const int8_t *restrict a,
+                                        const int8_t *restrict b, int k,
+                                        int32_t sumB) {
+    __m256i acc = _mm256_setzero_si256();
+    const __m256i bias = _mm256_set1_epi8((char)0x80);
+    int i = 0;
+    int n = k & ~31;
+    int32_t raw = 0;
+    for (; i < n; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
+        va = _mm256_xor_si256(va, bias);
+        acc = _mm256_dpbusd_epi32(acc, va, vb);
+    }
+    {
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s4 = _mm_add_epi32(lo, hi);
+        __m128i s2 = _mm_add_epi32(s4, _mm_srli_si128(s4, 8));
+        __m128i s1 = _mm_add_epi32(s2, _mm_srli_si128(s2, 4));
+        raw = _mm_cvtsi128_si32(s1);
+    }
+    for (; i < k; i++) {
+        raw += (int32_t)((uint8_t)(a[i] ^ (char)0x80)) * (int32_t)b[i];
+    }
+    return raw - 128 * sumB;
+}
+#endif  // __AVXVNNI__ (INT8なし)
+
+#ifdef __AVXVNNIINT8__
+// AVX-VNNI-INT8連続dot (将来の対応CPU用。-mavxvnniint8で定義)。
+// _mm256_dpbssd_epi32(acc, va, vb) は符号付き直接積のため補正不要・exact。
+// bit同一性の証明 (G3) はAVX-VNNI路と同一 (int32 exact累積のため順序不変。
+// bound: |acc|≤127*127*4096≈6.6e7<2^31)。AVX2 emul路と異なりint16中間は
+// 存在しない。テール (k%32) はスカラーk順加算。後段float化は既存路と同一の
+// ため出力floatはbit同一。FMA不使用。
+// 注意: N100/Gracemontでは本命令は#UDする (7:1 EDX[4]=0。実機確認済み)。
+// N100向けビルドに-mavxvnniint8を付けてはならない。N100では-mavxvnniのみ
+// (AVX-VNNI路) を使うこと。手元実行環境には対応CPUがないため、本関数は
+// コンパイル確認＋数学的等価性 (AVX-VNNI路と同一構造) で担保する。
+static int32_t jt_w8a8_dot_vnni256(const int8_t *restrict a,
+                                   const int8_t *restrict b, int k) {
+    __m256i acc = _mm256_setzero_si256();
+    int i = 0;
+    int n = k & ~31;
+    for (; i < n; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
+        acc = _mm256_dpbssd_epi32(acc, va, vb);
+    }
+    {
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s4 = _mm_add_epi32(lo, hi);
+        __m128i s2 = _mm_add_epi32(s4, _mm_srli_si128(s4, 8));
+        __m128i s1 = _mm_add_epi32(s2, _mm_srli_si128(s2, 4));
+        int32_t total = _mm_cvtsi128_si32(s1);
+        for (; i < k; i++) {
+            total += (int32_t)a[i] * (int32_t)b[i];
+        }
+        return total;
+    }
+}
+#endif  // __AVXVNNIINT8__
+
+#if defined(__AVX2__) || (defined(__AVX512F__) && defined(__AVX512VNNI__)) || \
+    defined(__AVXVNNIINT8__) || defined(__AVXVNNI__)
 // 最良dot選択 (N==1路・panel路で共用)。いずれも整数exact。
+// sumBはbusd分岐でのみ使用 (呼出し側が列ごとに事前計算。他分岐は無視)。
 static int32_t jt_w8a8_dot_best(const int8_t *restrict a,
-                                const int8_t *restrict b, int k) {
+                                const int8_t *restrict b, int k,
+                                int32_t sumB) {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
+    (void)sumB;
     return jt_w8a8_dot_vnni(a, b, k);
+#elif defined(__AVXVNNIINT8__)
+    (void)sumB;
+    return jt_w8a8_dot_vnni256(a, b, k);
+#elif defined(__AVXVNNI__)
+    return jt_w8a8_dot_vnni256_busd(a, b, k, sumB);
 #elif defined(__AVX2__)
+    (void)sumB;
     return jt_w8a8_dot_avx2(a, b, k);
 #else
     {
+        (void)sumB;
         int32_t total = 0;
         for (int i = 0; i < k; i++) {
             total += (int32_t)a[i] * (int32_t)b[i];
@@ -307,12 +442,25 @@ static int jt_w8a8_gemm_panel(const int8_t *restrict Aq,
                 prow[k] = Bq[(size_t)k * (size_t)N + (size_t)nc];
             }
         }
+#if defined(__AVXVNNI__) && !defined(__AVXVNNIINT8__)
+        // busd補正用Σbをpack済み列から事前計算 (cache-hot。M行で共用)。
+        // dot内の逐次合算をなくし、dot本体を純SIMD化する (速度用。値は同一)。
+        int32_t colSum[JT_W8A8_PANEL_NB];
+        for (int j = 0; j < nb; j++) {
+            colSum[j] = jt_w8a8_colsum_busd(P + (size_t)j * (size_t)K, K);
+        }
+#endif
         for (int m = 0; m < M; m++) {
             const int8_t *arow = Aq + (size_t)m * (size_t)K;
             float *crow = C + (size_t)m * (size_t)N + n0;
             for (int j = 0; j < nb; j++) {
-                int32_t acc =
-                    jt_w8a8_dot_best(arow, P + (size_t)j * (size_t)K, K);
+#if defined(__AVXVNNI__) && !defined(__AVXVNNIINT8__)
+                int32_t acc = jt_w8a8_dot_best(arow, P + (size_t)j * (size_t)K,
+                                               K, colSum[j]);
+#else
+                int32_t acc = jt_w8a8_dot_best(arow, P + (size_t)j * (size_t)K,
+                                               K, 0);
+#endif
                 double ss = sB_col ? sA_d * (double)sB_col[n0 + j]
                                    : sA_d * (double)sB_single;
                 double v = 0.0;
@@ -354,9 +502,29 @@ static int jt_w8a8_gemm_fast(const int8_t *restrict Aq,
             errno = ERANGE;
             return JT_ERR_INVAL;
         }
+#if defined(__AVXVNNI__) && !defined(__AVXVNNIINT8__)
+        // busd補正用ΣbをB列から1回だけ事前計算 (M行で共用)。
+        {
+            int32_t sumB = jt_w8a8_colsum_busd(Bq, K);
+            for (int m = 0; m < M; m++) {
+                const int8_t *arow = Aq + (size_t)m * (size_t)K;
+                int32_t acc = jt_w8a8_dot_best(arow, Bq, K, sumB);
+                double v = 0.0;
+                float f = 0.0f;
+                v = (double)acc * ss;
+                f = (float)v;
+                if (!isfinite((double)f)) {
+                    errno = ERANGE;
+                    return JT_ERR_INVAL;
+                }
+                C[(size_t)m * (size_t)N] = f;
+            }
+            return JT_OK;
+        }
+#else
         for (int m = 0; m < M; m++) {
             const int8_t *arow = Aq + (size_t)m * (size_t)K;
-            int32_t acc = jt_w8a8_dot_best(arow, Bq, K);
+            int32_t acc = jt_w8a8_dot_best(arow, Bq, K, 0);
             double v = 0.0;
             float f = 0.0f;
             v = (double)acc * ss;
@@ -368,6 +536,7 @@ static int jt_w8a8_gemm_fast(const int8_t *restrict Aq,
             C[(size_t)m * (size_t)N] = f;
         }
         return JT_OK;
+#endif
     }
 #ifdef __AVX2__
     if (M < JT_W8A8_PANEL_MIN_M) {
@@ -835,7 +1004,8 @@ int jt_w8a8_gemm_per_tensor(const int8_t *restrict Aq,
             goto cleanup;
         }
 #if defined(__AVX2__) || \
-    (defined(__AVX512F__) && defined(__AVX512VNNI__))
+    (defined(__AVX512F__) && defined(__AVX512VNNI__)) || \
+    defined(__AVXVNNIINT8__) || defined(__AVXVNNI__)
         // G3同一関数内最適化: 検証済みのまま高速路へ (bit同一)。
         rc = jt_w8a8_gemm_fast(Aq, Bq, (double)sA, NULL, sB, C, M, N, K);
 #else
@@ -889,7 +1059,8 @@ int jt_w8a8_gemm_per_channel(const int8_t *restrict Aq,
         }
     }
 #if defined(__AVX2__) || \
-    (defined(__AVX512F__) && defined(__AVX512VNNI__))
+    (defined(__AVX512F__) && defined(__AVX512VNNI__)) || \
+    defined(__AVXVNNIINT8__) || defined(__AVXVNNI__)
     // G3同一関数内最適化: 検証済みのまま高速路へ (bit同一)。
     rc = jt_w8a8_gemm_fast(Aq, Bq, (double)sA, sB_col, 1.0f, C, M, N, K);
 #else
