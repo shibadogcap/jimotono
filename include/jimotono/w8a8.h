@@ -17,7 +17,9 @@
 //     公開API・検証・tol不変。整数exactのため出力はbit同一):
 //     AVX2 emul (#ifdef __AVX2__) / AVX512-VNNI (Ryzen用。__AVX512F__＋
 //     __AVX512VNNI__ガード。__AVX512__マクロは存在しない) /
-//     AVX-VNNI (N100用予約。__AVXVNNIINT8__＋-mavxvnniint8) /
+//     AVX-VNNI (N100用。__AVXVNNI__＋-mavxvnni。u8*s8＋0x80補正でexact) /
+//     AVX-VNNI-INT8 (将来CPU用。__AVXVNNIINT8__＋-mavxvnniint8。s8*s8直接。
+//     N100では#UDするため使わない) /
 //     非対応CPUは同一k順スカラー。FMA不使用。
 //
 // [fp32並存・フラグ]
