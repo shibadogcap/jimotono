@@ -1,6 +1,7 @@
 build-*/
 Testing/
 data/*.jtdp
+data/*.jtvocab
 artifacts/ckpt/*
 artifacts/quant/*
 artifacts/lut/*
