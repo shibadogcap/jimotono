@@ -172,11 +172,12 @@ int jt_moe_bwd_unchecked(const float *restrict dY, const float *restrict X,
 // 同一入力→同一 perm を保証する (単一スレッドで構築。タイブレークは
 // (expert_id, token_pos, slot) の辞書式順序。重みの大小比較で順序を決めない)。
 // capacity 上限 cap = ceil(cap_factor * T * k / E) を超えた分は drop
-// (当該ペアの寄与を 0 とし、残り重みの renormalize はしない。共有 expert は
+// (当該ペアの寄与を 0 とし、残り重みは renormalize する (G2改訂。旧「しない」を撤回)。
+// トークン毎に kept 和Sで w'=w/S。共有 expert は
 // 対象外で呼び出し側が別経路とする)。cap_factor は 1.0–1.5 の範囲でのみ受付。
 //   ids [T*k]: token-major の expert 割当て ([t][k] row-major)。全要素 < E であること。
 //   T: トークン数 (>0)。k: top-k (1..E)。E: routed 数 (1..MAX)。
-//   cap_factor: 容量係数 (1.0–1.5 の有限値。既定 1.25)。
+//   cap_factor: 容量係数 (1.0–1.5 の有限値。既定 1.5=G2改訂)。
 //   perm [T*k]: kept のみを expert 順に並べた flattened index (長さ = *out_kept)。
 //     flattened index q = t*k+p (token-major)。NULL 不可。
 //   off [E+1]: expert 境界 (off[E] == *out_kept)。NULL 不可。
@@ -200,8 +201,8 @@ int jt_moe_batch_sort(const size_t *restrict ids, int T, int k, int E,
 // 本格マイクロカーネルは Step 4)。各行の計算核と結合の token 順は Step 1 と
 // 同一のため、drop なし時は単体版 jt_moe_fwd のトークンループと bit 一致する
 // (同一順序の token 順 combine のため。AVX2 有効時も同一ヘルパー使用)。
-// drop あり時は dropped ペアの寄与を 0 とし renormalize しない。共有 expert は
-// 常時オン・容量制限対象外でトークン毎に単体版と同一に加算する。
+// drop あり時は dropped ペアの寄与を 0 とし kept を renormalize する (G2改訂)。
+// 共有 expert は常時オン・容量制限対象外でトークン毎に単体版と同一に加算する。
 // bwd は単体版 jt_moe_bwd をそのまま使う (同一 ids/weights/cache 形式)。
 // 注意 (Step 3 への申送り): drop あり時の bwd 側 drop マスク適用
 // (dropped ペアの gate 勾配 0 化) は Step 3 の範囲。本関数は dropped 対応
@@ -215,7 +216,7 @@ int jt_moe_batch_sort(const size_t *restrict ids, int T, int k, int E,
 //   cache_Gsel/Usel [T][k*h] or NULL, cache_Ysel [T][k*n] or NULL,
 //   cache_Gs/Us [T][S*h] or NULL: 単体版の cache のバッチ敷き詰め版。
 //     bwd を使う場合は単体版同様に非NULLで渡すこと。NULL 時は順伝播のみ。
-//   cap_factor: 1.0–1.5 (既定 1.25)。
+//   cap_factor: 1.0–1.5 (既定 1.5=G2改訂)。
 //   out_perm [T*k] or NULL, out_off [E+1] or NULL, out_drop [T*k] or NULL:
 //     ソート結果の写し (決定論性・drop 率の観測用。NULL で省略)。
 //   out_kept/out_dropped or NULL: kept/drop 総数。
@@ -279,7 +280,7 @@ int jt_moe_fwd_batch_unchecked(const float *restrict X,
 //     expert内はperm順 (安定ソートのためtoken_pos昇順と一致) に加算する。
 //   - dWのM_e縮約は m昇順 (expert内token_pos昇順)。可変M_eによるbit変動は
 //     許容範囲 (§5.2) で評価する (1e-8〜1e-7程度は正常、1e-6超は原因特定)。
-// dropされたペアの寄与は0 (gate勾配も0。renormalizeしない。§1.2/§3.3)。
+// dropされたペアの寄与は0 (gate勾配も0。keptはrenormalizeする。§1.2/§3.3=G2改訂)。
 // SwiGLU非線形のbwdはperm順のまま要素wiseに処理し、同一数式
 // (jt_swiglu_bwdと同一のsigmoid/silu/ヤコビアン) を使う。
 //   dY [T][n]: 上流勾配。X [T][n]: fwd入力と同一値。

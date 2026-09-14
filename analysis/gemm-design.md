@@ -55,13 +55,34 @@ logits 自体の再計算はしない。
   ```
   cap_e = ceil(capacity_factor * T * k / E)
   ```
-  デフォルト `capacity_factor = 1.25`（調整可能。1.0–1.5 の範囲で P3 実測確定、前例は Tutel 動的 factor）。
+  デフォルト `capacity_factor = 1.5`（G2改訂で 1.25→1.5。調整可能範囲 1.0–1.5 内。前例は Tutel 動的 factor）。
+  改訂理由：§9.4の通り長時間走行で 1.25 は終盤 6.64% とトリガ超過のため、設計範囲上限の 1.5 を既定化する。
+  `cap_e` は longrun 条件（T=512・k=2・E=16）で `ceil(1.25*1024/16)=80` → `ceil(1.5*1024/16)=96`。
+  drop率 0.1% 以下見込み（§8.1短走 0.74% からの外挿。G2再測定§10で実測確定）。
+  メモリ増は expert 連続ワークスペースのみ：Xe/Ye 各 80*256*4=80KB→96*256*4=96KB（+16KB×2）、
+  Ge/Ue 各 80*64*4=20KB→96*64*4=24KB（+4KB×2）、合計 +40KB。
+  active 100M 予算（fp32換算 400MB）・dense 2GB に対し無視可能（0.01%級）であり予算内。
+  TinyStories 条件（T=64・k=2・E=8・n=64）では cap 20→24、ワークスペース +1KB級で同様に予算内。
 - 各 expert への割当てが `cap_e` を超えた分は **drop**（当該 (token, expert) ペアの寄与を 0 とし、
-  残りの選出 expert の重みは renormalize **しない** — 学習ダイナミクスを変えないため。
+  残りの選出 expert の重みは renormalize **する** — G2改訂で仕様変更。旧「renormalizeしない」を撤回。
+  しない方が動力学を変える（実効勾配が痩せる）。標準実装（DeepSpeed-MoE/Tutel流）はrenormalize。
+  方式：トークン毎に kept の重み和 S で `w' = w / S`（S>0時。S==0時は寄与0）。
+  `out_weights` は kept について renormalize 後の値に更新する（in-place）。
+  dropped の `out_weights` は元のまま残すが未使用（dropマスクでskip）。
+  bwdは renormalize 後重みで softmaxヤコビアンを計算する（分母S経由の2次項は straight-through として無視。§3.3に記録）。
   renormalize 有無はハイパーパラメータではなく仕様として固定し、変更時は設計改訂とする）。
 - 共有 expert（常時オン2つ、AGENTS §2.1）は capacity 制限の対象外（§2.3）。
 - drop 率・expert 別ヒストグラムをステップ毎にカウンタ記録する（デバッグ用。ホットパス外の集計のみ）。
   drop 率が恒常的に >5% の場合は capacity_factor の見直しトリガ（自動調整はしない）。
+- G2改訂（2026-09-14）：G2判定タスクを合成回帰から TinyStories に変更する。
+  理由：合成は train loss が 0 に張り付き（§9.1：表示桁落ちで相対差未定義、後半 200% 張り付き）評価不能のため。
+  TinyStories（実言語CE）は 0 床なしで最終loss差≦1%が定義可能。F6確立の設定を流用する
+  （`train_tinystories` 既定：d=64・layers=2・E=8・K=2・S=1・H=32・batch=64・lr=3e-4・V=258。
+  V=48588は情報密度で勝つが G2短走（200 steps以下）は V=258 で判定。1000 steps禁止）。
+  G2再測定は 200 steps以下・逐次・単一プロセス・実行前 `uptime` 確認。判定は§5.4の4項目維持。
+  改訂後も乖離が残れば H2（bwd加算順序）と分離報告する（許容判断禁止）。
+  付帯：`train_tinystories` 等の対象 main の先頭に `setvbuf(_IOLBF)` を追加する
+  （行バッファリングで G2 ログの逐次可視化。数値・API・fail-closed に影響なし）。
 
 なぜ dropless（Megablocks 式）にしないか：CPU学習では可変長 dropless が
 マイクロカーネルのタイル固定化（§4）と L2 常駐（expert 単位 192KB、roofline D6）を崩すため。
@@ -145,7 +166,9 @@ expert e（perm 順バッファ上）：
   logits への最終 scatter は `token_pos` 順に直列化する。
 - top-k の hard 選択自体は微分不可のため straight-through（選択マスク固定）の扱いを維持し、
   本書でゲーティング関数の変更は行わない。
-- drop されたペアの gate 勾配は 0（寄与なし）。renormalize しない仕様（§1.2）と整合させる。
+- drop されたペアの gate 勾配は 0（寄与なし）。G2改訂の renormalize 仕様（§1.2）と整合させる：
+  kept の `w'`（renormalize 後）で softmaxヤコビアンを計算し、dropped は 0 のまま。
+  分母 S 経由の 2 次項（`dw'/dw` の分母微分）は straight-through として無視する（実装を単純に保つ標準近似）。
 - 決定論性：gate 勾配の token 方向加算は token 順に固定し、スレッド分割は expert 単位または
   token ブロック単位のいずれかに統一する（混在させない）。実装ステップ§7の soak で順序固定を検証。
 
