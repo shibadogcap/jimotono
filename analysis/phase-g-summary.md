@@ -77,3 +77,30 @@
 - `analysis/roofline.md` D4（AI 0.38–0.50・ridge 21・全カーネル帯域律速）、D6（GEMM化 AI≈23・expert固定トークン走査）、D5（LLCスラッシング棄却・帯域天井）
 - `analysis/f2-breakdown.md`（bwd 46%支配・val償却・sync逓増。学習目標の基準値としてP3へ申送り）
 - P3前提は `analysis/p3-architecture.md` に一本化（本書はPhase G総括でありP3設計は行わない）
+
+## 7. 再測定ベースライン（-mavx2修正後。Stage 1の比較基準。既存値の書き換えなし）
+
+- branch: `perf/p3/g-remeasure`（本wtのみ。コミットしない）。実装変更なし（測定＋文書追記のみ）。
+- 背景：Stage0の `-mavx2` 欠落修正（swiglu_bwd 3.8x・moe_bwd 2.18x・bit同一）により§3–§4の数値が陳腐化。
+  本節の値をStage 1以降の比較基準（新ベースライン）とする。§1–§6の既存値は書き換えない。
+- 条件：本wt内 `build-rem/` のみ。`--no-sched` 付与（Stage0のlrスケジュール既定ONによる動力学変更を除外し
+  旧条件と同一動力学で比較。既定ONではsingle 200 steps valが2.5039→2.9440に変わることを確認済み。
+  所要はON/OFFで同一）。逐次・単一プロセス・実行前 `uptime` 確認（up 13 days、load約1.7–2.8）。
+  詳細は `analysis/gemm-design.md` §14、`analysis/f2-breakdown.md` §7、
+  `analysis/roofline.md` D4追記を一次ソースとする。本書は要約＋承認記録であり再解釈は行わない。
+
+| 項目 | 新ベースライン（旧値） | ソース |
+|---|---|---|
+| steps/s倍率 TinyStories 500 steps | micro **31.25**（旧30.49） vs same-build single **6.76**（旧6.71）＝**4.62x**（旧4.54x） | §14.1 |
+| steps/s倍率 200 steps | micro 31.75 vs single 6.78＝**4.68x** | §14.1 |
+| Step 3比回帰なし | micro 31.25 vs naive batch 14.49＝**2.16x**（旧2.10x。回帰なし維持） | §14.1 |
+| 理論天井比 | **58.4%維持**（核不変を確認。7形状再測−4〜+8%で一致。(64,256,512)の50%未達も維持） | §14.2 |
+| 最終val（500 steps） | micro **2.3552**／single **2.3561**（いずれも旧値と完全一致） | §14.1 |
+| 最終val（200 steps） | micro **2.5135**／single **2.5039**（いずれも旧値と完全一致） | §14.1 |
+| F2内訳（代表6T） | step 1751ms（旧1886）・fwd 68ms・bwd 865ms・optim 225ms・sync 127ms・val償却444ms。最速点は2Tへ移動 | F2 §7 |
+| 帯域参照 | STREAM Triad実測 **21.24GB/s**（旧推定29.4の−27.7%。±30%留保内）。bwd効率は実測比約22%（約1/4.5）として確定 | roofline D4追記 |
+
+- ゲート判定は有効のまま（bit同一のため）。最終valの完全一致（micro 2.3552/2.5135・single 2.3561/2.5039）により
+  G1–G4の合否（§1–§2）は揺らがない。再判定は行わない。
+- Stage 1の比較は本節新ベースライン（`--no-sched`・固定lr系） against Stage 1改変で行うこと。
+  既定スケジュールON系の動力学比較が必要な場合は200 steps参考値（single val 2.9440・micro val 2.9529・差0.30%）を起点とし、本節固定lr系と混ぜないこと。
