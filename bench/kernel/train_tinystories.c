@@ -1210,6 +1210,79 @@ static int ts_aux_stats(const size_t *restrict cidsT,
     return JT_OK;
 }
 
+// Expert割当て集中検出用：層別cntのmax/min/medianを層平均＋層ワーストで返す。
+// entropy平均では瞬間集中を見逃すためステップ毎に記録する。
+// medianはE=8偶数のためソート後中央2値平均 (s[3]+s[4])/2 と定義する。
+// max/mean>2 (mean=T*K/E) なら集中と判定する。idsはcap前割当て。
+// fail-closed。
+static int ts_assign_stats(const size_t *restrict cidsT, int L, int T,
+                           double *restrict out_max_avg,
+                           double *restrict out_min_avg,
+                           double *restrict out_med_avg,
+                           double *restrict out_max_worst) {
+    double s_max = 0.0;
+    double s_min = 0.0;
+    double s_med = 0.0;
+    double worst = 0.0;
+    if (cidsT == NULL || out_max_avg == NULL || out_min_avg == NULL ||
+        out_med_avg == NULL || out_max_worst == NULL || L <= 0 || T <= 0) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
+    }
+    for (int l = 0; l < L; l++) {
+        const size_t *ids = cidsT + (size_t)l * (size_t)T * (size_t)TS_K;
+        size_t Tk = (size_t)T * (size_t)TS_K;
+        size_t cnt[TS_E];
+        size_t srt[TS_E];
+        size_t mx = 0;
+        size_t mn = Tk;
+        double med = 0.0;
+        for (int e = 0; e < TS_E; e++) {
+            cnt[e] = 0;
+        }
+        for (size_t q = 0; q < Tk; q++) {
+            size_t e = ids[q];
+            if (e >= (size_t)TS_E) {
+                errno = EINVAL;
+                return JT_ERR_INVAL;
+            }
+            cnt[e]++;
+        }
+        for (int e = 0; e < TS_E; e++) {
+            srt[e] = cnt[e];
+        }
+        for (int a = 1; a < TS_E; a++) {
+            size_t v = srt[a];
+            int b = a - 1;
+            while (b >= 0 && srt[b] > v) {
+                srt[b + 1] = srt[b];
+                b--;
+            }
+            srt[b + 1] = v;
+        }
+        for (int e = 0; e < TS_E; e++) {
+            if (cnt[e] > mx) {
+                mx = cnt[e];
+            }
+            if (cnt[e] < mn) {
+                mn = cnt[e];
+            }
+        }
+        med = ((double)srt[TS_E / 2 - 1] + (double)srt[TS_E / 2]) / 2.0;
+        s_max += (double)mx;
+        s_min += (double)mn;
+        s_med += med;
+        if ((double)mx > worst) {
+            worst = (double)mx;
+        }
+    }
+    *out_max_avg = s_max / (double)L;
+    *out_min_avg = s_min / (double)L;
+    *out_med_avg = s_med / (double)L;
+    *out_max_worst = worst;
+    return JT_OK;
+}
+
 // L_aux勾配のWgateへの加算（f定数近似。dL/dw=μ*E*f_e/(T*K)経由のヤコビアン）。
 // m->GのWgate部へ加算する。fail-closed。
 static int ts_aux_grad_apply(ts_model_t *restrict m,
@@ -2425,14 +2498,30 @@ int main(int argc, char **argv) {
                 double rr = (rdenom > 0) ? (100.0 * (double)step_renorm /
                                             (double)rdenom)
                                          : 0.0;
+                double amax = 0.0;
+                double amin = 0.0;
+                double amed = 0.0;
+                double wmax = 0.0;
+                double amean = (double)Tstep * (double)TS_K / (double)TS_E;
+                double rmax = 0.0;
+                if (ts_assign_stats(cidsT, n_layers, Tstep, &amax, &amin,
+                                    &amed, &wmax) != JT_OK) {
+                    fprintf(stderr,
+                            "train_tinystories: assign failed at step=%ld\n",
+                            step);
+                    goto cleanup;
+                }
+                rmax = (amean > 0.0) ? (amax / amean) : 0.0;
                 fprintf(stderr,
                         "train_ts_step: step=%ld train_ce=%.6f "
                         "ce=%.6f aux=%.6f ent=%.6f gnorm=%.6f "
                         "dropped=%zu/%zu (%.4f%%) renorm=%zu/%zu (%.4f%%) "
+                        "amax=%.1f amin=%.1f amed=%.1f rmax=%.3f wmax=%.0f "
                         "moe_batch=%d T=%d\n",
                         step + 1, last_train_ce, loss_mean, aux_m, ent_m,
                         gnorm, step_dropped, denom, dr, step_renorm, rdenom,
-                        rr, g_ts_moe_batch, Tstep);
+                        rr, amax, amin, amed, rmax, wmax, g_ts_moe_batch,
+                        Tstep);
             }
             if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
                 fprintf(stderr,
@@ -2595,13 +2684,28 @@ int main(int argc, char **argv) {
                 double dr = (denom > 0)
                                 ? (100.0 * (double)step_dropped / (double)denom)
                                 : 0.0;
+                double amax = 0.0;
+                double amin = 0.0;
+                double amed = 0.0;
+                double wmax = 0.0;
+                double amean = (double)batch * (double)TS_K / (double)TS_E;
+                double rmax = 0.0;
+                if (ts_assign_stats(step_ids, n_layers, (int)batch, &amax,
+                                    &amin, &amed, &wmax) != JT_OK) {
+                    fprintf(stderr,
+                            "train_tinystories: assign failed at step=%ld\n",
+                            step);
+                    goto cleanup;
+                }
+                rmax = (amean > 0.0) ? (amax / amean) : 0.0;
                 fprintf(stderr,
                         "train_ts_step: step=%ld train_ce=%.6f ce=%.6f "
                         "aux=%.6f ent=%.6f gnorm=%.6f dropped=%zu/%zu "
-                        "(%.4f%%) renorm=0 moe_batch=%d T=%ld\n",
+                        "(%.4f%%) renorm=0 amax=%.1f amin=%.1f amed=%.1f "
+                        "rmax=%.3f wmax=%.0f moe_batch=%d T=%ld\n",
                         step + 1, last_train_ce, ce_mean, aux_m, ent_m,
-                        gnorm, step_dropped, denom, dr, g_ts_moe_batch,
-                        batch);
+                        gnorm, step_dropped, denom, dr, amax, amin, amed,
+                        rmax, wmax, g_ts_moe_batch, batch);
             }
         }
         if (jt_optim8_step(&m.opt, m.P, m.G, m.lt.n_total) != JT_OK) {
