@@ -268,6 +268,93 @@ int jt_moe_fwd_batch_unchecked(const float *restrict X,
                                size_t *restrict out_kept,
                                size_t *restrict out_dropped);
 
+// MoE逆伝播のバッチ版 (Tトークン分。Step 3: 同一perm再利用のdW/dX GEMM)。
+// fwd (jt_moe_fwd_batch) と同一 perm・同一 expert 境界で処理する
+// (bwdでの再ルーティング・再ソート禁止。再ソートしない)。
+// 素朴GEMM参照実装 (triple-loop相当。ブロッキング・SIMD新規最適化なし・
+// AVX-512不使用。本格マイクロカーネルはStep 4)。
+// 順序固定 (決定論性。f32非結合則のため):
+//   - dX scatter-addは expert_id 昇順に固定 (同一tokenのk=2寄与の加算順)。
+//   - gate勾配 (dWgate/dLogits) のtoken方向加算は token_pos 昇順に固定。
+//     expert内はperm順 (安定ソートのためtoken_pos昇順と一致) に加算する。
+//   - dWのM_e縮約は m昇順 (expert内token_pos昇順)。可変M_eによるbit変動は
+//     許容範囲 (§5.2) で評価する (1e-8〜1e-7程度は正常、1e-6超は原因特定)。
+// dropされたペアの寄与は0 (gate勾配も0。renormalizeしない。§1.2/§3.3)。
+// SwiGLU非線形のbwdはperm順のまま要素wiseに処理し、同一数式
+// (jt_swiglu_bwdと同一のsigmoid/silu/ヤコビアン) を使う。
+//   dY [T][n]: 上流勾配。X [T][n]: fwd入力と同一値。
+//   Wgate/Wg/Wu/Wd/Wg_s/Wu_s/Wd_s: fwdと同一値・同一形式。
+//   ids [T][k], weights [T][k]: fwdのout_ids/out_weightsと同一値。
+//   Gsel/Usel [T][k*h], Ysel [T][k*n]: fwdのcacheと同一値。
+//   Gs/Us [T][S*h]: fwdの共有cache (S==0時はNULL可)。
+//   perm [kept], off [E+1], drop [T*k]: fwdのout_perm/out_off/out_dropと
+//     同一値 (再ソートせず読み出すのみ)。NULL不可。
+//   dX [T][n]: 入力勾配 (上書き)。
+//   dWgate [E][n]: gate勾配 (上書き。非選択行は0)。
+//   dWg/dWu/dWd [E][h][n]: routed勾配 (上書き。非選択expertは0)。
+//   dWg_s/dWu_s/dWd_s [S][h][n]: 共有勾配 (上書き。S==0時はNULL可)。
+//   dLogits [T][E] or NULL: token毎のgate logit勾配 (選択外・dropは0)。
+//   T/n/h/E/k/S: fwd_batchと同一範囲。cap_factorは本関数では使わない
+//     (perm/off/dropが既に確定済みのため。引数なし)。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用)。検証失敗時は
+//   dX・dW群・dLogitsを更新しない (fail-closed。単体版と同一条件)。
+// 備考: 内部作業域はmalloc確保。AVX-512不使用。
+int jt_moe_bwd_batch(const float *restrict dY, const float *restrict X,
+                     const float *restrict Wgate,
+                     const float *restrict Wg, const float *restrict Wu,
+                     const float *restrict Wd,
+                     const float *restrict Wg_s, const float *restrict Wu_s,
+                     const float *restrict Wd_s,
+                     const size_t *restrict ids, const float *restrict weights,
+                     const float *restrict Gsel, const float *restrict Usel,
+                     const float *restrict Ysel,
+                     const float *restrict Gs, const float *restrict Us,
+                     const size_t *restrict perm, const size_t *restrict off,
+                     const unsigned char *restrict drop,
+                     float *restrict dX,
+                     float *restrict dWgate,
+                     float *restrict dWg, float *restrict dWu,
+                     float *restrict dWd,
+                     float *restrict dWg_s, float *restrict dWu_s,
+                     float *restrict dWd_s,
+                     float *restrict dLogits,
+                     int T, int n, int h, int n_experts, int topk,
+                     int n_shared);
+
+// jt_moe_bwd_batchの重み・キャッシュ有限スキャンを省略する内部高速経路。
+// 通常バッチbwdと同一の計算核 (bit一致)。省略範囲・使用条件は
+// jt_moe_bwd_uncheckedに同じ (区間冒頭で重み検証済み＋区間内不変、
+// ids/weightsは同一ステップ内fwd産の場合のみ)。
+// 戻り値: JT_OK / JT_ERR_INVAL (errno併用)。
+int jt_moe_bwd_batch_unchecked(const float *restrict dY,
+                               const float *restrict X,
+                               const float *restrict Wgate,
+                               const float *restrict Wg,
+                               const float *restrict Wu,
+                               const float *restrict Wd,
+                               const float *restrict Wg_s,
+                               const float *restrict Wu_s,
+                               const float *restrict Wd_s,
+                               const size_t *restrict ids,
+                               const float *restrict weights,
+                               const float *restrict Gsel,
+                               const float *restrict Usel,
+                               const float *restrict Ysel,
+                               const float *restrict Gs,
+                               const float *restrict Us,
+                               const size_t *restrict perm,
+                               const size_t *restrict off,
+                               const unsigned char *restrict drop,
+                               float *restrict dX,
+                               float *restrict dWgate,
+                               float *restrict dWg, float *restrict dWu,
+                               float *restrict dWd,
+                               float *restrict dWg_s, float *restrict dWu_s,
+                               float *restrict dWd_s,
+                               float *restrict dLogits,
+                               int T, int n, int h, int n_experts, int topk,
+                               int n_shared);
+
 // StickyMoE損失の系列合算ヘルパー.
 //   gates: [T][n] row-majorのgate分布 (routedのみ)。
 //   T: 系列長 (>0)。n: expert数 (>0)。w (W): 窓幅 (>0)。

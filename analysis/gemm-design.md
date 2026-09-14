@@ -134,8 +134,9 @@ expert e（perm 順バッファ上）：
 - `dX_e = dY_e · W^T`（M_e×N_out × N_out×N の GEMM）。
 - SwiGLU 非線形の bwd（roofline D4 の SwiGLU bwd、AI 0.38）は perm 順のまま要素wise処理し、
   順序依存なし（要素独立のため perm の影響を受けない）。
-- `dX[token_pos] += dX_e` で scatter-add 復元（k=2 のため同一 token に2寄与が加算される。順序は加算の可換性により
-  決定論的合計が保証される範囲で任意。§5 の許容差で規定）。
+- `dX[token_pos] += dX_e` で scatter-add 復元（k=2 のため同一 token に2寄与が加算される。
+  加算順序は `expert_id` 昇順に固定する。f32 非結合則のため順序変動は最終ビットを変え得るので、
+  「任意」ではなく固定とし、§5 の許容差で評価する）。
 
 ### 3.3 gate 勾配の順序扱い
 
