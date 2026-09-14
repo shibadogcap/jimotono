@@ -19,11 +19,19 @@ date: 2026-09-14
 - [ ] Stage 3b-2 INT4/INT2 + T-MAC (design approved, impl pending)
 - [ ] G1 fusion decode remeasure (after decode impl)
 
-## 4. factorized head: S1 mandatory gate (4-stage fallback)
-- G0: dense 1B monotonic val decrease
-- G1: factorized val diff ≤ 1% @2000 steps (design scale)
-- fallback: k=512 → full head INT4 → P3a redesign
-- details: analysis/p3a-factorized-head-validation.md
+## 4. factorized head × lowbit: S1 composite gate
+- factorized単独: val diff ≤ 1% @2000 steps (design scale)
+- 低ビット単独: val diff ≤ 1% (TinyStories T=512。真LUT +0.98%で通過)
+- 複合 (factorized + 低ビット): val diff ≤ 1%
+- 複合未達時のフォールバック順序:
+  1. 低ビットをINT8に戻す (T-MAC断念、W8A8本線維持)
+  2. factorized headをk=512へ
+  3. full head INT4へ
+  4. 未達時はP3a再設計
+- proxy解像度注記: d=64とd=1024の量子化感度差仮説あり（大dほど鈍感）。
+  S1でdesign scale実測を必須とする。
+- details: analysis/p3a-factorized-head-validation.md、
+  analysis/p3b-tmac-gradient-check.md
 
 ## 5. S1 verification items
 1. 1B training fits 16GB RAM

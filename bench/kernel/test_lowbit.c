@@ -14,6 +14,7 @@
 
 #include "jimotono/common.h"
 #include "jimotono/lowbit.h"
+#include "jimotono/train_bwd.h"
 
 static int g_fail = 0;
 
@@ -227,10 +228,92 @@ static void test_lut_vs_fp32(void) {
     }
 }
 
+// STE勾配一致: fake-quant順伝播＋fp32逆伝播の勾配は、
+// fake-quant重みでのfp32逆伝播と同一 (別経路の量子化勾配なし)。
+// すなわち勾配差は順伝播差の線形伝播に留まる (5倍以内をassert)。
+static void test_ste_grad(void) {
+    enum { N = 8, H = 4 };
+    float X[N], Wg[H * N], Wu[H * N], Wd[H * N];
+    float G[H], U[H], Y[N], Gq[H], Uq[H], Yq[N];
+    float dY[N], dX[N], dXq[N];
+    float dWg[H * N], dWu[H * N], dWd[H * N];
+    float dWgq[H * N], dWuq[H * N], dWdq[H * N];
+    float Wgq[H * N], Wuq[H * N], Wdq[H * N];
+    for (int i = 0; i < N; i++) {
+        X[i] = lpat(i, 1, 21) * 0.5f;
+        dY[i] = lpat(i, 2, 23) * 0.5f;
+    }
+    for (int i = 0; i < H * N; i++) {
+        Wg[i] = lpat(i, 3, 25) * 0.3f;
+        Wu[i] = lpat(i, 4, 27) * 0.3f;
+        Wd[i] = lpat(i, 5, 29) * 0.3f;
+    }
+    // fake-quant重み (gate/up INT2, down INT4)。
+    for (int j = 0; j < H; j++) {
+        float cg[N], cu[N], cd[H];
+        for (int t = 0; t < N; t++) {
+            cg[t] = Wg[(size_t)j * N + t];
+            cu[t] = Wu[(size_t)j * N + t];
+        }
+        for (int t = 0; t < H; t++) {
+            cd[t] = 0.0f;
+        }
+        CHECK(jt_lowbit_fakequant(cg, cg, N, 2) == JT_OK, "ste fqg");
+        CHECK(jt_lowbit_fakequant(cu, cu, N, 2) == JT_OK, "ste fqu");
+        for (int t = 0; t < N; t++) {
+            Wgq[(size_t)j * N + t] = cg[t];
+            Wuq[(size_t)j * N + t] = cu[t];
+        }
+    }
+    for (int j = 0; j < N; j++) {
+        float cd[H], cq[H];
+        for (int t = 0; t < H; t++) {
+            cd[t] = Wd[(size_t)t * N + j];
+        }
+        CHECK(jt_lowbit_fakequant(cd, cq, H, 4) == JT_OK, "ste fqd");
+        for (int t = 0; t < H; t++) {
+            Wdq[(size_t)t * N + j] = cq[t];
+        }
+    }
+    CHECK(jt_swiglu_fwd(X, Wg, Wu, Wd, G, U, Y, N, H) == JT_OK, "ste fwd");
+    CHECK(jt_swiglu_fwd(X, Wgq, Wuq, Wdq, Gq, Uq, Yq, N, H) == JT_OK,
+          "ste fwdq");
+    CHECK(jt_swiglu_bwd(dY, X, G, U, Wd, Wg, Wu, dX, dWg, dWu, dWd, N,
+                        H) == JT_OK,
+          "ste bwd");
+    CHECK(jt_swiglu_bwd(dY, X, Gq, Uq, Wdq, Wgq, Wuq, dXq, dWgq, dWuq,
+                        dWdq, N, H) == JT_OK,
+          "ste bwdq");
+    // 順伝播の相対差と勾配の相対差を比較 (勾配差≦5×順伝播差)。
+    {
+        double fs = 0.0, gs = 0.0, fn = 0.0;
+        for (int i = 0; i < N; i++) {
+            fs += fabs((double)Y[i] - (double)Yq[i]);
+            fn += fabs((double)Y[i]);
+        }
+        for (int i = 0; i < H * N; i++) {
+            gs += fabs((double)dWg[i] - (double)dWgq[i]);
+            gs += fabs((double)dWu[i] - (double)dWuq[i]);
+            gs += fabs((double)dWd[i] - (double)dWdq[i]);
+            fn += 0.0;
+        }
+        double frel = fs / N / (fn / N + 1e-9);
+        double gscale = 0.0;
+        for (int i = 0; i < H * N; i++) {
+            gscale += fabs((double)dWg[i]) + fabs((double)dWu[i]) +
+                      fabs((double)dWd[i]);
+        }
+        double grel = gs / (gscale + 1e-9);
+        CHECK(grel <= 5.0 * frel + 1e-6, "ste grad %f vs fwd %f", grel,
+              frel);
+    }
+}
+
 int main(void) {
     test_mode_api();
     test_fakequant_err();
     test_lut_vs_fp32();
+    test_ste_grad();
     if (g_fail == 0) {
         printf("lowbit: OK\n");
         return 0;

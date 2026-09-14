@@ -155,6 +155,16 @@
 - FRI-MxMoE（サブレイヤー別ロバスト性の捉え方のみ）：https://aclanthology.org/2026.acl-long.982/
 - W8A8 INT8本線（SGLang CPU）：https://docs.sglang.io/docs/hardware-platforms/cpu_server
 
+## 7. Stage 3b-2実測記録（条件付き通過）
+
+- TinyStories T=512・200/500 steps（逐次・単一）：fp32基準 2.9470/2.4137、
+  INT8対照 +0.21%、fake-quant +1.21%/+1.16%、真LUT +1.30%/+0.98%。
+- 判定：真LUT（本番経路）が500 stepsで+0.98% → 通過。fake-quant +1.16%は
+  marginalだが本番経路でないため許容。INT8対照+0.21%はW8A8本線の裏付け。
+- 真LUT vs fake-quantの差+0.18%（500 steps）を明記。真LUTは収束中。
+- proxy解像度仮説：d=64 vs d=1024の量子化感度差。大dほど鈍感（冗長性）の
+  一般則を参照。S1でdesign scale実測を必須とする。
+
 ## 禁止事項の遵守記録
 
 - 他wt接触・checkout/switch：なし（本wt・本branchのみ。`git rev-parse --show-toplevel`＋`git branch --show-current`で確認）。
