@@ -44,8 +44,8 @@ jobs:
             name: macos14-arm64-clang
             cc: clang
             cxx: clang++
-          - os: macos-13
-            name: macos13-x64-clang
+          - os: macos-15-intel
+            name: macos15-x64-clang
             cc: clang
             cxx: clang++
           - os: windows-11-arm

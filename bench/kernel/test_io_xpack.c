@@ -596,8 +596,8 @@ static void test_linux_extra(void) {
     }
 #else
     {
-        unsigned char c[16] = {0};
-        jt_io_spec_t s = {0, sizeof(c), c};
+        // O_DIRECT fdのため整列済みbuf(4096B)でsync fallbackを確認する。
+        jt_io_spec_t s = {0, 4096, buf};
         errno = 0;
         CHECK(jt_io_pread_batch_uring(fd, &s, 1) == JT_ERR_NOSUP,
               "linux uring fallback should be NOSUP");

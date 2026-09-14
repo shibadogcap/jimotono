@@ -14,8 +14,13 @@ endif()
 # Warnings: strict but portable across clang/gcc/MSVC
 if(MSVC)
   add_compile_options(/W4)
+  # MSVC /fp:precise (default) forbids FP contraction: matches no-FMA policy.
 else()
   add_compile_options(-Wall -Wextra -Wpedantic -Wshadow)
+  # Forbid compiler FMA contraction (a*b+c -> fma): the no-FMA rounding policy
+  # (mul/add separated in source) is void if the compiler re-contracts.
+  # Required for cross-compiler loss-trajectory determinism (e2e_pipe).
+  add_compile_options(-ffp-contract=off)
 endif()
 
 # SIMD is opt-in per TU via ifdef guards, never forced globally.

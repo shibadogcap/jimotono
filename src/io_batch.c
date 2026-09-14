@@ -15,6 +15,8 @@
 
 #if defined(_WIN32)
 #include <io.h>
+#include <stdio.h>
+// _lseeki64 / _read 用。SEEK_SET は stdio.h 由来。
 // _lseeki64 / _read 用。Phase 1はbuffered fallback (OVERLAPPED化はPhase 2 TODO)。
 // NOTE: _readのcountはunsigned int幅のため、大きいlengthは分割して読む。
 #else

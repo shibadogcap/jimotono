@@ -8,6 +8,7 @@
 #include "jimotono/bpe.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -638,10 +639,10 @@ static unsigned char *jt_bpe_normalize(const unsigned char *restrict s,
     return buf;
 }
 
-// -inf 判定用 (isinfを使わず INFINITY マクロで初期化)。
+// -inf 判定用 (MSVCは定数0除算を拒否するため -INFINITY を使用)。
 // Unigram Viterbiは対数確率の最大和 (0に近いほど良い。byte片-80が最悪)。
 static float jt_bpe_neginf(void) {
-    return -1.0f / 0.0f;
+    return -INFINITY;
 }
 
 int jt_bpe_encode(const jt_bpe_t *restrict b, const char *restrict text,
