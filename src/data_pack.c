@@ -309,16 +309,90 @@ int jt_dp_write_file(const char *restrict path,
 
 // ---- reader ----
 
+// 後方定義の前方宣言（Windows実装から共用）。
+static int jt_dp_validate(const unsigned char *restrict base, size_t len,
+                          jt_dp_rstate_t *restrict rs);
+
 #if defined(_WIN32)
 
+// Windows: CreateFileMapping対応までの暫定としてfopen/fread＋mallocで読む
+// （mmap相当の常駐。is_mmap=0でjt_dp_closeがfreeする）。
 int jt_dp_open(const char *restrict path, jt_dp_reader_t *restrict out) {
-    (void)path;
-    if (out != NULL) {
-        out->opaque = NULL;
+    if (path == NULL || out == NULL) {
+        errno = EINVAL;
+        return JT_ERR_INVAL;
     }
-    // TODO(Windows-mmap): CreateFileMapping/MapViewOfFile対応後に除去。
-    errno = ENOSYS;
-    return JT_ERR_NOSUP;
+    out->opaque = NULL;
+    int rc = JT_OK;
+    FILE *f = NULL;
+    unsigned char *base = NULL;
+    size_t len = 0;
+    jt_dp_rstate_t *rs = NULL;
+    long flen = 0;
+
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return JT_ERR_IO;  // errnoはfopen由来
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        rc = JT_ERR_IO;
+        goto cleanup;
+    }
+    flen = ftell(f);
+    if (flen <= 0) {
+        errno = (flen == 0) ? EINVAL : EIO;  // 空ファイルはfail-closed
+        rc = (flen == 0) ? JT_ERR_INVAL : JT_ERR_IO;
+        goto cleanup;
+    }
+    if ((uint64_t)flen > SIZE_MAX) {
+        errno = EINVAL;
+        rc = JT_ERR_INVAL;
+        goto cleanup;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        rc = JT_ERR_IO;
+        goto cleanup;
+    }
+    len = (size_t)flen;
+    base = (unsigned char *)malloc(len);
+    if (base == NULL) {
+        errno = ENOMEM;
+        rc = JT_ERR_NOMEM;
+        goto cleanup;
+    }
+    if (fread(base, 1, len, f) != len) {
+        errno = EIO;
+        rc = JT_ERR_IO;
+        goto cleanup;
+    }
+    rs = (jt_dp_rstate_t *)calloc(1, sizeof(*rs));
+    if (rs == NULL) {
+        errno = ENOMEM;
+        rc = JT_ERR_NOMEM;
+        goto cleanup;
+    }
+    rs->base = base;
+    rs->len = len;
+    rs->is_mmap = 0;
+    base = NULL;  // 所有権をrsへ
+    rc = jt_dp_validate(rs->base, rs->len, rs);
+    if (rc != JT_OK) {
+        goto cleanup;
+    }
+    out->opaque = rs;
+    rs = NULL;
+    rc = JT_OK;
+
+cleanup:
+    if (f != NULL) {
+        fclose(f);
+    }
+    free(base);
+    if (rs != NULL) {
+        free(rs->base);
+        free(rs);
+    }
+    return rc;
 }
 
 #else  // POSIX (Linux/macOS): mmap + malloc fallback
@@ -551,6 +625,13 @@ void jt_dp_close(jt_dp_reader_t *restrict r) {
         return;
     }
 #if defined(_WIN32)
+    // Windows暫定実装はmalloc常駐（is_mmap=0）のためfreeで解放。
+    // CreateFileMapping対応時はここを分岐させること。
+    {
+        jt_dp_rstate_t *rs = (jt_dp_rstate_t *)r->opaque;
+        free(rs->base);
+        free(rs);
+    }
     r->opaque = NULL;
     return;
 #else
