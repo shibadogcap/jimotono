@@ -45,7 +45,7 @@ date: 2026-09-14 (S1 pre-requisite)
   discarded. Reuse as init vs scratch is an S2-entry decision, recorded
   in the S1 exit manifest (no silent reuse).
 
-## 5. verification gate
+## 6. verification gate
 - save → resume → loss trajectory match (bit-identical single-thread,
   tol 1e-6 MT). Fails gate → checkpoint feature blocked, S1 continues
   without resume (fresh runs only).
