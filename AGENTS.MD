@@ -7,10 +7,11 @@
 
 **設計目標**：
 - RAM使用量：dense部分 2GB以下（INT4）、全体 8GB以下
-- 計算負荷：アクティブパラメータ 100M、1トークンあたりのカーネル起動回数 50回以下
+- 計算負荷：アクティブパラメータ 100M既定、1トークンあたりのカーネル起動回数 50回以下
 - 推論速度：N100で5 tok/s以上、Ryzen AI 360で30 tok/s以上
 - 性能：Qwen3.8-27B相当（日本語・コーディング・ツールコール）
-- モデル規模：総10〜20B / アクティブ100M
+- モデル規模：総10〜20B / アクティブ100M既定
+- 条件付き選択肢：A300-500Mは既定化せず、(i)η≧0.3維持 (ii)KV微小維持（CSA2＋FP4） (iii)未縮小head除去済み (iv)NVMe 103MiB/token内実測＋η実測を満たす設計改訂でのみ
 
 **クロスプラットフォーム**：
 - CPU：x86_64（AVX2 / AVX-512）、ARM64（NEON）
@@ -32,7 +33,7 @@
 | 要素 | 選択 | 参照元 |
 |---|---|---|
 | 線形注意 | Gated DeltaNet-2 | https://research.nvidia.com/publication/2026-05_gated-deltanet-2-decoupling-erase-and-write-linear-attention |
-| 線形：フル比率 | 4:1〜7:1（線形寄り） | https://aclanthology.org/2024.emnlp-main.916.pdf |
+| 線形：フル比率 | 4:1〜5:1（線形寄り） | https://aclanthology.org/2024.emnlp-main.916.pdf |
 | MoE粒度 | 細粒度（1エキスパート2〜4M、数千個） | https://huggingface.co/FlameF0X/TinyMoE-100m-2x8 |
 | 共有エキスパート | 常時オン2つ | https://deepseekv4.space/blog/deepseek-v4-technical-report |
 | ルーティング予測 | StickyMoE soft-hard variant | https://arxiv.org/html/2607.08780v1 |
@@ -47,7 +48,7 @@
 | ルーティングエキスパート down_proj | INT4 | https://huggingface.co/OsaurusAI/ZAYA1-8B-JANGTQ_K |
 | ルーティングエキスパート gate/up | INT2 | https://huggingface.co/OsaurusAI/ZAYA1-8B-JANGTQ_K |
 | アテンション射影 | INT8 | 毎トークン発火 |
-| 埋め込み/出力ヘッド | INT8（tied embeddings） | 重要かつ小さい |
+| 埋め込み/出力ヘッド | INT8（untie既定・factorized head 1024→256→48588） | 重要かつ小さい |
 
 FRI-MxMoE：プロファイリング不要でエキスパート内サブレイヤーの異なるロバスト性を捉え、最大15.7倍のプロファイリング高速化。
 https://aclanthology.org/2026.acl-long.982/
@@ -68,11 +69,11 @@ https://aclanthology.org/2026.acl-long.982/
 
 ### 3.3 LUT（ルックアップテーブル）
 
-- T-MAC方式：int1/2/3/4 × int8/fp16/fp32のmpGEMMを逆量子化なしで実行
+- T-MAC方式：int1/2/3/4 × int8/fp16/fp32のmpGEMMを逆量子化なしで実行。GEMM体制（prefill・学習）の副線に限定し、decode GEMVの本線にしない（QLUT構築がamortize不可。W8A8 INT8経路が本線）
   https://ar5iv.labs.arxiv.org/html/2407.00088
 - 性能：BitNet-b1.58-3Bでシングルコア30 tok/s、8コア71 tok/s（M2-Ultra）、Raspberry Pi 5で11 tok/s
 - エネルギー効率：llama.cpp比で60〜70%削減
-- 学習時：HGQ-LUT方式。LUT-Dense層を通常のテンソル演算で学習し、推論時にLUTにコンパイル
+- 学習時：HGQ-LUT方式。LUT-Dense層を通常のテンソル演算で学習し、推論時にLUTにコンパイル（検証はP3本体判断）
 
 ### 3.4 分岐予測の活用
 
